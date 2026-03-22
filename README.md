@@ -79,15 +79,20 @@ Custom CRS definitions can be constructed and passed to `Transform::from_crs_def
 |---|---|---|
 | `rayon` | yes | Parallel batch transforms via `convert_batch_parallel()` |
 | `geo-types` | yes | `From`/`Into` conversions for `geo_types::Coord<f64>` |
+| `c-proj-compat` | no | Optional reference-compatibility integration against bundled C PROJ |
 
 ## Testing
 
 ```sh
 cargo test                        # all tests
 cargo test -p proj-core --no-default-features  # core crate without rayon/geo-types
+./scripts/run-reference-parity.sh
 cargo clippy --all-targets -- -D warnings
 cargo package -p proj-core --allow-dirty
 ```
+
+For reference comparisons and current benchmark results against bundled C PROJ,
+see [docs/benchmark-report.md](docs/benchmark-report.md).
 
 ## Publishing
 

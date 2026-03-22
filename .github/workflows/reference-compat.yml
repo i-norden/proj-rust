@@ -1,0 +1,52 @@
+name: Reference Compat
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_benchmarks:
+        description: Run the Criterion comparison benchmark and upload reports
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  parity:
+    name: Live C PROJ Parity
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Run live parity test against bundled C PROJ
+        run: ./scripts/run-reference-parity.sh
+
+  benchmark:
+    name: C PROJ Comparison Bench
+    runs-on: ubuntu-latest
+    needs: parity
+    if: ${{ inputs.run_benchmarks }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Run Criterion comparison bench
+        run: ./scripts/run-reference-benchmarks.sh
+      - name: Upload Criterion reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: criterion-c-proj-compat
+          path: target/criterion
+          if-no-files-found: error
