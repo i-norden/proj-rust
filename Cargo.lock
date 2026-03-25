@@ -618,6 +618,7 @@ dependencies = [
  "criterion",
  "geo-types",
  "proj",
+ "proj-sys",
  "proptest",
  "rayon",
  "serde",

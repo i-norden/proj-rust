@@ -58,6 +58,24 @@ proptest! {
         prop_assert!((lat2 - lat).abs() < 1e-6, "lat: {lat2} vs {lat}");
     }
 
+    /// Roundtrip: WGS84 → Web Mercator → WGS84 preserves ellipsoidal height.
+    #[test]
+    fn roundtrip_4326_3857_3d(
+        lon in -180.0..180.0f64,
+        lat in (-WM_LAT_LIMIT)..WM_LAT_LIMIT,
+        h in -1000.0..10000.0f64,
+    ) {
+        let fwd = Transform::new("EPSG:4326", "EPSG:3857").unwrap();
+        let inv = Transform::new("EPSG:3857", "EPSG:4326").unwrap();
+
+        let projected = fwd.convert_3d((lon, lat, h)).unwrap();
+        let (lon2, lat2, h2) = inv.convert_3d(projected).unwrap();
+
+        prop_assert!((lon2 - lon).abs() < 1e-6, "lon: {lon2} vs {lon}");
+        prop_assert!((lat2 - lat).abs() < 1e-6, "lat: {lat2} vs {lat}");
+        prop_assert!((h2 - h).abs() < 1e-6, "h: {h2} vs {h}");
+    }
+
     /// Identity: same-CRS transform returns input unchanged.
     #[test]
     fn identity_same_crs(
@@ -84,5 +102,23 @@ proptest! {
 
         prop_assert!((lon2 - lon).abs() < 1e-5, "lon: {lon2} vs {lon}");
         prop_assert!((lat2 - lat).abs() < 1e-5, "lat: {lat2} vs {lat}");
+    }
+
+    /// Cross-datum roundtrip: NAD27 → WGS84 → NAD27 preserves ellipsoidal height.
+    #[test]
+    fn roundtrip_nad27_wgs84_3d(
+        lon in -130.0..-60.0f64,
+        lat in 25.0..50.0f64,
+        h in -100.0..5000.0f64,
+    ) {
+        let fwd = Transform::new("EPSG:4267", "EPSG:4326").unwrap();
+        let inv = Transform::new("EPSG:4326", "EPSG:4267").unwrap();
+
+        let shifted = fwd.convert_3d((lon, lat, h)).unwrap();
+        let (lon2, lat2, h2) = inv.convert_3d(shifted).unwrap();
+
+        prop_assert!((lon2 - lon).abs() < 1e-5, "lon: {lon2} vs {lon}");
+        prop_assert!((lat2 - lat).abs() < 1e-5, "lat: {lat2} vs {lat}");
+        prop_assert!((h2 - h).abs() < 1e-12, "h: {h2} vs {h}");
     }
 }
