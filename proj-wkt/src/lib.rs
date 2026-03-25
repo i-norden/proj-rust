@@ -28,7 +28,7 @@ mod proj_string;
 mod projjson;
 mod wkt;
 
-use proj_core::{Coord, CrsDef, Transform, Transformable};
+use proj_core::{Coord, Coord3D, CrsDef, Transform, Transformable, Transformable3D};
 
 /// Parse error.
 #[derive(Debug, thiserror::Error)]
@@ -185,9 +185,24 @@ impl Proj {
         }
     }
 
+    /// Transform a 3D coordinate using a CRS-to-CRS transform.
+    pub fn convert_3d<T: Transformable3D>(&self, coord: T) -> proj_core::Result<T> {
+        match &self.inner {
+            ProjInner::Transform(transform) => transform.convert_3d(coord),
+            ProjInner::Definition(_) => Err(proj_core::Error::InvalidDefinition(
+                "coordinate conversion requires a CRS-to-CRS transform, not a standalone CRS definition".into(),
+            )),
+        }
+    }
+
     /// Transform a coordinate using the native [`Coord`] type.
     pub fn convert_coord(&self, coord: Coord) -> proj_core::Result<Coord> {
         self.convert(coord)
+    }
+
+    /// Transform a 3D coordinate using the native [`Coord3D`] type.
+    pub fn convert_coord_3d(&self, coord: Coord3D) -> proj_core::Result<Coord3D> {
+        self.convert_3d(coord)
     }
 
     fn definition(&self) -> Result<&CrsDef> {
@@ -272,6 +287,14 @@ mod tests {
         let proj = Proj::new_known_crs("EPSG:4326", "EPSG:3857", None).unwrap();
         let (x, _y) = proj.convert((-74.006, 40.7128)).unwrap();
         assert!((x - (-8238310.0)).abs() < 100.0);
+    }
+
+    #[test]
+    fn proj_facade_from_known_crs_3d() {
+        let proj = Proj::new_known_crs("EPSG:4326", "EPSG:3857", None).unwrap();
+        let (x, _y, z) = proj.convert_3d((-74.006, 40.7128, 25.0)).unwrap();
+        assert!((x - (-8238310.0)).abs() < 100.0);
+        assert!((z - 25.0).abs() < 1e-12);
     }
 
     #[test]

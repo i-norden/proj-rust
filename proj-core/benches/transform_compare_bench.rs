@@ -2,11 +2,23 @@ use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criteri
 use proj::Proj;
 use proj_core::Transform;
 
+#[path = "../tests/common/c_proj_ffi.rs"]
+mod c_proj_ffi;
+
+use c_proj_ffi::CProjTransform;
+
 struct SinglePointCase {
     name: &'static str,
     from_epsg: u32,
     to_epsg: u32,
     coord: (f64, f64),
+}
+
+struct SinglePointCase3D {
+    name: &'static str,
+    from_epsg: u32,
+    to_epsg: u32,
+    coord: (f64, f64, f64),
 }
 
 fn c_proj_transform(from_epsg: u32, to_epsg: u32) -> Proj {
@@ -66,6 +78,52 @@ fn bench_single_point(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_single_point_3d(c: &mut Criterion) {
+    let cases = [
+        SinglePointCase3D {
+            name: "3D 4326->3857",
+            from_epsg: 4326,
+            to_epsg: 3857,
+            coord: (-74.006, 40.7128, 50.0),
+        },
+        SinglePointCase3D {
+            name: "3D 4267->4326",
+            from_epsg: 4267,
+            to_epsg: 4326,
+            coord: (-90.0, 45.0, 250.0),
+        },
+    ];
+
+    let mut group = c.benchmark_group("single-point-3d-vs-c-proj");
+
+    for case in cases {
+        let rust_transform = Transform::from_epsg(case.from_epsg, case.to_epsg).unwrap();
+        let c_transform = CProjTransform::new_known_crs(
+            &format!("EPSG:{}", case.from_epsg),
+            &format!("EPSG:{}", case.to_epsg),
+        )
+        .unwrap_or_else(|e| {
+            panic!(
+                "failed to create C PROJ 3D transform EPSG:{}->EPSG:{}: {e}",
+                case.from_epsg, case.to_epsg
+            );
+        });
+
+        group.bench_with_input(
+            BenchmarkId::new("proj-rust", case.name),
+            &case.coord,
+            |b, coord| b.iter(|| rust_transform.convert_3d(black_box(*coord)).unwrap()),
+        );
+        group.bench_with_input(
+            BenchmarkId::new("c-proj", case.name),
+            &case.coord,
+            |b, coord| b.iter(|| c_transform.convert_3d(black_box(*coord)).unwrap()),
+        );
+    }
+
+    group.finish();
+}
+
 fn bench_batch_web_mercator(c: &mut Criterion) {
     let rust_transform = Transform::from_epsg(4326, 3857).unwrap();
     let c_transform = c_proj_transform(4326, 3857);
@@ -99,5 +157,10 @@ fn bench_batch_web_mercator(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_single_point, bench_batch_web_mercator);
+criterion_group!(
+    benches,
+    bench_single_point,
+    bench_single_point_3d,
+    bench_batch_web_mercator
+);
 criterion_main!(benches);

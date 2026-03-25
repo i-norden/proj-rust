@@ -15,6 +15,25 @@ impl Coord {
     }
 }
 
+/// A 3D coordinate.
+///
+/// At the public API boundary:
+/// - **Geographic CRS**: x/y are longitude/latitude in degrees
+/// - **Projected CRS**: x/y are easting/northing in meters
+/// - `z` is preserved unchanged by the current horizontal-only transform pipeline
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Coord3D {
+    pub x: f64,
+    pub y: f64,
+    pub z: f64,
+}
+
+impl Coord3D {
+    pub fn new(x: f64, y: f64, z: f64) -> Self {
+        Self { x, y, z }
+    }
+}
+
 impl From<(f64, f64)> for Coord {
     fn from((x, y): (f64, f64)) -> Self {
         Self { x, y }
@@ -24,6 +43,18 @@ impl From<(f64, f64)> for Coord {
 impl From<Coord> for (f64, f64) {
     fn from(c: Coord) -> Self {
         (c.x, c.y)
+    }
+}
+
+impl From<(f64, f64, f64)> for Coord3D {
+    fn from((x, y, z): (f64, f64, f64)) -> Self {
+        Self { x, y, z }
+    }
+}
+
+impl From<Coord3D> for (f64, f64, f64) {
+    fn from(c: Coord3D) -> Self {
+        (c.x, c.y, c.z)
     }
 }
 
@@ -50,6 +81,16 @@ pub trait Transformable: Sized {
     fn from_coord(c: Coord) -> Self;
 }
 
+/// Trait for types that can be transformed through a [`Transform`](crate::Transform)
+/// while preserving an ellipsoidal height component.
+///
+/// The transform returns the same type as the input, so `(f64, f64, f64)` in gives
+/// `(f64, f64, f64)` out and [`Coord3D`] in gives [`Coord3D`] out.
+pub trait Transformable3D: Sized {
+    fn into_coord3d(self) -> Coord3D;
+    fn from_coord3d(c: Coord3D) -> Self;
+}
+
 impl Transformable for Coord {
     fn into_coord(self) -> Coord {
         self
@@ -68,6 +109,30 @@ impl Transformable for (f64, f64) {
     }
     fn from_coord(c: Coord) -> Self {
         (c.x, c.y)
+    }
+}
+
+impl Transformable3D for Coord3D {
+    fn into_coord3d(self) -> Coord3D {
+        self
+    }
+
+    fn from_coord3d(c: Coord3D) -> Self {
+        c
+    }
+}
+
+impl Transformable3D for (f64, f64, f64) {
+    fn into_coord3d(self) -> Coord3D {
+        Coord3D {
+            x: self.0,
+            y: self.1,
+            z: self.2,
+        }
+    }
+
+    fn from_coord3d(c: Coord3D) -> Self {
+        (c.x, c.y, c.z)
     }
 }
 
@@ -102,10 +167,32 @@ mod tests {
     }
 
     #[test]
+    fn coord3d_from_tuple() {
+        let c: Coord3D = (1.0, 2.0, 3.0).into();
+        assert_eq!(c.x, 1.0);
+        assert_eq!(c.y, 2.0);
+        assert_eq!(c.z, 3.0);
+    }
+
+    #[test]
+    fn tuple_from_coord3d() {
+        let t: (f64, f64, f64) = Coord3D::new(3.0, 4.0, 5.0).into();
+        assert_eq!(t, (3.0, 4.0, 5.0));
+    }
+
+    #[test]
     fn transformable_roundtrip_tuple() {
         let original = (10.0, 20.0);
         let coord = original.into_coord();
         let back = <(f64, f64)>::from_coord(coord);
+        assert_eq!(original, back);
+    }
+
+    #[test]
+    fn transformable3d_roundtrip_tuple() {
+        let original = (10.0, 20.0, 30.0);
+        let coord = original.into_coord3d();
+        let back = <(f64, f64, f64)>::from_coord3d(coord);
         assert_eq!(original, back);
     }
 }

@@ -38,9 +38,14 @@ let projected: geo_types::Coord<f64> = t.convert(coord).unwrap();
 // Batch transforms (parallel with `rayon` feature)
 let coords: Vec<(f64, f64)> = vec![(-74.006, 40.7128); 1000];
 let results = t.convert_batch_parallel(&coords).unwrap();
+
+// 3D transforms preserve the third ordinate unchanged
+let (x, y, h) = t.convert_3d((-74.006, 40.7128, 15.0)).unwrap();
+assert_eq!(h, 15.0);
 ```
 
 Coordinates use the CRS's native units: degrees for geographic CRS, meters for projected CRS.
+For `convert_3d()`, the `z` component is preserved unchanged because the current CRS model is horizontal-only.
 
 ## Supported Input Formats
 
