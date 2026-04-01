@@ -2,7 +2,7 @@ use serde_json::Value;
 use std::collections::HashMap;
 
 use crate::{ParseError, Result};
-use proj_core::{CrsDef, Datum, GeographicCrsDef, ProjectedCrsDef, ProjectionMethod};
+use proj_core::{CrsDef, Datum, GeographicCrsDef, LinearUnit, ProjectedCrsDef, ProjectionMethod};
 
 pub(crate) fn parse_projjson(s: &str) -> Result<CrsDef> {
     let value: Value =
@@ -22,11 +22,7 @@ pub(crate) fn parse_projjson(s: &str) -> Result<CrsDef> {
     match crs_type {
         "GeographicCRS" | "GeodeticCRS" => {
             let datum = infer_datum(&value)?;
-            Ok(CrsDef::Geographic(GeographicCrsDef {
-                epsg: 0,
-                datum,
-                name: "",
-            }))
+            Ok(CrsDef::Geographic(GeographicCrsDef::new(0, datum, "")))
         }
         "ProjectedCRS" => parse_projected_projjson(&value),
         other => Err(ParseError::Parse(format!(
@@ -40,6 +36,8 @@ fn parse_projected_projjson(value: &Value) -> Result<CrsDef> {
         .get("conversion")
         .ok_or_else(|| ParseError::Parse("PROJJSON projected CRS is missing conversion".into()))?;
     let datum = infer_datum(value)?;
+    let linear_unit = projected_linear_unit(value).unwrap_or_else(LinearUnit::metre);
+    let base_angle_unit_to_degree = base_geographic_angle_unit_to_degree(value).unwrap_or(1.0);
     let method_name = conversion
         .get("method")
         .and_then(|method| method.get("name"))
@@ -47,7 +45,7 @@ fn parse_projected_projjson(value: &Value) -> Result<CrsDef> {
         .ok_or_else(|| {
             ParseError::Parse("PROJJSON projected CRS is missing conversion.method.name".into())
         })?;
-    let params = parse_parameters(conversion);
+    let params = parse_parameters(conversion, linear_unit, base_angle_unit_to_degree);
 
     let lon0 = first_param(
         &params,
@@ -177,12 +175,13 @@ fn parse_projected_projjson(value: &Value) -> Result<CrsDef> {
         }
     };
 
-    Ok(CrsDef::Projected(ProjectedCrsDef {
-        epsg: 0,
+    Ok(CrsDef::Projected(ProjectedCrsDef::new(
+        0,
         datum,
         method,
-        name: "",
-    }))
+        linear_unit,
+        "",
+    )))
 }
 
 fn top_level_epsg_id(value: &Value) -> Option<u32> {
@@ -200,35 +199,28 @@ fn top_level_epsg_id(value: &Value) -> Option<u32> {
 }
 
 fn infer_datum(value: &Value) -> Result<Datum> {
-    let mut text = String::new();
-    collect_names(value, &mut text);
-    let upper = text.to_uppercase();
-
-    if upper.contains("WORLD GEODETIC SYSTEM 1984")
-        || upper.contains("WGS 84")
-        || upper.contains("WGS84")
-    {
+    if any_name_contains(value, &["WORLD GEODETIC SYSTEM 1984", "WGS 84", "WGS84"]) {
         return Ok(proj_core::datum::WGS84);
     }
-    if upper.contains("NORTH AMERICAN DATUM 1983") || upper.contains("NAD83") {
+    if any_name_contains(value, &["NORTH AMERICAN DATUM 1983", "NAD83"]) {
         return Ok(proj_core::datum::NAD83);
     }
-    if upper.contains("NORTH AMERICAN DATUM 1927") || upper.contains("NAD27") {
+    if any_name_contains(value, &["NORTH AMERICAN DATUM 1927", "NAD27"]) {
         return Ok(proj_core::datum::NAD27);
     }
-    if upper.contains("ETRS89") || upper.contains("ETRS 89") {
+    if any_name_contains(value, &["ETRS89", "ETRS 89"]) {
         return Ok(proj_core::datum::ETRS89);
     }
-    if upper.contains("OSGB") || upper.contains("ORDNANCE SURVEY GREAT BRITAIN 1936") {
+    if any_name_contains(value, &["OSGB", "ORDNANCE SURVEY GREAT BRITAIN 1936"]) {
         return Ok(proj_core::datum::OSGB36);
     }
-    if upper.contains("ED50") || upper.contains("EUROPEAN DATUM 1950") {
+    if any_name_contains(value, &["ED50", "EUROPEAN DATUM 1950"]) {
         return Ok(proj_core::datum::ED50);
     }
-    if upper.contains("PULKOVO") {
+    if any_name_contains(value, &["PULKOVO"]) {
         return Ok(proj_core::datum::PULKOVO1942);
     }
-    if upper.contains("TOKYO") {
+    if any_name_contains(value, &["TOKYO"]) {
         return Ok(proj_core::datum::TOKYO);
     }
 
@@ -237,30 +229,27 @@ fn infer_datum(value: &Value) -> Result<Datum> {
     ))
 }
 
-fn collect_names(value: &Value, text: &mut String) {
+fn any_name_contains(value: &Value, needles: &[&str]) -> bool {
     match value {
-        Value::Object(map) => {
-            for (key, val) in map {
-                if key == "name" {
-                    if let Some(s) = val.as_str() {
-                        text.push_str(s);
-                        text.push('\n');
-                    }
-                } else {
-                    collect_names(val, text);
-                }
-            }
-        }
-        Value::Array(values) => {
-            for val in values {
-                collect_names(val, text);
-            }
-        }
-        _ => {}
+        Value::Object(map) => map.iter().any(|(key, val)| {
+            (key == "name"
+                && val.as_str().is_some_and(|s| {
+                    needles
+                        .iter()
+                        .any(|needle| contains_ascii_case_insensitive(s, needle))
+                }))
+                || any_name_contains(val, needles)
+        }),
+        Value::Array(values) => values.iter().any(|val| any_name_contains(val, needles)),
+        _ => false,
     }
 }
 
-fn parse_parameters(conversion: &Value) -> HashMap<String, f64> {
+fn parse_parameters(
+    conversion: &Value,
+    projected_linear_unit: LinearUnit,
+    base_angle_unit_to_degree: f64,
+) -> HashMap<String, f64> {
     let mut params = HashMap::new();
     let values = match conversion.get("parameters").and_then(Value::as_array) {
         Some(values) => values,
@@ -271,17 +260,202 @@ fn parse_parameters(conversion: &Value) -> HashMap<String, f64> {
         let Some(name) = param.get("name").and_then(Value::as_str) else {
             continue;
         };
+        let normalized_name = normalize_key(name);
         let value = match param.get("value") {
             Some(Value::Number(n)) => n.as_f64(),
             Some(Value::String(s)) => s.parse::<f64>().ok(),
             _ => None,
         };
         if let Some(value) = value {
-            params.insert(normalize_key(name), value);
+            let factor = parameter_factor_from_json(
+                param,
+                &normalized_name,
+                projected_linear_unit,
+                base_angle_unit_to_degree,
+            );
+            params.insert(normalized_name, value * factor);
         }
     }
 
     params
+}
+
+#[derive(Clone, Copy)]
+enum ParameterUnitKind {
+    Angle,
+    Length,
+    Scale,
+    Other,
+}
+
+fn parameter_factor_from_json(
+    param: &Value,
+    normalized_name: &str,
+    projected_linear_unit: LinearUnit,
+    base_angle_unit_to_degree: f64,
+) -> f64 {
+    let unit_kind = parameter_unit_kind(normalized_name);
+    match unit_kind {
+        ParameterUnitKind::Angle => param
+            .get("unit")
+            .and_then(angle_unit_to_degree_from_json)
+            .or_else(|| {
+                param
+                    .get("unit_conversion_factor")
+                    .and_then(Value::as_f64)
+                    .map(radians_to_degrees_factor)
+            })
+            .or_else(|| {
+                param
+                    .get("conversion_factor")
+                    .and_then(Value::as_f64)
+                    .map(radians_to_degrees_factor)
+            })
+            .unwrap_or(base_angle_unit_to_degree),
+        ParameterUnitKind::Length => param
+            .get("unit")
+            .and_then(linear_unit_from_json)
+            .map(LinearUnit::meters_per_unit)
+            .or_else(|| param.get("unit_conversion_factor").and_then(Value::as_f64))
+            .or_else(|| param.get("conversion_factor").and_then(Value::as_f64))
+            .unwrap_or(projected_linear_unit.meters_per_unit()),
+        ParameterUnitKind::Scale | ParameterUnitKind::Other => 1.0,
+    }
+}
+
+fn parameter_unit_kind(normalized_name: &str) -> ParameterUnitKind {
+    match normalized_name {
+        "centralmeridian"
+        | "longitudeofcenter"
+        | "longitudeofnaturalorigin"
+        | "longitudeoffalseorigin"
+        | "longitudeoforigin"
+        | "latitudeoforigin"
+        | "latitudeofcenter"
+        | "latitudeofnaturalorigin"
+        | "latitudeoffalseorigin"
+        | "standardparallel"
+        | "standardparallel1"
+        | "standardparallel2"
+        | "latitudeofstandardparallel"
+        | "latitudeof1ststandardparallel"
+        | "latitudeof2ndstandardparallel" => ParameterUnitKind::Angle,
+        "falseeasting" | "falsenorthing" | "eastingatfalseorigin" | "northingatfalseorigin" => {
+            ParameterUnitKind::Length
+        }
+        "scalefactor" | "scalefactoratnaturalorigin" | "scalefactoratprojectionorigin" => {
+            ParameterUnitKind::Scale
+        }
+        _ => ParameterUnitKind::Other,
+    }
+}
+
+fn projected_linear_unit(value: &Value) -> Option<LinearUnit> {
+    value
+        .get("coordinate_system")
+        .and_then(|cs| cs.get("axis"))
+        .and_then(Value::as_array)
+        .and_then(|axis| axis.first())
+        .and_then(axis_linear_unit)
+}
+
+fn base_geographic_angle_unit_to_degree(value: &Value) -> Option<f64> {
+    value
+        .get("base_crs")
+        .and_then(|crs| crs.get("coordinate_system"))
+        .and_then(|cs| cs.get("axis"))
+        .and_then(Value::as_array)
+        .and_then(|axis| axis.first())
+        .and_then(axis_angle_unit_to_degree)
+}
+
+fn axis_linear_unit(axis: &Value) -> Option<LinearUnit> {
+    axis.get("unit")
+        .and_then(linear_unit_from_json)
+        .or_else(|| {
+            axis.get("unit_conversion_factor")
+                .and_then(Value::as_f64)
+                .and_then(|factor| LinearUnit::from_meters_per_unit(factor).ok())
+        })
+        .or_else(|| {
+            axis.get("conversion_factor")
+                .and_then(Value::as_f64)
+                .and_then(|factor| LinearUnit::from_meters_per_unit(factor).ok())
+        })
+}
+
+fn axis_angle_unit_to_degree(axis: &Value) -> Option<f64> {
+    axis.get("unit")
+        .and_then(angle_unit_to_degree_from_json)
+        .or_else(|| {
+            axis.get("unit_conversion_factor")
+                .and_then(Value::as_f64)
+                .map(radians_to_degrees_factor)
+        })
+        .or_else(|| {
+            axis.get("conversion_factor")
+                .and_then(Value::as_f64)
+                .map(radians_to_degrees_factor)
+        })
+}
+
+fn linear_unit_from_json(value: &Value) -> Option<LinearUnit> {
+    if let Some(unit) = value.as_str() {
+        return linear_unit_name(unit);
+    }
+
+    if let Some(factor) = value.get("conversion_factor").and_then(Value::as_f64) {
+        return LinearUnit::from_meters_per_unit(factor).ok();
+    }
+    if let Some(factor) = value.get("unit_conversion_factor").and_then(Value::as_f64) {
+        return LinearUnit::from_meters_per_unit(factor).ok();
+    }
+    value
+        .get("name")
+        .and_then(Value::as_str)
+        .and_then(linear_unit_name)
+}
+
+fn angle_unit_to_degree_from_json(value: &Value) -> Option<f64> {
+    if let Some(unit) = value.as_str() {
+        return angle_unit_name_to_degree(unit);
+    }
+
+    if let Some(factor) = value.get("conversion_factor").and_then(Value::as_f64) {
+        return Some(radians_to_degrees_factor(factor));
+    }
+    if let Some(factor) = value.get("unit_conversion_factor").and_then(Value::as_f64) {
+        return Some(radians_to_degrees_factor(factor));
+    }
+    value
+        .get("name")
+        .and_then(Value::as_str)
+        .and_then(angle_unit_name_to_degree)
+}
+
+fn linear_unit_name(name: &str) -> Option<LinearUnit> {
+    match normalize_key(name).as_str() {
+        "metre" | "meter" => Some(LinearUnit::metre()),
+        "kilometre" | "kilometer" => Some(LinearUnit::kilometre()),
+        "foot" | "internationalfoot" | "ft" => Some(LinearUnit::foot()),
+        "ussurveyfoot" | "usfoot" | "usft" => Some(LinearUnit::us_survey_foot()),
+        "yard" => LinearUnit::from_meters_per_unit(0.9144).ok(),
+        "nauticalmile" => LinearUnit::from_meters_per_unit(1852.0).ok(),
+        _ => None,
+    }
+}
+
+fn angle_unit_name_to_degree(name: &str) -> Option<f64> {
+    match normalize_key(name).as_str() {
+        "degree" => Some(1.0),
+        "radian" => Some(radians_to_degrees_factor(1.0)),
+        "grad" | "gon" => Some(0.9),
+        _ => None,
+    }
+}
+
+fn radians_to_degrees_factor(radians_per_unit: f64) -> f64 {
+    radians_per_unit.to_degrees()
 }
 
 fn first_param(params: &HashMap<String, f64>, names: &[&str]) -> Option<f64> {
@@ -298,9 +472,21 @@ fn normalize_key(value: &str) -> String {
         .collect()
 }
 
+fn contains_ascii_case_insensitive(haystack: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+
+    haystack
+        .char_indices()
+        .any(|(idx, _)| matches!(haystack.get(idx..idx + needle.len()), Some(slice) if slice.eq_ignore_ascii_case(needle)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const US_FOOT_TO_METER: f64 = 0.3048006096012192;
 
     #[test]
     fn parses_projjson_with_top_level_epsg_id() {
@@ -373,5 +559,107 @@ mod tests {
         .unwrap();
 
         assert!(crs.is_projected());
+    }
+
+    #[test]
+    fn parses_projected_projjson_with_foot_units() {
+        let meter_crs = parse_projjson(
+            r#"{
+                "type": "ProjectedCRS",
+                "name": "Custom UTM 18N metre",
+                "base_crs": {
+                    "name": "WGS 84",
+                    "datum": { "name": "World Geodetic System 1984" }
+                },
+                "conversion": {
+                    "method": { "name": "Transverse Mercator" },
+                    "parameters": [
+                        { "name": "Latitude of natural origin", "value": 0 },
+                        { "name": "Longitude of natural origin", "value": -75 },
+                        { "name": "Scale factor at natural origin", "value": 0.9996 },
+                        { "name": "False easting", "value": 500000, "unit": "metre" },
+                        { "name": "False northing", "value": 0, "unit": "metre" }
+                    ]
+                },
+                "coordinate_system": {
+                    "subtype": "Cartesian",
+                    "axis": [
+                        { "name": "Easting", "direction": "east", "unit": "metre" },
+                        { "name": "Northing", "direction": "north", "unit": "metre" }
+                    ]
+                }
+            }"#,
+        )
+        .unwrap();
+        let foot_crs = parse_projjson(
+            r#"{
+                "type": "ProjectedCRS",
+                "name": "Custom UTM 18N ftUS",
+                "base_crs": {
+                    "name": "WGS 84",
+                    "datum": { "name": "World Geodetic System 1984" }
+                },
+                "conversion": {
+                    "method": { "name": "Transverse Mercator" },
+                    "parameters": [
+                        { "name": "Latitude of natural origin", "value": 0 },
+                        { "name": "Longitude of natural origin", "value": -75 },
+                        { "name": "Scale factor at natural origin", "value": 0.9996 },
+                        {
+                            "name": "False easting",
+                            "value": 1640416.6666666667,
+                            "unit": {
+                                "type": "LinearUnit",
+                                "name": "US survey foot",
+                                "conversion_factor": 0.3048006096012192
+                            }
+                        },
+                        {
+                            "name": "False northing",
+                            "value": 0,
+                            "unit": {
+                                "type": "LinearUnit",
+                                "name": "US survey foot",
+                                "conversion_factor": 0.3048006096012192
+                            }
+                        }
+                    ]
+                },
+                "coordinate_system": {
+                    "subtype": "Cartesian",
+                    "axis": [
+                        {
+                            "name": "Easting",
+                            "direction": "east",
+                            "unit": {
+                                "type": "LinearUnit",
+                                "name": "US survey foot",
+                                "conversion_factor": 0.3048006096012192
+                            }
+                        },
+                        {
+                            "name": "Northing",
+                            "direction": "north",
+                            "unit": {
+                                "type": "LinearUnit",
+                                "name": "US survey foot",
+                                "conversion_factor": 0.3048006096012192
+                            }
+                        }
+                    ]
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let from = proj_core::lookup_epsg(4326).unwrap();
+        let meter_tx = proj_core::Transform::from_crs_defs(&from, &meter_crs).unwrap();
+        let foot_tx = proj_core::Transform::from_crs_defs(&from, &foot_crs).unwrap();
+
+        let (mx, my) = meter_tx.convert((-74.006, 40.7128)).unwrap();
+        let (fx, fy) = foot_tx.convert((-74.006, 40.7128)).unwrap();
+
+        assert!((fx * US_FOOT_TO_METER - mx).abs() < 0.02, "x mismatch");
+        assert!((fy * US_FOOT_TO_METER - my).abs() < 0.02, "y mismatch");
     }
 }

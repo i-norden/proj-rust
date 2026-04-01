@@ -14,24 +14,42 @@ struct ReferencePoint {
 }
 
 fn transform(from: u32, to: u32, x: f64, y: f64, tol: f64, desc: &str) -> Option<ReferencePoint> {
+    let label = if desc.is_empty() {
+        format!("EPSG:{from}->{to} ({x}, {y})")
+    } else {
+        desc.to_string()
+    };
     let from_crs = format!("EPSG:{from}");
     let to_crs = format!("EPSG:{to}");
-    let proj = Proj::new_known_crs(&from_crs, &to_crs, None).ok()?;
-    let (ox, oy) = proj.convert((x, y)).ok()?;
-    if ox.is_finite() && oy.is_finite() {
-        Some(ReferencePoint {
-            from_epsg: from,
-            to_epsg: to,
-            input_x: x,
-            input_y: y,
-            expected_x: ox,
-            expected_y: oy,
-            tolerance: tol,
-            description: desc.to_string(),
-        })
-    } else {
-        None
+    let proj = match Proj::new_known_crs(&from_crs, &to_crs, None) {
+        Ok(proj) => proj,
+        Err(err) => {
+            eprintln!("Skipping reference point {label}: failed to create transform: {err}");
+            return None;
+        }
+    };
+    let (ox, oy) = match proj.convert((x, y)) {
+        Ok(coord) => coord,
+        Err(err) => {
+            eprintln!("Skipping reference point {label}: transform failed: {err}");
+            return None;
+        }
+    };
+    if !ox.is_finite() || !oy.is_finite() {
+        eprintln!("Skipping reference point {label}: non-finite output ({ox}, {oy})");
+        return None;
     }
+
+    Some(ReferencePoint {
+        from_epsg: from,
+        to_epsg: to,
+        input_x: x,
+        input_y: y,
+        expected_x: ox,
+        expected_y: oy,
+        tolerance: tol,
+        description: desc.to_string(),
+    })
 }
 
 /// Geographic test points: (lon, lat, name)

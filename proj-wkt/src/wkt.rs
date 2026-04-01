@@ -1,5 +1,5 @@
 use crate::{ParseError, Result};
-use proj_core::CrsDef;
+use proj_core::{CrsDef, GeographicCrsDef, LinearUnit, ProjectedCrsDef, ProjectionMethod};
 use std::collections::HashMap;
 
 /// Parse a WKT CRS string.
@@ -9,6 +9,8 @@ use std::collections::HashMap;
 ///    → look up in registry
 /// 2. Otherwise, extract projection parameters from the WKT structure
 pub(crate) fn parse_wkt(s: &str) -> Result<CrsDef> {
+    let s = s.trim();
+
     // Try to extract a top-level CRS identifier first — most reliable approach.
     if let Some(epsg) = extract_top_level_epsg(s) {
         if let Some(crs) = proj_core::lookup_epsg(epsg) {
@@ -168,13 +170,21 @@ fn trim_wkt_token(token: &str) -> &str {
 
 /// Attempt to parse WKT structure to extract projection parameters.
 fn parse_wkt_structure(s: &str) -> Result<CrsDef> {
-    let upper = s.to_uppercase();
+    let Some((root_name, _, _)) = parse_wkt_element(s, 0) else {
+        return Err(ParseError::Parse(format!(
+            "unrecognized WKT root element: {:.40}",
+            s
+        )));
+    };
 
-    if upper.starts_with("GEOGCS") || upper.starts_with("GEODCRS") || upper.starts_with("GEOGCRS") {
+    if root_name.eq_ignore_ascii_case("GEOGCS")
+        || root_name.eq_ignore_ascii_case("GEODCRS")
+        || root_name.eq_ignore_ascii_case("GEOGCRS")
+    {
         return parse_wkt_geographic(s);
     }
 
-    if upper.starts_with("PROJCS") || upper.starts_with("PROJCRS") {
+    if root_name.eq_ignore_ascii_case("PROJCS") || root_name.eq_ignore_ascii_case("PROJCRS") {
         return parse_wkt_projected(s);
     }
 
@@ -186,27 +196,22 @@ fn parse_wkt_structure(s: &str) -> Result<CrsDef> {
 
 fn parse_wkt_geographic(s: &str) -> Result<CrsDef> {
     // Extract datum name to determine which datum to use
-    let upper = s.to_uppercase();
-    let datum = infer_datum(&upper)?;
+    let datum = infer_datum(s)?;
 
-    Ok(CrsDef::Geographic(proj_core::GeographicCrsDef {
-        epsg: 0,
-        datum,
-        name: "",
-    }))
+    Ok(CrsDef::Geographic(GeographicCrsDef::new(0, datum, "")))
 }
 
 fn parse_wkt_projected(s: &str) -> Result<CrsDef> {
-    let upper = s.to_uppercase();
-
     // WKT1 uses PROJECTION["name"], WKT2 uses METHOD["name"].
-    let proj_name =
-        extract_wkt_value(&upper, "PROJECTION").or_else(|| extract_wkt_value(&upper, "METHOD"));
+    let proj_name = extract_wkt_value_case_insensitive(s, "PROJECTION")
+        .or_else(|| extract_wkt_value_case_insensitive(s, "METHOD"));
     let normalized_method = proj_name.as_deref().map(normalize_key).ok_or_else(|| {
         ParseError::Parse("WKT projected CRS is missing a projection method".into())
     })?;
 
-    let params = parse_wkt_parameters(s);
+    let projected_linear_unit = extract_projected_linear_unit(s).unwrap_or_else(LinearUnit::metre);
+    let base_angle_unit_to_degree = extract_base_geographic_angle_unit_to_degree(s).unwrap_or(1.0);
+    let params = parse_wkt_parameters(s, projected_linear_unit, base_angle_unit_to_degree);
 
     // Extract common parameters
     let lon0 = first_param(
@@ -242,17 +247,17 @@ fn parse_wkt_projected(s: &str) -> Result<CrsDef> {
     let fn_ = first_param(&params, &["falsenorthing"]).unwrap_or(0.0);
 
     // Determine datum from GEOGCS section
-    let datum = infer_datum(&upper)?;
+    let datum = infer_datum(s)?;
 
     let method = match normalized_method.as_str() {
-        "transversemercator" => proj_core::ProjectionMethod::TransverseMercator {
+        "transversemercator" => ProjectionMethod::TransverseMercator {
             lon0,
             lat0,
             k0,
             false_easting: fe,
             false_northing: fn_,
         },
-        name if name.starts_with("mercator") => proj_core::ProjectionMethod::Mercator {
+        name if name.starts_with("mercator") => ProjectionMethod::Mercator {
             lon0,
             lat_ts: first_param(
                 &params,
@@ -268,7 +273,7 @@ fn parse_wkt_projected(s: &str) -> Result<CrsDef> {
             false_northing: fn_,
         },
         "lambertconformalconic1sp" | "lambertconformalconic2sp" | "lambertconformalconic" => {
-            proj_core::ProjectionMethod::LambertConformalConic {
+            ProjectionMethod::LambertConformalConic {
                 lon0,
                 lat0,
                 lat1: first_param(
@@ -285,26 +290,24 @@ fn parse_wkt_projected(s: &str) -> Result<CrsDef> {
                 false_northing: fn_,
             }
         }
-        "albersequalareaconic" | "albersequalarea" => {
-            proj_core::ProjectionMethod::AlbersEqualArea {
-                lon0,
-                lat0,
-                lat1: first_param(
-                    &params,
-                    &["standardparallel1", "latitudeof1ststandardparallel"],
-                )
-                .unwrap_or(lat0),
-                lat2: first_param(
-                    &params,
-                    &["standardparallel2", "latitudeof2ndstandardparallel"],
-                )
-                .unwrap_or(lat0),
-                false_easting: fe,
-                false_northing: fn_,
-            }
-        }
+        "albersequalareaconic" | "albersequalarea" => ProjectionMethod::AlbersEqualArea {
+            lon0,
+            lat0,
+            lat1: first_param(
+                &params,
+                &["standardparallel1", "latitudeof1ststandardparallel"],
+            )
+            .unwrap_or(lat0),
+            lat2: first_param(
+                &params,
+                &["standardparallel2", "latitudeof2ndstandardparallel"],
+            )
+            .unwrap_or(lat0),
+            false_easting: fe,
+            false_northing: fn_,
+        },
         "polarstereographicvarianta" | "polarstereographicvariantb" | "polarstereographic" => {
-            proj_core::ProjectionMethod::PolarStereographic {
+            ProjectionMethod::PolarStereographic {
                 lon0,
                 lat_ts: first_param(
                     &params,
@@ -320,22 +323,20 @@ fn parse_wkt_projected(s: &str) -> Result<CrsDef> {
                 false_northing: fn_,
             }
         }
-        "equidistantcylindrical" | "platecarree" => {
-            proj_core::ProjectionMethod::EquidistantCylindrical {
-                lon0,
-                lat_ts: first_param(
-                    &params,
-                    &[
-                        "standardparallel1",
-                        "latitudeof1ststandardparallel",
-                        "latitudeofstandardparallel",
-                    ],
-                )
-                .unwrap_or(0.0),
-                false_easting: fe,
-                false_northing: fn_,
-            }
-        }
+        "equidistantcylindrical" | "platecarree" => ProjectionMethod::EquidistantCylindrical {
+            lon0,
+            lat_ts: first_param(
+                &params,
+                &[
+                    "standardparallel1",
+                    "latitudeof1ststandardparallel",
+                    "latitudeofstandardparallel",
+                ],
+            )
+            .unwrap_or(0.0),
+            false_easting: fe,
+            false_northing: fn_,
+        },
         _ => {
             return Err(ParseError::Parse(format!(
                 "unsupported WKT projection: {}",
@@ -344,42 +345,53 @@ fn parse_wkt_projected(s: &str) -> Result<CrsDef> {
         }
     };
 
-    Ok(CrsDef::Projected(proj_core::ProjectedCrsDef {
-        epsg: 0,
+    Ok(CrsDef::Projected(ProjectedCrsDef::new(
+        0,
         datum,
         method,
-        name: "",
-    }))
+        projected_linear_unit,
+        "",
+    )))
 }
 
-fn infer_datum(upper: &str) -> Result<proj_core::Datum> {
-    if upper.contains("WGS 84") || upper.contains("WGS84") || upper.contains("WGS_1984") {
+fn infer_datum(s: &str) -> Result<proj_core::Datum> {
+    if contains_ascii_case_insensitive(s, "WGS 84")
+        || contains_ascii_case_insensitive(s, "WGS84")
+        || contains_ascii_case_insensitive(s, "WGS_1984")
+    {
         return Ok(proj_core::datum::WGS84);
     }
-    if upper.contains("NAD83") || upper.contains("NAD 83") || upper.contains("NORTH_AMERICAN_1983")
+    if contains_ascii_case_insensitive(s, "NAD83")
+        || contains_ascii_case_insensitive(s, "NAD 83")
+        || contains_ascii_case_insensitive(s, "NORTH_AMERICAN_1983")
     {
         return Ok(proj_core::datum::NAD83);
     }
-    if upper.contains("NAD27") || upper.contains("NAD 27") || upper.contains("NORTH_AMERICAN_1927")
+    if contains_ascii_case_insensitive(s, "NAD27")
+        || contains_ascii_case_insensitive(s, "NAD 27")
+        || contains_ascii_case_insensitive(s, "NORTH_AMERICAN_1927")
     {
         return Ok(proj_core::datum::NAD27);
     }
-    if upper.contains("ETRS89") || upper.contains("ETRS 89") {
+    if contains_ascii_case_insensitive(s, "ETRS89") || contains_ascii_case_insensitive(s, "ETRS 89")
+    {
         return Ok(proj_core::datum::ETRS89);
     }
-    if upper.contains("OSGB")
-        || upper.contains("AIRY")
-        || upper.contains("ORDNANCE_SURVEY_GREAT_BRITAIN_1936")
+    if contains_ascii_case_insensitive(s, "OSGB")
+        || contains_ascii_case_insensitive(s, "AIRY")
+        || contains_ascii_case_insensitive(s, "ORDNANCE_SURVEY_GREAT_BRITAIN_1936")
     {
         return Ok(proj_core::datum::OSGB36);
     }
-    if upper.contains("ED50") || upper.contains("EUROPEAN_DATUM_1950") {
+    if contains_ascii_case_insensitive(s, "ED50")
+        || contains_ascii_case_insensitive(s, "EUROPEAN_DATUM_1950")
+    {
         return Ok(proj_core::datum::ED50);
     }
-    if upper.contains("PULKOVO") {
+    if contains_ascii_case_insensitive(s, "PULKOVO") {
         return Ok(proj_core::datum::PULKOVO1942);
     }
-    if upper.contains("TOKYO") {
+    if contains_ascii_case_insensitive(s, "TOKYO") {
         return Ok(proj_core::datum::TOKYO);
     }
 
@@ -388,53 +400,234 @@ fn infer_datum(upper: &str) -> Result<proj_core::Datum> {
     ))
 }
 
-/// Extract a quoted value like PROJECTION["Transverse_Mercator"]
-fn extract_wkt_value(upper: &str, key: &str) -> Option<String> {
+/// Extract a quoted value like PROJECTION["Transverse_Mercator"].
+fn extract_wkt_value_case_insensitive(s: &str, key: &str) -> Option<String> {
     let marker = format!("{key}[\"");
-    let pos = upper.find(&marker)?;
+    let pos = find_ascii_case_insensitive(s, &marker)?;
     let start = pos + marker.len();
-    let rest = &upper[start..];
+    let rest = &s[start..];
     let end = rest.find('"')?;
     Some(rest[..end].to_string())
 }
 
-fn parse_wkt_parameters(s: &str) -> HashMap<String, f64> {
-    let upper = s.to_uppercase();
+fn parse_wkt_parameters(
+    s: &str,
+    projected_linear_unit: LinearUnit,
+    base_angle_unit_to_degree: f64,
+) -> HashMap<String, f64> {
     let mut params = HashMap::new();
     let mut search_start = 0usize;
 
-    while let Some(rel) = upper[search_start..].find("PARAMETER[") {
-        let start = search_start + rel + "PARAMETER[".len();
-        let rest = &s[start..];
-        let quote_start = match rest.find('"') {
-            Some(pos) => pos,
-            None => break,
-        };
-        let name_start = start + quote_start + 1;
-        let name_rest = &s[name_start..];
-        let name_end = match name_rest.find('"') {
-            Some(pos) => pos,
-            None => break,
-        };
-        let name = &name_rest[..name_end];
-        let after_name = &name_rest[name_end + 1..];
-        let comma = match after_name.find(',') {
-            Some(pos) => pos,
-            None => break,
-        };
-        let value_rest = after_name[comma + 1..].trim_start();
-        let value_len = value_rest
-            .find(|c: char| !(c.is_ascii_digit() || matches!(c, '.' | '-' | '+' | 'e' | 'E')))
-            .unwrap_or(value_rest.len());
-
-        if let Ok(value) = value_rest[..value_len].parse::<f64>() {
-            params.insert(normalize_key(name), value);
+    while let Some(rel) = find_ascii_case_insensitive(&s[search_start..], "PARAMETER[") {
+        let start = search_start + rel;
+        if let Some((name, inner, next)) = parse_wkt_element(s, start) {
+            if name.eq_ignore_ascii_case("PARAMETER") {
+                if let Some((key, value)) =
+                    parse_parameter_element(inner, projected_linear_unit, base_angle_unit_to_degree)
+                {
+                    params.insert(key, value);
+                }
+                search_start = next;
+                continue;
+            }
         }
-
-        search_start = name_start + name_end + 1;
+        search_start = start + "PARAMETER[".len();
     }
 
     params
+}
+
+#[derive(Clone, Copy)]
+enum ParameterUnitKind {
+    Angle,
+    Length,
+    Scale,
+    Other,
+}
+
+fn parse_parameter_element(
+    inner: &str,
+    projected_linear_unit: LinearUnit,
+    base_angle_unit_to_degree: f64,
+) -> Option<(String, f64)> {
+    let fields = split_top_level_fields(inner);
+    if fields.len() < 2 {
+        return None;
+    }
+
+    let name = trim_wkt_token(fields[0]);
+    let normalized_name = normalize_key(name);
+    let value = fields[1].trim().parse::<f64>().ok()?;
+    let unit_kind = parameter_unit_kind(&normalized_name);
+
+    let nested_factor = fields.iter().skip(2).find_map(|field| {
+        let field = field.trim();
+        let (unit_name, unit_inner, _) = parse_wkt_element(field, 0)?;
+        match unit_name.to_ascii_uppercase().as_str() {
+            "ANGLEUNIT" => parse_unit_factor(unit_inner).map(radians_to_degrees_factor),
+            "LENGTHUNIT" | "UNIT" => parse_unit_factor(unit_inner),
+            "SCALEUNIT" => parse_unit_factor(unit_inner),
+            _ => None,
+        }
+    });
+
+    let default_factor = match unit_kind {
+        ParameterUnitKind::Angle => base_angle_unit_to_degree,
+        ParameterUnitKind::Length => projected_linear_unit.meters_per_unit(),
+        ParameterUnitKind::Scale | ParameterUnitKind::Other => 1.0,
+    };
+
+    Some((
+        normalized_name,
+        value * nested_factor.unwrap_or(default_factor),
+    ))
+}
+
+fn parameter_unit_kind(normalized_name: &str) -> ParameterUnitKind {
+    match normalized_name {
+        "centralmeridian"
+        | "longitudeofcenter"
+        | "longitudeofnaturalorigin"
+        | "longitudeoffalseorigin"
+        | "longitudeoforigin"
+        | "latitudeoforigin"
+        | "latitudeofcenter"
+        | "latitudeofnaturalorigin"
+        | "latitudeoffalseorigin"
+        | "standardparallel"
+        | "standardparallel1"
+        | "standardparallel2"
+        | "latitudeofstandardparallel"
+        | "latitudeof1ststandardparallel"
+        | "latitudeof2ndstandardparallel" => ParameterUnitKind::Angle,
+        "falseeasting" | "falsenorthing" | "eastingatfalseorigin" | "northingatfalseorigin" => {
+            ParameterUnitKind::Length
+        }
+        "scalefactor" | "scalefactoratnaturalorigin" | "scalefactoratprojectionorigin" => {
+            ParameterUnitKind::Scale
+        }
+        _ => ParameterUnitKind::Other,
+    }
+}
+
+fn split_top_level_fields(s: &str) -> Vec<&str> {
+    let mut fields = Vec::new();
+    let mut field_start = 0usize;
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let bytes = s.as_bytes();
+    let mut i = 0usize;
+
+    while i < bytes.len() {
+        match bytes[i] {
+            b'"' => {
+                if in_string && bytes.get(i + 1) == Some(&b'"') {
+                    i += 2;
+                    continue;
+                }
+                in_string = !in_string;
+            }
+            _ if in_string => {}
+            b'[' => depth += 1,
+            b']' => depth = depth.saturating_sub(1),
+            b',' if depth == 0 => {
+                fields.push(s[field_start..i].trim());
+                field_start = i + 1;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+
+    fields.push(s[field_start..].trim());
+    fields
+}
+
+fn root_inner(s: &str) -> Option<&str> {
+    parse_wkt_element(s, 0).map(|(_, inner, _)| inner)
+}
+
+fn extract_projected_linear_unit(s: &str) -> Option<LinearUnit> {
+    let inner = root_inner(s)?;
+    let mut linear_unit = None;
+    for_each_top_level_element(inner, |name, element_inner| {
+        if name.eq_ignore_ascii_case("UNIT") || name.eq_ignore_ascii_case("LENGTHUNIT") {
+            linear_unit = parse_unit_factor(element_inner)
+                .and_then(|factor| LinearUnit::from_meters_per_unit(factor).ok());
+        }
+    });
+    linear_unit
+}
+
+fn extract_base_geographic_angle_unit_to_degree(s: &str) -> Option<f64> {
+    for name in ["BASEGEOGCRS", "GEOGCRS", "GEODCRS", "GEOGCS"] {
+        if let Some(start) = find_ascii_case_insensitive(s, name) {
+            if let Some((_, inner, _)) = parse_wkt_element(s, start) {
+                let mut factor = None;
+                for_each_top_level_element(inner, |unit_name, unit_inner| {
+                    if unit_name.eq_ignore_ascii_case("UNIT")
+                        || unit_name.eq_ignore_ascii_case("ANGLEUNIT")
+                    {
+                        factor = parse_unit_factor(unit_inner).map(radians_to_degrees_factor);
+                    }
+                });
+                if factor.is_some() {
+                    return factor;
+                }
+            }
+        }
+    }
+    None
+}
+
+fn for_each_top_level_element<'a, F>(inner: &'a str, mut f: F)
+where
+    F: FnMut(&'a str, &'a str),
+{
+    let mut i = 0usize;
+    let bytes = inner.as_bytes();
+    let mut depth = 0usize;
+    let mut in_string = false;
+
+    while i < bytes.len() {
+        match bytes[i] {
+            b'"' => {
+                if in_string && bytes.get(i + 1) == Some(&b'"') {
+                    i += 2;
+                    continue;
+                }
+                in_string = !in_string;
+                i += 1;
+            }
+            _ if in_string => i += 1,
+            b'[' => {
+                depth += 1;
+                i += 1;
+            }
+            b']' => {
+                depth = depth.saturating_sub(1);
+                i += 1;
+            }
+            _ if depth == 0 => {
+                if let Some((name, element_inner, next)) = parse_wkt_element(inner, i) {
+                    f(name, element_inner);
+                    i = next;
+                } else {
+                    i += 1;
+                }
+            }
+            _ => i += 1,
+        }
+    }
+}
+
+fn parse_unit_factor(inner: &str) -> Option<f64> {
+    let fields = split_top_level_fields(inner);
+    fields.get(1)?.trim().parse::<f64>().ok()
+}
+
+fn radians_to_degrees_factor(radians_per_unit: f64) -> f64 {
+    radians_per_unit.to_degrees()
 }
 
 fn first_param(params: &HashMap<String, f64>, names: &[&str]) -> Option<f64> {
@@ -451,9 +644,28 @@ fn normalize_key(value: &str) -> String {
         .collect()
 }
 
+fn contains_ascii_case_insensitive(haystack: &str, needle: &str) -> bool {
+    find_ascii_case_insensitive(haystack, needle).is_some()
+}
+
+fn find_ascii_case_insensitive(haystack: &str, needle: &str) -> Option<usize> {
+    if needle.is_empty() {
+        return Some(0);
+    }
+
+    haystack.char_indices().find_map(|(idx, _)| {
+        haystack
+            .get(idx..idx + needle.len())
+            .filter(|slice| slice.eq_ignore_ascii_case(needle))
+            .map(|_| idx)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const US_FOOT_TO_METER: f64 = 0.3048006096012192;
 
     #[test]
     fn extract_top_level_epsg_from_wkt() {
@@ -513,6 +725,25 @@ mod tests {
         let wkt = r#"PROJCRS["WGS 84 / UTM zone 18N",BASEGEOGCRS["WGS 84",DATUM["World Geodetic System 1984",ELLIPSOID["WGS 84",6378137,298.257223563]]],CONVERSION["UTM zone 18N",METHOD["Transverse Mercator"],PARAMETER["Latitude of natural origin",0,ANGLEUNIT["degree",0.0174532925199433]],PARAMETER["Longitude of natural origin",-75,ANGLEUNIT["degree",0.0174532925199433]],PARAMETER["Scale factor at natural origin",0.9996,SCALEUNIT["unity",1]],PARAMETER["False easting",500000,LENGTHUNIT["metre",1]],PARAMETER["False northing",0,LENGTHUNIT["metre",1]]],CS[Cartesian,2],AXIS["easting",east],AXIS["northing",north],LENGTHUNIT["metre",1]]"#;
         let crs = parse_wkt(wkt).unwrap();
         assert!(crs.is_projected());
+    }
+
+    #[test]
+    fn parse_wkt_projcs_with_foot_units() {
+        let meter_wkt = r#"PROJCS["UTM 18N metre",GEOGCS["WGS 84",DATUM["WGS_1984",SPHEROID["WGS 84",6378137,298.257223563]],UNIT["Degree",0.0174532925199433]],PROJECTION["Transverse_Mercator"],PARAMETER["latitude_of_origin",0],PARAMETER["central_meridian",-75],PARAMETER["scale_factor",0.9996],PARAMETER["false_easting",500000],PARAMETER["false_northing",0],UNIT["metre",1]]"#;
+        let foot_wkt = r#"PROJCS["UTM 18N ftUS",GEOGCS["WGS 84",DATUM["WGS_1984",SPHEROID["WGS 84",6378137,298.257223563]],UNIT["Degree",0.0174532925199433]],PROJECTION["Transverse_Mercator"],PARAMETER["latitude_of_origin",0],PARAMETER["central_meridian",-75],PARAMETER["scale_factor",0.9996],PARAMETER["false_easting",1640416.6666666667],PARAMETER["false_northing",0],UNIT["Foot_US",0.3048006096012192]]"#;
+
+        let meter_crs = parse_wkt(meter_wkt).unwrap();
+        let foot_crs = parse_wkt(foot_wkt).unwrap();
+        let from = proj_core::lookup_epsg(4326).unwrap();
+
+        let meter_tx = proj_core::Transform::from_crs_defs(&from, &meter_crs).unwrap();
+        let foot_tx = proj_core::Transform::from_crs_defs(&from, &foot_crs).unwrap();
+
+        let (mx, my) = meter_tx.convert((-74.006, 40.7128)).unwrap();
+        let (fx, fy) = foot_tx.convert((-74.006, 40.7128)).unwrap();
+
+        assert!((fx * US_FOOT_TO_METER - mx).abs() < 0.02, "x mismatch");
+        assert!((fy * US_FOOT_TO_METER - my).abs() < 0.02, "y mismatch");
     }
 
     #[test]

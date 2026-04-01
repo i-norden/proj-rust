@@ -135,13 +135,41 @@ fn get_f64(params: &HashMap<String, String>, key: &str) -> f64 {
     params.get(key).and_then(|v| v.parse().ok()).unwrap_or(0.0)
 }
 
+fn resolve_linear_unit_to_meter(params: &HashMap<String, String>) -> Result<f64> {
+    if let Some(to_meter) = params.get("to_meter") {
+        return to_meter
+            .parse::<f64>()
+            .map_err(|_| ParseError::Parse(format!("invalid +to_meter value: {to_meter}")));
+    }
+
+    let factor = match params.get("units").map(|s| s.as_str()) {
+        None | Some("m") => 1.0,
+        Some("km") => 1000.0,
+        Some("ft") => 0.3048,
+        Some("us-ft") => 0.3048006096012192,
+        Some("yd") => 0.9144,
+        Some("ch") => 20.1168,
+        Some("link") => 0.201168,
+        Some("mi") => 1609.344,
+        Some("nmi") => 1852.0,
+        Some(other) => {
+            return Err(ParseError::Parse(format!(
+                "unsupported PROJ linear unit: {other}"
+            )));
+        }
+    };
+
+    Ok(factor)
+}
+
+fn resolve_linear_unit(params: &HashMap<String, String>) -> Result<LinearUnit> {
+    let meters_per_unit = resolve_linear_unit_to_meter(params)?;
+    LinearUnit::from_meters_per_unit(meters_per_unit).map_err(ParseError::Core)
+}
+
 fn parse_geographic(params: &HashMap<String, String>) -> Result<CrsDef> {
     let d = resolve_datum(params)?;
-    Ok(CrsDef::Geographic(GeographicCrsDef {
-        epsg: 0,
-        datum: d,
-        name: "",
-    }))
+    Ok(CrsDef::Geographic(GeographicCrsDef::new(0, d, "")))
 }
 
 fn parse_utm(params: &HashMap<String, String>) -> Result<CrsDef> {
@@ -157,30 +185,33 @@ fn parse_utm(params: &HashMap<String, String>) -> Result<CrsDef> {
 
     let south = params.contains_key("south");
     let d = resolve_datum(params)?;
+    let linear_unit = resolve_linear_unit(params)?;
 
     let lon0 = (zone as f64 - 1.0) * 6.0 - 180.0 + 3.0;
     let false_northing = if south { 10_000_000.0 } else { 0.0 };
 
-    Ok(CrsDef::Projected(ProjectedCrsDef {
-        epsg: 0,
-        datum: d,
-        method: ProjectionMethod::TransverseMercator {
+    Ok(CrsDef::Projected(ProjectedCrsDef::new(
+        0,
+        d,
+        ProjectionMethod::TransverseMercator {
             lon0,
             lat0: 0.0,
             k0: 0.9996,
-            false_easting: 500_000.0,
-            false_northing,
+            false_easting: linear_unit.to_meters(500_000.0),
+            false_northing: linear_unit.to_meters(false_northing),
         },
-        name: "",
-    }))
+        linear_unit,
+        "",
+    )))
 }
 
 fn parse_tmerc(params: &HashMap<String, String>) -> Result<CrsDef> {
     let d = resolve_datum(params)?;
-    Ok(CrsDef::Projected(ProjectedCrsDef {
-        epsg: 0,
-        datum: d,
-        method: ProjectionMethod::TransverseMercator {
+    let linear_unit = resolve_linear_unit(params)?;
+    Ok(CrsDef::Projected(ProjectedCrsDef::new(
+        0,
+        d,
+        ProjectionMethod::TransverseMercator {
             lon0: get_f64(params, "lon_0"),
             lat0: get_f64(params, "lat_0"),
             k0: params
@@ -188,19 +219,21 @@ fn parse_tmerc(params: &HashMap<String, String>) -> Result<CrsDef> {
                 .or(params.get("k"))
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(1.0),
-            false_easting: get_f64(params, "x_0"),
-            false_northing: get_f64(params, "y_0"),
+            false_easting: linear_unit.to_meters(get_f64(params, "x_0")),
+            false_northing: linear_unit.to_meters(get_f64(params, "y_0")),
         },
-        name: "",
-    }))
+        linear_unit,
+        "",
+    )))
 }
 
 fn parse_merc(params: &HashMap<String, String>) -> Result<CrsDef> {
     let d = resolve_datum(params)?;
-    Ok(CrsDef::Projected(ProjectedCrsDef {
-        epsg: 0,
-        datum: d,
-        method: ProjectionMethod::Mercator {
+    let linear_unit = resolve_linear_unit(params)?;
+    Ok(CrsDef::Projected(ProjectedCrsDef::new(
+        0,
+        d,
+        ProjectionMethod::Mercator {
             lon0: get_f64(params, "lon_0"),
             lat_ts: get_f64(params, "lat_ts"),
             k0: params
@@ -208,11 +241,12 @@ fn parse_merc(params: &HashMap<String, String>) -> Result<CrsDef> {
                 .or(params.get("k"))
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(1.0),
-            false_easting: get_f64(params, "x_0"),
-            false_northing: get_f64(params, "y_0"),
+            false_easting: linear_unit.to_meters(get_f64(params, "x_0")),
+            false_northing: linear_unit.to_meters(get_f64(params, "y_0")),
         },
-        name: "",
-    }))
+        linear_unit,
+        "",
+    )))
 }
 
 fn parse_stereo(params: &HashMap<String, String>) -> Result<CrsDef> {
@@ -232,10 +266,11 @@ fn parse_stereo(params: &HashMap<String, String>) -> Result<CrsDef> {
         ));
     };
     let d = resolve_datum(params)?;
-    Ok(CrsDef::Projected(ProjectedCrsDef {
-        epsg: 0,
-        datum: d,
-        method: ProjectionMethod::PolarStereographic {
+    let linear_unit = resolve_linear_unit(params)?;
+    Ok(CrsDef::Projected(ProjectedCrsDef::new(
+        0,
+        d,
+        ProjectionMethod::PolarStereographic {
             lon0: get_f64(params, "lon_0"),
             lat_ts: lat_ts.copysign(pole),
             k0: params
@@ -243,65 +278,74 @@ fn parse_stereo(params: &HashMap<String, String>) -> Result<CrsDef> {
                 .or(params.get("k"))
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(1.0),
-            false_easting: get_f64(params, "x_0"),
-            false_northing: get_f64(params, "y_0"),
+            false_easting: linear_unit.to_meters(get_f64(params, "x_0")),
+            false_northing: linear_unit.to_meters(get_f64(params, "y_0")),
         },
-        name: "",
-    }))
+        linear_unit,
+        "",
+    )))
 }
 
 fn parse_lcc(params: &HashMap<String, String>) -> Result<CrsDef> {
     let d = resolve_datum(params)?;
-    Ok(CrsDef::Projected(ProjectedCrsDef {
-        epsg: 0,
-        datum: d,
-        method: ProjectionMethod::LambertConformalConic {
+    let linear_unit = resolve_linear_unit(params)?;
+    Ok(CrsDef::Projected(ProjectedCrsDef::new(
+        0,
+        d,
+        ProjectionMethod::LambertConformalConic {
             lon0: get_f64(params, "lon_0"),
             lat0: get_f64(params, "lat_0"),
             lat1: get_f64(params, "lat_1"),
             lat2: get_f64(params, "lat_2"),
-            false_easting: get_f64(params, "x_0"),
-            false_northing: get_f64(params, "y_0"),
+            false_easting: linear_unit.to_meters(get_f64(params, "x_0")),
+            false_northing: linear_unit.to_meters(get_f64(params, "y_0")),
         },
-        name: "",
-    }))
+        linear_unit,
+        "",
+    )))
 }
 
 fn parse_aea(params: &HashMap<String, String>) -> Result<CrsDef> {
     let d = resolve_datum(params)?;
-    Ok(CrsDef::Projected(ProjectedCrsDef {
-        epsg: 0,
-        datum: d,
-        method: ProjectionMethod::AlbersEqualArea {
+    let linear_unit = resolve_linear_unit(params)?;
+    Ok(CrsDef::Projected(ProjectedCrsDef::new(
+        0,
+        d,
+        ProjectionMethod::AlbersEqualArea {
             lon0: get_f64(params, "lon_0"),
             lat0: get_f64(params, "lat_0"),
             lat1: get_f64(params, "lat_1"),
             lat2: get_f64(params, "lat_2"),
-            false_easting: get_f64(params, "x_0"),
-            false_northing: get_f64(params, "y_0"),
+            false_easting: linear_unit.to_meters(get_f64(params, "x_0")),
+            false_northing: linear_unit.to_meters(get_f64(params, "y_0")),
         },
-        name: "",
-    }))
+        linear_unit,
+        "",
+    )))
 }
 
 fn parse_eqc(params: &HashMap<String, String>) -> Result<CrsDef> {
     let d = resolve_datum(params)?;
-    Ok(CrsDef::Projected(ProjectedCrsDef {
-        epsg: 0,
-        datum: d,
-        method: ProjectionMethod::EquidistantCylindrical {
+    let linear_unit = resolve_linear_unit(params)?;
+    Ok(CrsDef::Projected(ProjectedCrsDef::new(
+        0,
+        d,
+        ProjectionMethod::EquidistantCylindrical {
             lon0: get_f64(params, "lon_0"),
             lat_ts: get_f64(params, "lat_ts"),
-            false_easting: get_f64(params, "x_0"),
-            false_northing: get_f64(params, "y_0"),
+            false_easting: linear_unit.to_meters(get_f64(params, "x_0")),
+            false_northing: linear_unit.to_meters(get_f64(params, "y_0")),
         },
-        name: "",
-    }))
+        linear_unit,
+        "",
+    )))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const US_FOOT_TO_METER: f64 = 0.3048006096012192;
 
     #[test]
     fn parse_longlat_wgs84() {
@@ -319,8 +363,8 @@ mod tests {
     fn parse_utm_zone18s() {
         let crs = parse_proj_string("+proj=utm +zone=18 +south +datum=WGS84 +units=m").unwrap();
         if let CrsDef::Projected(p) = &crs {
-            if let ProjectionMethod::TransverseMercator { false_northing, .. } = &p.method {
-                assert_eq!(*false_northing, 10_000_000.0);
+            if let ProjectionMethod::TransverseMercator { false_northing, .. } = p.method() {
+                assert_eq!(false_northing, 10_000_000.0);
             } else {
                 panic!("expected TM");
             }
@@ -336,7 +380,7 @@ mod tests {
         ).unwrap();
         assert!(crs.is_projected());
         if let CrsDef::Projected(p) = &crs {
-            assert!(p.datum.to_wgs84.is_some());
+            assert!(p.datum().to_wgs84.is_some());
         }
     }
 
@@ -347,6 +391,28 @@ mod tests {
         let t = proj_core::Transform::from_crs_defs(&from, &to).unwrap();
         let (x, _y) = t.convert((-74.006, 40.7128)).unwrap();
         assert!((x - 583960.0).abs() < 1.0, "easting = {x}");
+    }
+
+    #[test]
+    fn proj_string_projected_units_roundtrip_through_native_feet() {
+        let from = parse_proj_string("+proj=longlat +datum=WGS84 +no_defs").unwrap();
+        let to_feet = parse_proj_string(
+            "+proj=tmerc +lat_0=0 +lon_0=-75 +k=0.9996 +x_0=1640416.6666666667 +y_0=0 +datum=WGS84 +units=us-ft +no_defs",
+        )
+        .unwrap();
+        let to_meters = parse_proj_string(
+            "+proj=tmerc +lat_0=0 +lon_0=-75 +k=0.9996 +x_0=500000 +y_0=0 +datum=WGS84 +units=m +no_defs",
+        )
+        .unwrap();
+
+        let feet_tx = proj_core::Transform::from_crs_defs(&from, &to_feet).unwrap();
+        let meter_tx = proj_core::Transform::from_crs_defs(&from, &to_meters).unwrap();
+
+        let (fx, fy) = feet_tx.convert((-74.006, 40.7128)).unwrap();
+        let (mx, my) = meter_tx.convert((-74.006, 40.7128)).unwrap();
+
+        assert!((fx * US_FOOT_TO_METER - mx).abs() < 0.02, "x mismatch");
+        assert!((fy * US_FOOT_TO_METER - my).abs() < 0.02, "y mismatch");
     }
 
     #[test]

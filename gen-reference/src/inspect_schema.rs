@@ -44,7 +44,7 @@ fn main() {
     }
 
     // Sample a conversion to see parameter storage
-    let mut s = conn.prepare(
+    let s = conn.prepare(
         "SELECT * FROM conversion_table WHERE auth_name='EPSG' LIMIT 1"
     ).unwrap_or_else(|_| conn.prepare("SELECT 'no conversion_table'").unwrap());
     let cols = s.column_names().iter().map(|c| c.to_string()).collect::<Vec<_>>();
@@ -52,7 +52,7 @@ fn main() {
 
     // Check a specific UTM zone
     println!("\n--- EPSG:32618 (UTM 18N) ---");
-    let mut s = conn.prepare(
+    let s = conn.prepare(
         "SELECT * FROM conversion_table WHERE auth_name='EPSG' AND code=16018"
     ).unwrap();
     let cols = s.column_names().iter().map(|c| c.to_string()).collect::<Vec<_>>();

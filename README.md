@@ -11,12 +11,12 @@ This workspace currently contains:
 
 `proj-rust` is intended for production use within its supported CRS and projection set. It is not a full implementation of all PROJ capabilities.
 
-Current non-goals for `v0.1.0` include:
+Current non-goals for the `0.2` release line include:
 
 - grid-shift based datum transforms
 - vertical or time-dependent CRS operations
 - full PROJ pipeline semantics and operation selection by area of use
-- complete axis-order and unit-model coverage across arbitrary CRS definitions
+- complete axis-order coverage and full arbitrary angular/unit-model coverage across all CRS definitions
 
 ## Usage
 
@@ -49,7 +49,7 @@ let projected_bounds = t.transform_bounds(bounds, 8).unwrap();
 assert!(projected_bounds.max_x > projected_bounds.min_x);
 ```
 
-Coordinates use the CRS's native units: degrees for geographic CRS, meters for projected CRS.
+Coordinates use the CRS's native units: degrees for geographic CRS, and the CRS's declared linear unit for projected CRS (for example meters or US survey feet).
 For `convert_3d()`, the `z` component is preserved unchanged because the current CRS model is horizontal-only.
 
 ## Supported Input Formats

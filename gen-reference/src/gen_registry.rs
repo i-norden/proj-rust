@@ -6,7 +6,6 @@
 
 use rusqlite::Connection;
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::Write;
 use std::path::PathBuf;
 
 fn find_proj_db() -> PathBuf {
@@ -39,7 +38,7 @@ const MAGIC: u32 = 0x45505347;
 const ELLIPSOID_RECORD_SIZE: usize = 20;
 const DATUM_RECORD_SIZE: usize = 64;
 const GEO_CRS_RECORD_SIZE: usize = 8;
-const PROJ_CRS_RECORD_SIZE: usize = 72;
+const PROJ_CRS_RECORD_SIZE: usize = 80;
 
 const METHOD_WEB_MERCATOR: u8 = 1;
 const METHOD_TRANSVERSE_MERCATOR: u8 = 2;
@@ -85,7 +84,6 @@ fn convert_dms_to_degrees(dms_value: f64) -> f64 {
     let abs_val = dms_value.abs();
     let degrees = abs_val.trunc();
     let mm_ss = (abs_val - degrees) * 100.0;
-    let minutes = mm_ss.round().min(mm_ss.trunc() + 1.0); // guard against 29.9999→30
     let minutes = if (mm_ss - mm_ss.round()).abs() < 1e-6 {
         mm_ss.round()
     } else {
@@ -93,17 +91,6 @@ fn convert_dms_to_degrees(dms_value: f64) -> f64 {
     };
     let seconds = (mm_ss - minutes) * 100.0;
     sign * (degrees + minutes / 60.0 + seconds / 3600.0)
-}
-
-fn uom_to_degrees(uom_code: i64) -> f64 {
-    match uom_code {
-        9102 | 9122 => 1.0,
-        9101 => 180.0 / std::f64::consts::PI,
-        9105 => 1.0 / 3600.0,
-        9104 => 1.0 / 60.0,
-        9107 => 180.0 / 200.0,
-        _ => 1.0,
-    }
 }
 
 struct ConvParams {
@@ -117,17 +104,34 @@ fn get_degrees(cp: &ConvParams, codes: &[i64]) -> f64 {
             return if uom == 9110 {
                 convert_dms_to_degrees(val)
             } else {
-                val * uom_to_degrees(uom)
+                let factor = match uom {
+                    9102 | 9122 => 1.0,
+                    9101 => 180.0 / std::f64::consts::PI,
+                    9105 => 1.0 / 3600.0,
+                    9104 => 1.0 / 60.0,
+                    9107 => 180.0 / 200.0,
+                    _ => panic!(
+                        "unsupported angular unit EPSG:{uom} for parameter EPSG:{code} in conversion method EPSG:{}",
+                        cp.method_code
+                    ),
+                };
+                val * factor
             };
         }
     }
     0.0
 }
 
-fn get_meters(cp: &ConvParams, codes: &[i64]) -> f64 {
+fn get_meters(cp: &ConvParams, codes: &[i64], linear_uoms: &BTreeMap<i64, f64>) -> f64 {
     for &code in codes {
-        if let Some(&(val, _)) = cp.params.get(&code) {
-            return val;
+        if let Some(&(val, uom)) = cp.params.get(&code) {
+            let factor = linear_uoms.get(&uom).copied().unwrap_or_else(|| {
+                panic!(
+                    "unsupported linear unit EPSG:{uom} for parameter EPSG:{code} in conversion method EPSG:{}",
+                    cp.method_code
+                )
+            });
+            return val * factor;
         }
     }
     0.0
@@ -202,6 +206,20 @@ fn main() {
             );
         }
     }
+
+    let linear_uoms: BTreeMap<i64, f64> = {
+        let mut s = conn
+            .prepare(
+                "SELECT code, conv_factor FROM unit_of_measure
+                 WHERE auth_name='EPSG' AND type='length'",
+            )
+            .unwrap();
+        s.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Option<f64>>(1)?)))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .filter_map(|(code, factor)| factor.map(|factor| (code, factor)))
+            .collect()
+    };
     // Helmert parameters
     {
         // Select the best Helmert transformation for each CRS→WGS84 path.
@@ -297,6 +315,7 @@ fn main() {
         code: u32,
         datum_code: u32,
         method_id: u8,
+        linear_unit_to_meter: f64,
         params: [f64; 7],
     }
     let mut proj_crs: Vec<ProjCrs> = Vec::new();
@@ -304,20 +323,42 @@ fn main() {
         let mut s = conn
             .prepare(
                 "SELECT pc.code, gc.datum_code, pc.conversion_auth_name, pc.conversion_code
+                    , a.uom_code, u.conv_factor
              FROM projected_crs pc
              JOIN geodetic_crs gc ON pc.geodetic_crs_code = gc.code
                AND pc.geodetic_crs_auth_name = gc.auth_name
+             LEFT JOIN axis a ON a.coordinate_system_auth_name = pc.coordinate_system_auth_name
+               AND a.coordinate_system_code = pc.coordinate_system_code
+               AND a.coordinate_system_order = 1
+             LEFT JOIN unit_of_measure u ON u.auth_name = a.uom_auth_name
+               AND u.code = a.uom_code
              WHERE pc.auth_name='EPSG' AND pc.deprecated=0
              ORDER BY pc.code",
             )
             .unwrap();
-        let raw: Vec<(u32, u32, String, i64)> = s
-            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+        let raw: Vec<(u32, u32, String, i64, Option<i64>, Option<f64>)> = s
+            .query_map([], |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                ))
+            })
             .unwrap()
             .filter_map(|r| r.ok())
             .collect();
 
-        for (code, datum_code, conv_auth, conv_code) in raw {
+        for (code, datum_code, conv_auth, conv_code, axis_uom_code, axis_unit_factor) in raw {
+            let linear_unit_to_meter = match (axis_uom_code, axis_unit_factor) {
+                (Some(_), Some(factor)) => factor,
+                (Some(uom_code), None) => {
+                    panic!("projected CRS EPSG:{code} uses unsupported axis linear unit EPSG:{uom_code}")
+                }
+                (None, _) => panic!("projected CRS EPSG:{code} is missing axis linear unit metadata"),
+            };
             let conv = match conn.query_row(
                 "SELECT method_code,
                     param1_code, param1_value, param1_uom_code,
@@ -356,11 +397,12 @@ fn main() {
                 None => continue,
             };
 
-            let params = encode_params(method_id, &conv);
+            let params = encode_params(method_id, &conv, &linear_uoms);
             proj_crs.push(ProjCrs {
                 code,
                 datum_code,
                 method_id,
+                linear_unit_to_meter,
                 params,
             });
         }
@@ -399,7 +441,7 @@ fn main() {
 
     // Header (16 bytes)
     buf.extend_from_slice(&MAGIC.to_le_bytes());
-    buf.extend_from_slice(&1u16.to_le_bytes()); // version
+    buf.extend_from_slice(&2u16.to_le_bytes()); // version
     buf.extend_from_slice(&(used_ellipsoids.len() as u16).to_le_bytes());
     buf.extend_from_slice(&(used_datums.len() as u16).to_le_bytes());
     buf.extend_from_slice(&(geo_crs.len() as u16).to_le_bytes());
@@ -441,8 +483,9 @@ fn main() {
         rec[4..8].copy_from_slice(&c.datum_code.to_le_bytes());
         rec[8] = c.method_id;
         // rec[9..16] = padding (zeros)
+        rec[16..24].copy_from_slice(&c.linear_unit_to_meter.to_le_bytes());
         for (i, &val) in c.params.iter().enumerate() {
-            let offset = 16 + i * 8;
+            let offset = 24 + i * 8;
             rec[offset..offset + 8].copy_from_slice(&val.to_le_bytes());
         }
         buf.extend_from_slice(&rec);
@@ -457,15 +500,15 @@ fn main() {
     );
 }
 
-fn encode_params(method_id: u8, cp: &ConvParams) -> [f64; 7] {
+fn encode_params(method_id: u8, cp: &ConvParams, linear_uoms: &BTreeMap<i64, f64>) -> [f64; 7] {
     match method_id {
         METHOD_WEB_MERCATOR => [0.0; 7],
         METHOD_TRANSVERSE_MERCATOR => [
             get_degrees(cp, &[LON_ORIGIN, LON_FALSE_ORIGIN, LON_OF_ORIGIN]),
             get_degrees(cp, &[LAT_ORIGIN, LAT_FALSE_ORIGIN]),
             get_scale(cp, &[SCALE_FACTOR]),
-            get_meters(cp, &[FALSE_EASTING, EASTING_FALSE_ORIGIN]),
-            get_meters(cp, &[FALSE_NORTHING, NORTHING_FALSE_ORIGIN]),
+            get_meters(cp, &[FALSE_EASTING, EASTING_FALSE_ORIGIN], linear_uoms),
+            get_meters(cp, &[FALSE_NORTHING, NORTHING_FALSE_ORIGIN], linear_uoms),
             0.0,
             0.0,
         ],
@@ -473,8 +516,8 @@ fn encode_params(method_id: u8, cp: &ConvParams) -> [f64; 7] {
             get_degrees(cp, &[LON_ORIGIN]),
             get_degrees(cp, &[LAT_1ST_PARALLEL, LAT_STD_PARALLEL]),
             get_scale(cp, &[SCALE_FACTOR]),
-            get_meters(cp, &[FALSE_EASTING]),
-            get_meters(cp, &[FALSE_NORTHING]),
+            get_meters(cp, &[FALSE_EASTING], linear_uoms),
+            get_meters(cp, &[FALSE_NORTHING], linear_uoms),
             0.0,
             0.0,
         ],
@@ -482,26 +525,26 @@ fn encode_params(method_id: u8, cp: &ConvParams) -> [f64; 7] {
             get_degrees(cp, &[LON_FALSE_ORIGIN, LON_ORIGIN]),
             get_degrees(cp, &[LAT_FALSE_ORIGIN, LAT_ORIGIN]),
             get_degrees(cp, &[LAT_1ST_PARALLEL]),
-            get_meters(cp, &[EASTING_FALSE_ORIGIN, FALSE_EASTING]),
+            get_meters(cp, &[EASTING_FALSE_ORIGIN, FALSE_EASTING], linear_uoms),
             0.0, // unused slot
             get_degrees(cp, &[LAT_2ND_PARALLEL]),
-            get_meters(cp, &[NORTHING_FALSE_ORIGIN, FALSE_NORTHING]),
+            get_meters(cp, &[NORTHING_FALSE_ORIGIN, FALSE_NORTHING], linear_uoms),
         ],
         METHOD_ALBERS => [
             get_degrees(cp, &[LON_FALSE_ORIGIN]),
             get_degrees(cp, &[LAT_FALSE_ORIGIN]),
             get_degrees(cp, &[LAT_1ST_PARALLEL]),
-            get_meters(cp, &[EASTING_FALSE_ORIGIN, FALSE_EASTING]),
+            get_meters(cp, &[EASTING_FALSE_ORIGIN, FALSE_EASTING], linear_uoms),
             0.0,
             get_degrees(cp, &[LAT_2ND_PARALLEL]),
-            get_meters(cp, &[NORTHING_FALSE_ORIGIN, FALSE_NORTHING]),
+            get_meters(cp, &[NORTHING_FALSE_ORIGIN, FALSE_NORTHING], linear_uoms),
         ],
         METHOD_POLAR_STEREO => [
             get_degrees(cp, &[LON_ORIGIN, LON_OF_ORIGIN]),
             get_degrees(cp, &[LAT_STD_PARALLEL, LAT_ORIGIN]),
             get_scale(cp, &[SCALE_FACTOR]),
-            get_meters(cp, &[FALSE_EASTING]),
-            get_meters(cp, &[FALSE_NORTHING]),
+            get_meters(cp, &[FALSE_EASTING], linear_uoms),
+            get_meters(cp, &[FALSE_NORTHING], linear_uoms),
             0.0,
             0.0,
         ],
@@ -509,8 +552,8 @@ fn encode_params(method_id: u8, cp: &ConvParams) -> [f64; 7] {
             get_degrees(cp, &[LON_ORIGIN]),
             get_degrees(cp, &[LAT_1ST_PARALLEL]),
             0.0,
-            get_meters(cp, &[FALSE_EASTING]),
-            get_meters(cp, &[FALSE_NORTHING]),
+            get_meters(cp, &[FALSE_EASTING], linear_uoms),
+            get_meters(cp, &[FALSE_NORTHING], linear_uoms),
             0.0,
             0.0,
         ],
