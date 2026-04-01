@@ -93,21 +93,6 @@ fn convert_dms_to_degrees(dms_value: f64) -> f64 {
     sign * (degrees + minutes / 60.0 + seconds / 3600.0)
 }
 
-fn uom_to_degrees(uom_code: i64) -> f64 {
-    match uom_code {
-        9102 | 9122 => 1.0,
-        9101 => 180.0 / std::f64::consts::PI,
-        9105 => 1.0 / 3600.0,
-        9104 => 1.0 / 60.0,
-        9107 => 180.0 / 200.0,
-        _ => 1.0,
-    }
-}
-
-fn uom_to_meters(uom_code: i64, linear_uoms: &BTreeMap<i64, f64>) -> f64 {
-    linear_uoms.get(&uom_code).copied().unwrap_or(1.0)
-}
-
 struct ConvParams {
     method_code: i64,
     params: BTreeMap<i64, (f64, i64)>, // param_code → (value, uom_code)
@@ -119,7 +104,18 @@ fn get_degrees(cp: &ConvParams, codes: &[i64]) -> f64 {
             return if uom == 9110 {
                 convert_dms_to_degrees(val)
             } else {
-                val * uom_to_degrees(uom)
+                let factor = match uom {
+                    9102 | 9122 => 1.0,
+                    9101 => 180.0 / std::f64::consts::PI,
+                    9105 => 1.0 / 3600.0,
+                    9104 => 1.0 / 60.0,
+                    9107 => 180.0 / 200.0,
+                    _ => panic!(
+                        "unsupported angular unit EPSG:{uom} for parameter EPSG:{code} in conversion method EPSG:{}",
+                        cp.method_code
+                    ),
+                };
+                val * factor
             };
         }
     }
@@ -129,7 +125,13 @@ fn get_degrees(cp: &ConvParams, codes: &[i64]) -> f64 {
 fn get_meters(cp: &ConvParams, codes: &[i64], linear_uoms: &BTreeMap<i64, f64>) -> f64 {
     for &code in codes {
         if let Some(&(val, uom)) = cp.params.get(&code) {
-            return val * uom_to_meters(uom, linear_uoms);
+            let factor = linear_uoms.get(&uom).copied().unwrap_or_else(|| {
+                panic!(
+                    "unsupported linear unit EPSG:{uom} for parameter EPSG:{code} in conversion method EPSG:{}",
+                    cp.method_code
+                )
+            });
+            return val * factor;
         }
     }
     0.0
@@ -321,7 +323,7 @@ fn main() {
         let mut s = conn
             .prepare(
                 "SELECT pc.code, gc.datum_code, pc.conversion_auth_name, pc.conversion_code
-                    , COALESCE(u.conv_factor, 1.0)
+                    , a.uom_code, u.conv_factor
              FROM projected_crs pc
              JOIN geodetic_crs gc ON pc.geodetic_crs_code = gc.code
                AND pc.geodetic_crs_auth_name = gc.auth_name
@@ -334,13 +336,29 @@ fn main() {
              ORDER BY pc.code",
             )
             .unwrap();
-        let raw: Vec<(u32, u32, String, i64, f64)> = s
-            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))
+        let raw: Vec<(u32, u32, String, i64, Option<i64>, Option<f64>)> = s
+            .query_map([], |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                ))
+            })
             .unwrap()
             .filter_map(|r| r.ok())
             .collect();
 
-        for (code, datum_code, conv_auth, conv_code, linear_unit_to_meter) in raw {
+        for (code, datum_code, conv_auth, conv_code, axis_uom_code, axis_unit_factor) in raw {
+            let linear_unit_to_meter = match (axis_uom_code, axis_unit_factor) {
+                (Some(_), Some(factor)) => factor,
+                (Some(uom_code), None) => {
+                    panic!("projected CRS EPSG:{code} uses unsupported axis linear unit EPSG:{uom_code}")
+                }
+                (None, _) => panic!("projected CRS EPSG:{code} is missing axis linear unit metadata"),
+            };
             let conv = match conn.query_row(
                 "SELECT method_code,
                     param1_code, param1_value, param1_uom_code,

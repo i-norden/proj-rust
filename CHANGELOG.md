@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.2.0
 
 - redesign the public CRS API around constructors/getters and a typed `LinearUnit`, replacing raw projected-unit scalars and making the native-unit model explicit
 - add projected native-unit support across `proj-core`, `proj-wkt`, and the embedded EPSG registry so foot-based and other non-meter projected CRS definitions transform correctly
