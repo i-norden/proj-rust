@@ -40,6 +40,8 @@ fn parse_projected_projjson(value: &Value) -> Result<CrsDef> {
         .get("conversion")
         .ok_or_else(|| ParseError::Parse("PROJJSON projected CRS is missing conversion".into()))?;
     let datum = infer_datum(value)?;
+    let linear_unit_to_meter = projected_linear_unit_to_meter(value).unwrap_or(1.0);
+    let base_angle_unit_to_degree = base_geographic_angle_unit_to_degree(value).unwrap_or(1.0);
     let method_name = conversion
         .get("method")
         .and_then(|method| method.get("name"))
@@ -47,7 +49,11 @@ fn parse_projected_projjson(value: &Value) -> Result<CrsDef> {
         .ok_or_else(|| {
             ParseError::Parse("PROJJSON projected CRS is missing conversion.method.name".into())
         })?;
-    let params = parse_parameters(conversion);
+    let params = parse_parameters(
+        conversion,
+        linear_unit_to_meter,
+        base_angle_unit_to_degree,
+    );
 
     let lon0 = first_param(
         &params,
@@ -181,6 +187,7 @@ fn parse_projected_projjson(value: &Value) -> Result<CrsDef> {
         epsg: 0,
         datum,
         method,
+        linear_unit_to_meter,
         name: "",
     }))
 }
@@ -260,7 +267,11 @@ fn collect_names(value: &Value, text: &mut String) {
     }
 }
 
-fn parse_parameters(conversion: &Value) -> HashMap<String, f64> {
+fn parse_parameters(
+    conversion: &Value,
+    projected_linear_unit_to_meter: f64,
+    base_angle_unit_to_degree: f64,
+) -> HashMap<String, f64> {
     let mut params = HashMap::new();
     let values = match conversion.get("parameters").and_then(Value::as_array) {
         Some(values) => values,
@@ -271,17 +282,191 @@ fn parse_parameters(conversion: &Value) -> HashMap<String, f64> {
         let Some(name) = param.get("name").and_then(Value::as_str) else {
             continue;
         };
+        let normalized_name = normalize_key(name);
         let value = match param.get("value") {
             Some(Value::Number(n)) => n.as_f64(),
             Some(Value::String(s)) => s.parse::<f64>().ok(),
             _ => None,
         };
         if let Some(value) = value {
-            params.insert(normalize_key(name), value);
+            let factor = parameter_factor_from_json(
+                param,
+                &normalized_name,
+                projected_linear_unit_to_meter,
+                base_angle_unit_to_degree,
+            );
+            params.insert(normalized_name, value * factor);
         }
     }
 
     params
+}
+
+#[derive(Clone, Copy)]
+enum ParameterUnitKind {
+    Angle,
+    Length,
+    Scale,
+    Other,
+}
+
+fn parameter_factor_from_json(
+    param: &Value,
+    normalized_name: &str,
+    projected_linear_unit_to_meter: f64,
+    base_angle_unit_to_degree: f64,
+) -> f64 {
+    let unit_kind = parameter_unit_kind(normalized_name);
+    match unit_kind {
+        ParameterUnitKind::Angle => param
+            .get("unit")
+            .and_then(angle_unit_to_degree_from_json)
+            .or_else(|| {
+                param.get("unit_conversion_factor")
+                    .and_then(Value::as_f64)
+                    .map(radians_to_degrees_factor)
+            })
+            .or_else(|| {
+                param.get("conversion_factor")
+                    .and_then(Value::as_f64)
+                    .map(radians_to_degrees_factor)
+            })
+            .unwrap_or(base_angle_unit_to_degree),
+        ParameterUnitKind::Length => param
+            .get("unit")
+            .and_then(linear_unit_to_meter_from_json)
+            .or_else(|| param.get("unit_conversion_factor").and_then(Value::as_f64))
+            .or_else(|| param.get("conversion_factor").and_then(Value::as_f64))
+            .unwrap_or(projected_linear_unit_to_meter),
+        ParameterUnitKind::Scale | ParameterUnitKind::Other => 1.0,
+    }
+}
+
+fn parameter_unit_kind(normalized_name: &str) -> ParameterUnitKind {
+    match normalized_name {
+        "centralmeridian"
+        | "longitudeofcenter"
+        | "longitudeofnaturalorigin"
+        | "longitudeoffalseorigin"
+        | "longitudeoforigin"
+        | "latitudeoforigin"
+        | "latitudeofcenter"
+        | "latitudeofnaturalorigin"
+        | "latitudeoffalseorigin"
+        | "standardparallel"
+        | "standardparallel1"
+        | "standardparallel2"
+        | "latitudeofstandardparallel"
+        | "latitudeof1ststandardparallel"
+        | "latitudeof2ndstandardparallel" => ParameterUnitKind::Angle,
+        "falseeasting"
+        | "falsenorthing"
+        | "eastingatfalseorigin"
+        | "northingatfalseorigin" => ParameterUnitKind::Length,
+        "scalefactor" | "scalefactoratnaturalorigin" | "scalefactoratprojectionorigin" => {
+            ParameterUnitKind::Scale
+        }
+        _ => ParameterUnitKind::Other,
+    }
+}
+
+fn projected_linear_unit_to_meter(value: &Value) -> Option<f64> {
+    value.get("coordinate_system")
+        .and_then(|cs| cs.get("axis"))
+        .and_then(Value::as_array)
+        .and_then(|axis| axis.first())
+        .and_then(axis_linear_unit_to_meter)
+}
+
+fn base_geographic_angle_unit_to_degree(value: &Value) -> Option<f64> {
+    value
+        .get("base_crs")
+        .and_then(|crs| crs.get("coordinate_system"))
+        .and_then(|cs| cs.get("axis"))
+        .and_then(Value::as_array)
+        .and_then(|axis| axis.first())
+        .and_then(axis_angle_unit_to_degree)
+}
+
+fn axis_linear_unit_to_meter(axis: &Value) -> Option<f64> {
+    axis.get("unit")
+        .and_then(linear_unit_to_meter_from_json)
+        .or_else(|| axis.get("unit_conversion_factor").and_then(Value::as_f64))
+        .or_else(|| axis.get("conversion_factor").and_then(Value::as_f64))
+}
+
+fn axis_angle_unit_to_degree(axis: &Value) -> Option<f64> {
+    axis.get("unit")
+        .and_then(angle_unit_to_degree_from_json)
+        .or_else(|| {
+            axis.get("unit_conversion_factor")
+                .and_then(Value::as_f64)
+                .map(radians_to_degrees_factor)
+        })
+        .or_else(|| {
+            axis.get("conversion_factor")
+                .and_then(Value::as_f64)
+                .map(radians_to_degrees_factor)
+        })
+}
+
+fn linear_unit_to_meter_from_json(value: &Value) -> Option<f64> {
+    if let Some(unit) = value.as_str() {
+        return linear_unit_name_to_meter(unit);
+    }
+
+    if let Some(factor) = value.get("conversion_factor").and_then(Value::as_f64) {
+        return Some(factor);
+    }
+    if let Some(factor) = value.get("unit_conversion_factor").and_then(Value::as_f64) {
+        return Some(factor);
+    }
+    value
+        .get("name")
+        .and_then(Value::as_str)
+        .and_then(linear_unit_name_to_meter)
+}
+
+fn angle_unit_to_degree_from_json(value: &Value) -> Option<f64> {
+    if let Some(unit) = value.as_str() {
+        return angle_unit_name_to_degree(unit);
+    }
+
+    if let Some(factor) = value.get("conversion_factor").and_then(Value::as_f64) {
+        return Some(radians_to_degrees_factor(factor));
+    }
+    if let Some(factor) = value.get("unit_conversion_factor").and_then(Value::as_f64) {
+        return Some(radians_to_degrees_factor(factor));
+    }
+    value
+        .get("name")
+        .and_then(Value::as_str)
+        .and_then(angle_unit_name_to_degree)
+}
+
+fn linear_unit_name_to_meter(name: &str) -> Option<f64> {
+    match normalize_key(name).as_str() {
+        "metre" | "meter" => Some(1.0),
+        "kilometre" | "kilometer" => Some(1000.0),
+        "foot" | "internationalfoot" | "ft" => Some(0.3048),
+        "ussurveyfoot" | "usfoot" | "usft" => Some(0.3048006096012192),
+        "yard" => Some(0.9144),
+        "nauticalmile" => Some(1852.0),
+        _ => None,
+    }
+}
+
+fn angle_unit_name_to_degree(name: &str) -> Option<f64> {
+    match normalize_key(name).as_str() {
+        "degree" => Some(1.0),
+        "radian" => Some(radians_to_degrees_factor(1.0)),
+        "grad" | "gon" => Some(0.9),
+        _ => None,
+    }
+}
+
+fn radians_to_degrees_factor(radians_per_unit: f64) -> f64 {
+    radians_per_unit.to_degrees()
 }
 
 fn first_param(params: &HashMap<String, f64>, names: &[&str]) -> Option<f64> {
@@ -301,6 +486,8 @@ fn normalize_key(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const US_FOOT_TO_METER: f64 = 0.3048006096012192;
 
     #[test]
     fn parses_projjson_with_top_level_epsg_id() {
@@ -373,5 +560,107 @@ mod tests {
         .unwrap();
 
         assert!(crs.is_projected());
+    }
+
+    #[test]
+    fn parses_projected_projjson_with_foot_units() {
+        let meter_crs = parse_projjson(
+            r#"{
+                "type": "ProjectedCRS",
+                "name": "Custom UTM 18N metre",
+                "base_crs": {
+                    "name": "WGS 84",
+                    "datum": { "name": "World Geodetic System 1984" }
+                },
+                "conversion": {
+                    "method": { "name": "Transverse Mercator" },
+                    "parameters": [
+                        { "name": "Latitude of natural origin", "value": 0 },
+                        { "name": "Longitude of natural origin", "value": -75 },
+                        { "name": "Scale factor at natural origin", "value": 0.9996 },
+                        { "name": "False easting", "value": 500000, "unit": "metre" },
+                        { "name": "False northing", "value": 0, "unit": "metre" }
+                    ]
+                },
+                "coordinate_system": {
+                    "subtype": "Cartesian",
+                    "axis": [
+                        { "name": "Easting", "direction": "east", "unit": "metre" },
+                        { "name": "Northing", "direction": "north", "unit": "metre" }
+                    ]
+                }
+            }"#,
+        )
+        .unwrap();
+        let foot_crs = parse_projjson(
+            r#"{
+                "type": "ProjectedCRS",
+                "name": "Custom UTM 18N ftUS",
+                "base_crs": {
+                    "name": "WGS 84",
+                    "datum": { "name": "World Geodetic System 1984" }
+                },
+                "conversion": {
+                    "method": { "name": "Transverse Mercator" },
+                    "parameters": [
+                        { "name": "Latitude of natural origin", "value": 0 },
+                        { "name": "Longitude of natural origin", "value": -75 },
+                        { "name": "Scale factor at natural origin", "value": 0.9996 },
+                        {
+                            "name": "False easting",
+                            "value": 1640416.6666666667,
+                            "unit": {
+                                "type": "LinearUnit",
+                                "name": "US survey foot",
+                                "conversion_factor": 0.3048006096012192
+                            }
+                        },
+                        {
+                            "name": "False northing",
+                            "value": 0,
+                            "unit": {
+                                "type": "LinearUnit",
+                                "name": "US survey foot",
+                                "conversion_factor": 0.3048006096012192
+                            }
+                        }
+                    ]
+                },
+                "coordinate_system": {
+                    "subtype": "Cartesian",
+                    "axis": [
+                        {
+                            "name": "Easting",
+                            "direction": "east",
+                            "unit": {
+                                "type": "LinearUnit",
+                                "name": "US survey foot",
+                                "conversion_factor": 0.3048006096012192
+                            }
+                        },
+                        {
+                            "name": "Northing",
+                            "direction": "north",
+                            "unit": {
+                                "type": "LinearUnit",
+                                "name": "US survey foot",
+                                "conversion_factor": 0.3048006096012192
+                            }
+                        }
+                    ]
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let from = proj_core::lookup_epsg(4326).unwrap();
+        let meter_tx = proj_core::Transform::from_crs_defs(&from, &meter_crs).unwrap();
+        let foot_tx = proj_core::Transform::from_crs_defs(&from, &foot_crs).unwrap();
+
+        let (mx, my) = meter_tx.convert((-74.006, 40.7128)).unwrap();
+        let (fx, fy) = foot_tx.convert((-74.006, 40.7128)).unwrap();
+
+        assert!((fx * US_FOOT_TO_METER - mx).abs() < 0.02, "x mismatch");
+        assert!((fy * US_FOOT_TO_METER - my).abs() < 0.02, "y mismatch");
     }
 }

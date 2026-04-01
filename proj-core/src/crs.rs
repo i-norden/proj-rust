@@ -56,7 +56,7 @@ pub struct GeographicCrsDef {
     pub name: &'static str,
 }
 
-/// Definition of a projected CRS (easting, northing in meters).
+/// Definition of a projected CRS (easting, northing in the CRS's native linear unit).
 #[derive(Debug, Clone, Copy)]
 pub struct ProjectedCrsDef {
     /// EPSG code.
@@ -65,6 +65,11 @@ pub struct ProjectedCrsDef {
     pub datum: Datum,
     /// Projection method and parameters.
     pub method: ProjectionMethod,
+    /// Conversion factor from the CRS's native projected unit to meters.
+    ///
+    /// For meter-based CRS this is `1.0`. For a US survey foot CRS, this is
+    /// `0.3048006096012192`.
+    pub linear_unit_to_meter: f64,
     /// Human-readable name.
     pub name: &'static str,
 }
@@ -188,6 +193,7 @@ mod tests {
             epsg: 3857,
             datum: datum::WGS84,
             method: ProjectionMethod::WebMercator,
+            linear_unit_to_meter: 1.0,
             name: "WGS 84 / Pseudo-Mercator",
         });
         assert!(crs.is_projected());

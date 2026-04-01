@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- add projected native-unit support across `proj-core`, `proj-wkt`, and the embedded EPSG registry so foot-based and other non-meter projected CRS definitions transform correctly
 - add native 3D coordinate APIs in `proj-core` and `proj-wkt`, with `z` preserved by the current horizontal-only transform pipeline
 - add live bundled C PROJ parity coverage and benchmark coverage for the new 3D transform path
 - optimize exact same-definition custom CRS transforms to use the identity pipeline

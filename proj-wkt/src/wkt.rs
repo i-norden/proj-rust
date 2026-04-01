@@ -206,7 +206,13 @@ fn parse_wkt_projected(s: &str) -> Result<CrsDef> {
         ParseError::Parse("WKT projected CRS is missing a projection method".into())
     })?;
 
-    let params = parse_wkt_parameters(s);
+    let projected_linear_unit_to_meter = extract_projected_linear_unit_to_meter(s).unwrap_or(1.0);
+    let base_angle_unit_to_degree = extract_base_geographic_angle_unit_to_degree(s).unwrap_or(1.0);
+    let params = parse_wkt_parameters(
+        s,
+        projected_linear_unit_to_meter,
+        base_angle_unit_to_degree,
+    );
 
     // Extract common parameters
     let lon0 = first_param(
@@ -348,6 +354,7 @@ fn parse_wkt_projected(s: &str) -> Result<CrsDef> {
         epsg: 0,
         datum,
         method,
+        linear_unit_to_meter: projected_linear_unit_to_meter,
         name: "",
     }))
 }
@@ -398,43 +405,225 @@ fn extract_wkt_value(upper: &str, key: &str) -> Option<String> {
     Some(rest[..end].to_string())
 }
 
-fn parse_wkt_parameters(s: &str) -> HashMap<String, f64> {
+fn parse_wkt_parameters(
+    s: &str,
+    projected_linear_unit_to_meter: f64,
+    base_angle_unit_to_degree: f64,
+) -> HashMap<String, f64> {
     let upper = s.to_uppercase();
     let mut params = HashMap::new();
     let mut search_start = 0usize;
 
     while let Some(rel) = upper[search_start..].find("PARAMETER[") {
-        let start = search_start + rel + "PARAMETER[".len();
-        let rest = &s[start..];
-        let quote_start = match rest.find('"') {
-            Some(pos) => pos,
-            None => break,
-        };
-        let name_start = start + quote_start + 1;
-        let name_rest = &s[name_start..];
-        let name_end = match name_rest.find('"') {
-            Some(pos) => pos,
-            None => break,
-        };
-        let name = &name_rest[..name_end];
-        let after_name = &name_rest[name_end + 1..];
-        let comma = match after_name.find(',') {
-            Some(pos) => pos,
-            None => break,
-        };
-        let value_rest = after_name[comma + 1..].trim_start();
-        let value_len = value_rest
-            .find(|c: char| !(c.is_ascii_digit() || matches!(c, '.' | '-' | '+' | 'e' | 'E')))
-            .unwrap_or(value_rest.len());
-
-        if let Ok(value) = value_rest[..value_len].parse::<f64>() {
-            params.insert(normalize_key(name), value);
+        let start = search_start + rel;
+        if let Some((name, inner, next)) = parse_wkt_element(s, start) {
+            if name.eq_ignore_ascii_case("PARAMETER") {
+                if let Some((key, value)) = parse_parameter_element(
+                    inner,
+                    projected_linear_unit_to_meter,
+                    base_angle_unit_to_degree,
+                ) {
+                    params.insert(key, value);
+                }
+                search_start = next;
+                continue;
+            }
         }
-
-        search_start = name_start + name_end + 1;
+        search_start = start + "PARAMETER[".len();
     }
 
     params
+}
+
+#[derive(Clone, Copy)]
+enum ParameterUnitKind {
+    Angle,
+    Length,
+    Scale,
+    Other,
+}
+
+fn parse_parameter_element(
+    inner: &str,
+    projected_linear_unit_to_meter: f64,
+    base_angle_unit_to_degree: f64,
+) -> Option<(String, f64)> {
+    let fields = split_top_level_fields(inner);
+    if fields.len() < 2 {
+        return None;
+    }
+
+    let name = trim_wkt_token(fields[0]);
+    let normalized_name = normalize_key(name);
+    let value = fields[1].trim().parse::<f64>().ok()?;
+    let unit_kind = parameter_unit_kind(&normalized_name);
+
+    let nested_factor = fields.iter().skip(2).find_map(|field| {
+        let field = field.trim();
+        let (unit_name, unit_inner, _) = parse_wkt_element(field, 0)?;
+        match unit_name.to_ascii_uppercase().as_str() {
+            "ANGLEUNIT" => parse_unit_factor(unit_inner).map(radians_to_degrees_factor),
+            "LENGTHUNIT" | "UNIT" => parse_unit_factor(unit_inner),
+            "SCALEUNIT" => parse_unit_factor(unit_inner),
+            _ => None,
+        }
+    });
+
+    let default_factor = match unit_kind {
+        ParameterUnitKind::Angle => base_angle_unit_to_degree,
+        ParameterUnitKind::Length => projected_linear_unit_to_meter,
+        ParameterUnitKind::Scale | ParameterUnitKind::Other => 1.0,
+    };
+
+    Some((normalized_name, value * nested_factor.unwrap_or(default_factor)))
+}
+
+fn parameter_unit_kind(normalized_name: &str) -> ParameterUnitKind {
+    match normalized_name {
+        "centralmeridian"
+        | "longitudeofcenter"
+        | "longitudeofnaturalorigin"
+        | "longitudeoffalseorigin"
+        | "longitudeoforigin"
+        | "latitudeoforigin"
+        | "latitudeofcenter"
+        | "latitudeofnaturalorigin"
+        | "latitudeoffalseorigin"
+        | "standardparallel"
+        | "standardparallel1"
+        | "standardparallel2"
+        | "latitudeofstandardparallel"
+        | "latitudeof1ststandardparallel"
+        | "latitudeof2ndstandardparallel" => ParameterUnitKind::Angle,
+        "falseeasting"
+        | "falsenorthing"
+        | "eastingatfalseorigin"
+        | "northingatfalseorigin" => ParameterUnitKind::Length,
+        "scalefactor" | "scalefactoratnaturalorigin" | "scalefactoratprojectionorigin" => {
+            ParameterUnitKind::Scale
+        }
+        _ => ParameterUnitKind::Other,
+    }
+}
+
+fn split_top_level_fields(s: &str) -> Vec<&str> {
+    let mut fields = Vec::new();
+    let mut field_start = 0usize;
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let bytes = s.as_bytes();
+    let mut i = 0usize;
+
+    while i < bytes.len() {
+        match bytes[i] {
+            b'"' => {
+                if in_string && bytes.get(i + 1) == Some(&b'"') {
+                    i += 2;
+                    continue;
+                }
+                in_string = !in_string;
+            }
+            _ if in_string => {}
+            b'[' => depth += 1,
+            b']' => depth = depth.saturating_sub(1),
+            b',' if depth == 0 => {
+                fields.push(s[field_start..i].trim());
+                field_start = i + 1;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+
+    fields.push(s[field_start..].trim());
+    fields
+}
+
+fn root_inner(s: &str) -> Option<&str> {
+    parse_wkt_element(s, 0).map(|(_, inner, _)| inner)
+}
+
+fn extract_projected_linear_unit_to_meter(s: &str) -> Option<f64> {
+    let inner = root_inner(s)?;
+    let mut factor = None;
+    for_each_top_level_element(inner, |name, element_inner| {
+        if name.eq_ignore_ascii_case("UNIT") || name.eq_ignore_ascii_case("LENGTHUNIT") {
+            factor = parse_unit_factor(element_inner);
+        }
+    });
+    factor
+}
+
+fn extract_base_geographic_angle_unit_to_degree(s: &str) -> Option<f64> {
+    let upper = s.to_uppercase();
+    for name in ["BASEGEOGCRS", "GEOGCRS", "GEODCRS", "GEOGCS"] {
+        if let Some(start) = upper.find(name) {
+            if let Some((_, inner, _)) = parse_wkt_element(s, start) {
+                let mut factor = None;
+                for_each_top_level_element(inner, |unit_name, unit_inner| {
+                    if unit_name.eq_ignore_ascii_case("UNIT")
+                        || unit_name.eq_ignore_ascii_case("ANGLEUNIT")
+                    {
+                        factor = parse_unit_factor(unit_inner).map(radians_to_degrees_factor);
+                    }
+                });
+                if factor.is_some() {
+                    return factor;
+                }
+            }
+        }
+    }
+    None
+}
+
+fn for_each_top_level_element<'a, F>(inner: &'a str, mut f: F)
+where
+    F: FnMut(&'a str, &'a str),
+{
+    let mut i = 0usize;
+    let bytes = inner.as_bytes();
+    let mut depth = 0usize;
+    let mut in_string = false;
+
+    while i < bytes.len() {
+        match bytes[i] {
+            b'"' => {
+                if in_string && bytes.get(i + 1) == Some(&b'"') {
+                    i += 2;
+                    continue;
+                }
+                in_string = !in_string;
+                i += 1;
+            }
+            _ if in_string => i += 1,
+            b'[' => {
+                depth += 1;
+                i += 1;
+            }
+            b']' => {
+                depth = depth.saturating_sub(1);
+                i += 1;
+            }
+            _ if depth == 0 => {
+                if let Some((name, element_inner, next)) = parse_wkt_element(inner, i) {
+                    f(name, element_inner);
+                    i = next;
+                } else {
+                    i += 1;
+                }
+            }
+            _ => i += 1,
+        }
+    }
+}
+
+fn parse_unit_factor(inner: &str) -> Option<f64> {
+    let fields = split_top_level_fields(inner);
+    fields.get(1)?.trim().parse::<f64>().ok()
+}
+
+fn radians_to_degrees_factor(radians_per_unit: f64) -> f64 {
+    radians_per_unit.to_degrees()
 }
 
 fn first_param(params: &HashMap<String, f64>, names: &[&str]) -> Option<f64> {
@@ -454,6 +643,8 @@ fn normalize_key(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const US_FOOT_TO_METER: f64 = 0.3048006096012192;
 
     #[test]
     fn extract_top_level_epsg_from_wkt() {
@@ -513,6 +704,25 @@ mod tests {
         let wkt = r#"PROJCRS["WGS 84 / UTM zone 18N",BASEGEOGCRS["WGS 84",DATUM["World Geodetic System 1984",ELLIPSOID["WGS 84",6378137,298.257223563]]],CONVERSION["UTM zone 18N",METHOD["Transverse Mercator"],PARAMETER["Latitude of natural origin",0,ANGLEUNIT["degree",0.0174532925199433]],PARAMETER["Longitude of natural origin",-75,ANGLEUNIT["degree",0.0174532925199433]],PARAMETER["Scale factor at natural origin",0.9996,SCALEUNIT["unity",1]],PARAMETER["False easting",500000,LENGTHUNIT["metre",1]],PARAMETER["False northing",0,LENGTHUNIT["metre",1]]],CS[Cartesian,2],AXIS["easting",east],AXIS["northing",north],LENGTHUNIT["metre",1]]"#;
         let crs = parse_wkt(wkt).unwrap();
         assert!(crs.is_projected());
+    }
+
+    #[test]
+    fn parse_wkt_projcs_with_foot_units() {
+        let meter_wkt = r#"PROJCS["UTM 18N metre",GEOGCS["WGS 84",DATUM["WGS_1984",SPHEROID["WGS 84",6378137,298.257223563]],UNIT["Degree",0.0174532925199433]],PROJECTION["Transverse_Mercator"],PARAMETER["latitude_of_origin",0],PARAMETER["central_meridian",-75],PARAMETER["scale_factor",0.9996],PARAMETER["false_easting",500000],PARAMETER["false_northing",0],UNIT["metre",1]]"#;
+        let foot_wkt = r#"PROJCS["UTM 18N ftUS",GEOGCS["WGS 84",DATUM["WGS_1984",SPHEROID["WGS 84",6378137,298.257223563]],UNIT["Degree",0.0174532925199433]],PROJECTION["Transverse_Mercator"],PARAMETER["latitude_of_origin",0],PARAMETER["central_meridian",-75],PARAMETER["scale_factor",0.9996],PARAMETER["false_easting",1640416.6666666667],PARAMETER["false_northing",0],UNIT["Foot_US",0.3048006096012192]]"#;
+
+        let meter_crs = parse_wkt(meter_wkt).unwrap();
+        let foot_crs = parse_wkt(foot_wkt).unwrap();
+        let from = proj_core::lookup_epsg(4326).unwrap();
+
+        let meter_tx = proj_core::Transform::from_crs_defs(&from, &meter_crs).unwrap();
+        let foot_tx = proj_core::Transform::from_crs_defs(&from, &foot_crs).unwrap();
+
+        let (mx, my) = meter_tx.convert((-74.006, 40.7128)).unwrap();
+        let (fx, fy) = foot_tx.convert((-74.006, 40.7128)).unwrap();
+
+        assert!((fx * US_FOOT_TO_METER - mx).abs() < 0.02, "x mismatch");
+        assert!((fy * US_FOOT_TO_METER - my).abs() < 0.02, "y mismatch");
     }
 
     #[test]

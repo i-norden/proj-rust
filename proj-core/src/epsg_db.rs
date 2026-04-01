@@ -10,7 +10,7 @@
 //! ```text
 //! Header (16 bytes):
 //!   [0..4]   u32  magic = 0x45505347 ("EPSG")
-//!   [4..6]   u16  version = 1
+//!   [4..6]   u16  version = 2
 //!   [6..8]   u16  num_ellipsoids
 //!   [8..10]  u16  num_datums
 //!   [10..12] u16  num_geographic_crs
@@ -41,18 +41,19 @@
 //!     [4..8]   u32  datum_epsg_code
 //!
 //! Projected CRS table (sorted by EPSG code):
-//!   Each record = 72 bytes:
+//!   Each record = 80 bytes:
 //!     [0..4]   u32  epsg_code
 //!     [4..8]   u32  datum_epsg_code
 //!     [8..9]   u8   method_id (see METHOD_* constants)
 //!     [9..16]  [u8; 7] reserved/padding
-//!     [16..24] f64  param0 (lon0 / central_meridian, degrees)
-//!     [24..32] f64  param1 (lat0 / lat_ts, degrees)
-//!     [32..40] f64  param2 (k0 / lat1, depends on method)
-//!     [40..48] f64  param3 (false_easting / lat2, depends on method)
-//!     [48..56] f64  param4 (false_northing, meters)
-//!     [56..64] f64  param5 (extra: lat2 for LCC/Albers)
-//!     [64..72] f64  param6 (extra: false_northing for LCC/Albers when lat2 used)
+//!     [16..24] f64  linear_unit_to_meter
+//!     [24..32] f64  param0 (lon0 / central_meridian, degrees)
+//!     [32..40] f64  param1 (lat0 / lat_ts, degrees)
+//!     [40..48] f64  param2 (k0 / lat1, depends on method)
+//!     [48..56] f64  param3 (false_easting, meters)
+//!     [56..64] f64  param4 (false_northing, meters)
+//!     [64..72] f64  param5 (extra: lat2 for LCC/Albers)
+//!     [72..80] f64  param6 (extra: false_northing for LCC/Albers when lat2 used)
 //! ```
 
 use crate::crs::*;
@@ -67,7 +68,7 @@ const HEADER_SIZE: usize = 16;
 const ELLIPSOID_RECORD_SIZE: usize = 20;
 const DATUM_RECORD_SIZE: usize = 64;
 const GEO_CRS_RECORD_SIZE: usize = 8;
-const PROJ_CRS_RECORD_SIZE: usize = 72;
+const PROJ_CRS_RECORD_SIZE: usize = 80;
 
 // Method IDs (must match generator)
 pub(crate) const METHOD_WEB_MERCATOR: u8 = 1;
@@ -119,6 +120,7 @@ fn layout() -> DbLayout {
     let data = EPSG_DATA;
     assert!(data.len() >= HEADER_SIZE, "EPSG database too small");
     assert_eq!(read_u32(data, 0), MAGIC, "invalid EPSG database magic");
+    assert_eq!(read_u16(data, 4), 2, "unsupported EPSG database version");
 
     let num_ellipsoids = read_u16(data, 6) as usize;
     let num_datums = read_u16(data, 8) as usize;
@@ -259,13 +261,14 @@ pub(crate) fn lookup_projected(code: u32) -> Option<CrsDef> {
     let datum = lookup_datum(&db, datum_code)?;
     let method_id = EPSG_DATA[offset + 8];
 
-    let p0 = read_f64(EPSG_DATA, offset + 16);
-    let p1 = read_f64(EPSG_DATA, offset + 24);
-    let p2 = read_f64(EPSG_DATA, offset + 32);
-    let p3 = read_f64(EPSG_DATA, offset + 40);
-    let p4 = read_f64(EPSG_DATA, offset + 48);
-    let p5 = read_f64(EPSG_DATA, offset + 56);
-    let p6 = read_f64(EPSG_DATA, offset + 64);
+    let linear_unit_to_meter = read_f64(EPSG_DATA, offset + 16);
+    let p0 = read_f64(EPSG_DATA, offset + 24);
+    let p1 = read_f64(EPSG_DATA, offset + 32);
+    let p2 = read_f64(EPSG_DATA, offset + 40);
+    let p3 = read_f64(EPSG_DATA, offset + 48);
+    let p4 = read_f64(EPSG_DATA, offset + 56);
+    let p5 = read_f64(EPSG_DATA, offset + 64);
+    let p6 = read_f64(EPSG_DATA, offset + 72);
 
     let method = match method_id {
         METHOD_WEB_MERCATOR => ProjectionMethod::WebMercator,
@@ -319,6 +322,7 @@ pub(crate) fn lookup_projected(code: u32) -> Option<CrsDef> {
         epsg: code,
         datum,
         method,
+        linear_unit_to_meter,
         name: "",
     }))
 }
@@ -379,6 +383,21 @@ mod tests {
         // EPSG:32119 — NAD83 / North Carolina
         let crs = lookup(32119).expect("32119");
         assert!(crs.is_projected());
+    }
+
+    #[test]
+    fn lookup_nc_state_plane_feet_unit() {
+        // EPSG:2264 — NAD83 / North Carolina (ftUS)
+        let crs = lookup(2264).expect("2264");
+        let CrsDef::Projected(projected) = crs else {
+            panic!("expected projected CRS");
+        };
+
+        assert!(
+            (projected.linear_unit_to_meter - 0.3048006096012192).abs() < 1e-15,
+            "linear unit = {}",
+            projected.linear_unit_to_meter
+        );
     }
 
     #[test]
