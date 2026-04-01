@@ -2,7 +2,9 @@ use serde_json::Value;
 use std::collections::HashMap;
 
 use crate::{ParseError, Result};
-use proj_core::{CrsDef, Datum, GeographicCrsDef, ProjectedCrsDef, ProjectionMethod};
+use proj_core::{
+    CrsDef, Datum, GeographicCrsDef, LinearUnit, ProjectedCrsDef, ProjectionMethod,
+};
 
 pub(crate) fn parse_projjson(s: &str) -> Result<CrsDef> {
     let value: Value =
@@ -22,11 +24,7 @@ pub(crate) fn parse_projjson(s: &str) -> Result<CrsDef> {
     match crs_type {
         "GeographicCRS" | "GeodeticCRS" => {
             let datum = infer_datum(&value)?;
-            Ok(CrsDef::Geographic(GeographicCrsDef {
-                epsg: 0,
-                datum,
-                name: "",
-            }))
+            Ok(CrsDef::Geographic(GeographicCrsDef::new(0, datum, "")))
         }
         "ProjectedCRS" => parse_projected_projjson(&value),
         other => Err(ParseError::Parse(format!(
@@ -40,7 +38,7 @@ fn parse_projected_projjson(value: &Value) -> Result<CrsDef> {
         .get("conversion")
         .ok_or_else(|| ParseError::Parse("PROJJSON projected CRS is missing conversion".into()))?;
     let datum = infer_datum(value)?;
-    let linear_unit_to_meter = projected_linear_unit_to_meter(value).unwrap_or(1.0);
+    let linear_unit = projected_linear_unit(value).unwrap_or_else(LinearUnit::metre);
     let base_angle_unit_to_degree = base_geographic_angle_unit_to_degree(value).unwrap_or(1.0);
     let method_name = conversion
         .get("method")
@@ -49,11 +47,7 @@ fn parse_projected_projjson(value: &Value) -> Result<CrsDef> {
         .ok_or_else(|| {
             ParseError::Parse("PROJJSON projected CRS is missing conversion.method.name".into())
         })?;
-    let params = parse_parameters(
-        conversion,
-        linear_unit_to_meter,
-        base_angle_unit_to_degree,
-    );
+    let params = parse_parameters(conversion, linear_unit, base_angle_unit_to_degree);
 
     let lon0 = first_param(
         &params,
@@ -183,13 +177,13 @@ fn parse_projected_projjson(value: &Value) -> Result<CrsDef> {
         }
     };
 
-    Ok(CrsDef::Projected(ProjectedCrsDef {
-        epsg: 0,
+    Ok(CrsDef::Projected(ProjectedCrsDef::new(
+        0,
         datum,
         method,
-        linear_unit_to_meter,
-        name: "",
-    }))
+        linear_unit,
+        "",
+    )))
 }
 
 fn top_level_epsg_id(value: &Value) -> Option<u32> {
@@ -207,35 +201,28 @@ fn top_level_epsg_id(value: &Value) -> Option<u32> {
 }
 
 fn infer_datum(value: &Value) -> Result<Datum> {
-    let mut text = String::new();
-    collect_names(value, &mut text);
-    let upper = text.to_uppercase();
-
-    if upper.contains("WORLD GEODETIC SYSTEM 1984")
-        || upper.contains("WGS 84")
-        || upper.contains("WGS84")
-    {
+    if any_name_contains(value, &["WORLD GEODETIC SYSTEM 1984", "WGS 84", "WGS84"]) {
         return Ok(proj_core::datum::WGS84);
     }
-    if upper.contains("NORTH AMERICAN DATUM 1983") || upper.contains("NAD83") {
+    if any_name_contains(value, &["NORTH AMERICAN DATUM 1983", "NAD83"]) {
         return Ok(proj_core::datum::NAD83);
     }
-    if upper.contains("NORTH AMERICAN DATUM 1927") || upper.contains("NAD27") {
+    if any_name_contains(value, &["NORTH AMERICAN DATUM 1927", "NAD27"]) {
         return Ok(proj_core::datum::NAD27);
     }
-    if upper.contains("ETRS89") || upper.contains("ETRS 89") {
+    if any_name_contains(value, &["ETRS89", "ETRS 89"]) {
         return Ok(proj_core::datum::ETRS89);
     }
-    if upper.contains("OSGB") || upper.contains("ORDNANCE SURVEY GREAT BRITAIN 1936") {
+    if any_name_contains(value, &["OSGB", "ORDNANCE SURVEY GREAT BRITAIN 1936"]) {
         return Ok(proj_core::datum::OSGB36);
     }
-    if upper.contains("ED50") || upper.contains("EUROPEAN DATUM 1950") {
+    if any_name_contains(value, &["ED50", "EUROPEAN DATUM 1950"]) {
         return Ok(proj_core::datum::ED50);
     }
-    if upper.contains("PULKOVO") {
+    if any_name_contains(value, &["PULKOVO"]) {
         return Ok(proj_core::datum::PULKOVO1942);
     }
-    if upper.contains("TOKYO") {
+    if any_name_contains(value, &["TOKYO"]) {
         return Ok(proj_core::datum::TOKYO);
     }
 
@@ -244,32 +231,23 @@ fn infer_datum(value: &Value) -> Result<Datum> {
     ))
 }
 
-fn collect_names(value: &Value, text: &mut String) {
+fn any_name_contains(value: &Value, needles: &[&str]) -> bool {
     match value {
-        Value::Object(map) => {
-            for (key, val) in map {
-                if key == "name" {
-                    if let Some(s) = val.as_str() {
-                        text.push_str(s);
-                        text.push('\n');
-                    }
-                } else {
-                    collect_names(val, text);
-                }
-            }
-        }
-        Value::Array(values) => {
-            for val in values {
-                collect_names(val, text);
-            }
-        }
-        _ => {}
+        Value::Object(map) => map.iter().any(|(key, val)| {
+            (key == "name"
+                && val
+                    .as_str()
+                    .is_some_and(|s| needles.iter().any(|needle| contains_ascii_case_insensitive(s, needle))))
+                || any_name_contains(val, needles)
+        }),
+        Value::Array(values) => values.iter().any(|val| any_name_contains(val, needles)),
+        _ => false,
     }
 }
 
 fn parse_parameters(
     conversion: &Value,
-    projected_linear_unit_to_meter: f64,
+    projected_linear_unit: LinearUnit,
     base_angle_unit_to_degree: f64,
 ) -> HashMap<String, f64> {
     let mut params = HashMap::new();
@@ -292,7 +270,7 @@ fn parse_parameters(
             let factor = parameter_factor_from_json(
                 param,
                 &normalized_name,
-                projected_linear_unit_to_meter,
+                projected_linear_unit,
                 base_angle_unit_to_degree,
             );
             params.insert(normalized_name, value * factor);
@@ -313,7 +291,7 @@ enum ParameterUnitKind {
 fn parameter_factor_from_json(
     param: &Value,
     normalized_name: &str,
-    projected_linear_unit_to_meter: f64,
+    projected_linear_unit: LinearUnit,
     base_angle_unit_to_degree: f64,
 ) -> f64 {
     let unit_kind = parameter_unit_kind(normalized_name);
@@ -334,10 +312,11 @@ fn parameter_factor_from_json(
             .unwrap_or(base_angle_unit_to_degree),
         ParameterUnitKind::Length => param
             .get("unit")
-            .and_then(linear_unit_to_meter_from_json)
+            .and_then(linear_unit_from_json)
+            .map(LinearUnit::meters_per_unit)
             .or_else(|| param.get("unit_conversion_factor").and_then(Value::as_f64))
             .or_else(|| param.get("conversion_factor").and_then(Value::as_f64))
-            .unwrap_or(projected_linear_unit_to_meter),
+            .unwrap_or(projected_linear_unit.meters_per_unit()),
         ParameterUnitKind::Scale | ParameterUnitKind::Other => 1.0,
     }
 }
@@ -370,12 +349,12 @@ fn parameter_unit_kind(normalized_name: &str) -> ParameterUnitKind {
     }
 }
 
-fn projected_linear_unit_to_meter(value: &Value) -> Option<f64> {
+fn projected_linear_unit(value: &Value) -> Option<LinearUnit> {
     value.get("coordinate_system")
         .and_then(|cs| cs.get("axis"))
         .and_then(Value::as_array)
         .and_then(|axis| axis.first())
-        .and_then(axis_linear_unit_to_meter)
+        .and_then(axis_linear_unit)
 }
 
 fn base_geographic_angle_unit_to_degree(value: &Value) -> Option<f64> {
@@ -388,11 +367,19 @@ fn base_geographic_angle_unit_to_degree(value: &Value) -> Option<f64> {
         .and_then(axis_angle_unit_to_degree)
 }
 
-fn axis_linear_unit_to_meter(axis: &Value) -> Option<f64> {
+fn axis_linear_unit(axis: &Value) -> Option<LinearUnit> {
     axis.get("unit")
-        .and_then(linear_unit_to_meter_from_json)
-        .or_else(|| axis.get("unit_conversion_factor").and_then(Value::as_f64))
-        .or_else(|| axis.get("conversion_factor").and_then(Value::as_f64))
+        .and_then(linear_unit_from_json)
+        .or_else(|| {
+            axis.get("unit_conversion_factor")
+                .and_then(Value::as_f64)
+                .and_then(|factor| LinearUnit::from_meters_per_unit(factor).ok())
+        })
+        .or_else(|| {
+            axis.get("conversion_factor")
+                .and_then(Value::as_f64)
+                .and_then(|factor| LinearUnit::from_meters_per_unit(factor).ok())
+        })
 }
 
 fn axis_angle_unit_to_degree(axis: &Value) -> Option<f64> {
@@ -410,21 +397,21 @@ fn axis_angle_unit_to_degree(axis: &Value) -> Option<f64> {
         })
 }
 
-fn linear_unit_to_meter_from_json(value: &Value) -> Option<f64> {
+fn linear_unit_from_json(value: &Value) -> Option<LinearUnit> {
     if let Some(unit) = value.as_str() {
-        return linear_unit_name_to_meter(unit);
+        return linear_unit_name(unit);
     }
 
     if let Some(factor) = value.get("conversion_factor").and_then(Value::as_f64) {
-        return Some(factor);
+        return LinearUnit::from_meters_per_unit(factor).ok();
     }
     if let Some(factor) = value.get("unit_conversion_factor").and_then(Value::as_f64) {
-        return Some(factor);
+        return LinearUnit::from_meters_per_unit(factor).ok();
     }
     value
         .get("name")
         .and_then(Value::as_str)
-        .and_then(linear_unit_name_to_meter)
+        .and_then(linear_unit_name)
 }
 
 fn angle_unit_to_degree_from_json(value: &Value) -> Option<f64> {
@@ -444,14 +431,14 @@ fn angle_unit_to_degree_from_json(value: &Value) -> Option<f64> {
         .and_then(angle_unit_name_to_degree)
 }
 
-fn linear_unit_name_to_meter(name: &str) -> Option<f64> {
+fn linear_unit_name(name: &str) -> Option<LinearUnit> {
     match normalize_key(name).as_str() {
-        "metre" | "meter" => Some(1.0),
-        "kilometre" | "kilometer" => Some(1000.0),
-        "foot" | "internationalfoot" | "ft" => Some(0.3048),
-        "ussurveyfoot" | "usfoot" | "usft" => Some(0.3048006096012192),
-        "yard" => Some(0.9144),
-        "nauticalmile" => Some(1852.0),
+        "metre" | "meter" => Some(LinearUnit::metre()),
+        "kilometre" | "kilometer" => Some(LinearUnit::kilometre()),
+        "foot" | "internationalfoot" | "ft" => Some(LinearUnit::foot()),
+        "ussurveyfoot" | "usfoot" | "usft" => Some(LinearUnit::us_survey_foot()),
+        "yard" => LinearUnit::from_meters_per_unit(0.9144).ok(),
+        "nauticalmile" => LinearUnit::from_meters_per_unit(1852.0).ok(),
         _ => None,
     }
 }
@@ -481,6 +468,16 @@ fn normalize_key(value: &str) -> String {
         .filter(|c| c.is_ascii_alphanumeric())
         .flat_map(|c| c.to_lowercase())
         .collect()
+}
+
+fn contains_ascii_case_insensitive(haystack: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+
+    haystack
+        .char_indices()
+        .any(|(idx, _)| matches!(haystack.get(idx..idx + needle.len()), Some(slice) if slice.eq_ignore_ascii_case(needle)))
 }
 
 #[cfg(test)]

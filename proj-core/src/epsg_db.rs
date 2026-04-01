@@ -240,11 +240,7 @@ pub(crate) fn lookup_geographic(code: u32) -> Option<CrsDef> {
     )?;
     let datum_code = read_u32(EPSG_DATA, offset + 4);
     let datum = lookup_datum(&db, datum_code)?;
-    Some(CrsDef::Geographic(GeographicCrsDef {
-        epsg: code,
-        datum,
-        name: "",
-    }))
+    Some(CrsDef::Geographic(GeographicCrsDef::new(code, datum, "")))
 }
 
 /// Look up a projected CRS by EPSG code from the embedded database.
@@ -318,13 +314,14 @@ pub(crate) fn lookup_projected(code: u32) -> Option<CrsDef> {
         _ => return None,
     };
 
-    Some(CrsDef::Projected(ProjectedCrsDef {
-        epsg: code,
+    let linear_unit = LinearUnit::from_meters_per_unit(linear_unit_to_meter).ok()?;
+    Some(CrsDef::Projected(ProjectedCrsDef::new(
+        code,
         datum,
         method,
-        linear_unit_to_meter,
-        name: "",
-    }))
+        linear_unit,
+        "",
+    )))
 }
 
 /// Look up any EPSG code (geographic or projected).
@@ -362,7 +359,7 @@ mod tests {
         let crs = lookup(32618).expect("32618");
         assert!(crs.is_projected());
         if let CrsDef::Projected(p) = crs {
-            if let ProjectionMethod::TransverseMercator { lon0, k0, .. } = p.method {
+            if let ProjectionMethod::TransverseMercator { lon0, k0, .. } = p.method() {
                 assert!((lon0 - (-75.0)).abs() < 0.01, "lon0 = {lon0}");
                 assert!((k0 - 0.9996).abs() < 0.0001, "k0 = {k0}");
             } else {
@@ -394,9 +391,9 @@ mod tests {
         };
 
         assert!(
-            (projected.linear_unit_to_meter - 0.3048006096012192).abs() < 1e-15,
+            (projected.linear_unit_to_meter() - 0.3048006096012192).abs() < 1e-15,
             "linear unit = {}",
-            projected.linear_unit_to_meter
+            projected.linear_unit_to_meter()
         );
     }
 

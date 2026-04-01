@@ -96,16 +96,16 @@ impl Transform {
             match (from, to) {
                 (CrsDef::Geographic(_), CrsDef::Geographic(_)) => TransformPipeline::Identity,
                 (CrsDef::Geographic(_), CrsDef::Projected(p)) => {
-                    let forward = make_projection(&p.method, &p.datum)?;
+                    let forward = make_projection(&p.method(), p.datum())?;
                     TransformPipeline::SameDatumForward { forward }
                 }
                 (CrsDef::Projected(p), CrsDef::Geographic(_)) => {
-                    let inverse = make_projection(&p.method, &p.datum)?;
+                    let inverse = make_projection(&p.method(), p.datum())?;
                     TransformPipeline::SameDatumInverse { inverse }
                 }
                 (CrsDef::Projected(p_from), CrsDef::Projected(p_to)) => {
-                    let inverse = make_projection(&p_from.method, &p_from.datum)?;
-                    let forward = make_projection(&p_to.method, &p_to.datum)?;
+                    let inverse = make_projection(&p_from.method(), p_from.datum())?;
+                    let forward = make_projection(&p_to.method(), p_to.datum())?;
                     TransformPipeline::SameDatumBoth { inverse, forward }
                 }
             }
@@ -125,11 +125,11 @@ impl Transform {
             }
 
             let inverse = match from {
-                CrsDef::Projected(p) => Some(make_projection(&p.method, &p.datum)?),
+                CrsDef::Projected(p) => Some(make_projection(&p.method(), p.datum())?),
                 CrsDef::Geographic(_) => None,
             };
             let forward = match to {
-                CrsDef::Projected(p) => Some(make_projection(&p.method, &p.datum)?),
+                CrsDef::Projected(p) => Some(make_projection(&p.method(), p.datum())?),
                 CrsDef::Geographic(_) => None,
             };
 
@@ -342,14 +342,20 @@ impl Transform {
 
     fn source_projected_native_to_meters(&self, x: f64, y: f64) -> (f64, f64) {
         match self.source {
-            CrsDef::Projected(p) => (x * p.linear_unit_to_meter, y * p.linear_unit_to_meter),
+            CrsDef::Projected(p) => (
+                p.linear_unit().to_meters(x),
+                p.linear_unit().to_meters(y),
+            ),
             CrsDef::Geographic(_) => (x, y),
         }
     }
 
     fn projected_meters_to_target_native(&self, x: f64, y: f64) -> (f64, f64) {
         match self.target {
-            CrsDef::Projected(p) => (x / p.linear_unit_to_meter, y / p.linear_unit_to_meter),
+            CrsDef::Projected(p) => (
+                p.linear_unit().from_meters(x),
+                p.linear_unit().from_meters(y),
+            ),
             CrsDef::Geographic(_) => (x, y),
         }
     }
@@ -390,11 +396,11 @@ impl Transform {
 
 fn same_crs_definition(from: &CrsDef, to: &CrsDef) -> bool {
     match (from, to) {
-        (CrsDef::Geographic(a), CrsDef::Geographic(b)) => a.datum.same_datum(&b.datum),
+        (CrsDef::Geographic(a), CrsDef::Geographic(b)) => a.datum().same_datum(b.datum()),
         (CrsDef::Projected(a), CrsDef::Projected(b)) => {
-            a.datum.same_datum(&b.datum)
-                && approx_eq(a.linear_unit_to_meter, b.linear_unit_to_meter)
-                && projection_methods_equivalent(&a.method, &b.method)
+            a.datum().same_datum(b.datum())
+                && approx_eq(a.linear_unit_to_meter(), b.linear_unit_to_meter())
+                && projection_methods_equivalent(&a.method(), &b.method())
         }
         _ => false,
     }
@@ -549,7 +555,7 @@ fn approx_eq(a: f64, b: f64) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::crs::{CrsDef, ProjectedCrsDef, ProjectionMethod};
+    use crate::crs::{CrsDef, LinearUnit, ProjectedCrsDef, ProjectionMethod};
     use crate::datum;
 
     const US_FOOT_TO_METER: f64 = 0.3048006096012192;
@@ -770,20 +776,20 @@ mod tests {
 
     #[test]
     fn identical_custom_projected_crs_is_identity() {
-        let from = CrsDef::Projected(ProjectedCrsDef {
-            epsg: 0,
-            datum: datum::WGS84,
-            method: ProjectionMethod::WebMercator,
-            linear_unit_to_meter: 1.0,
-            name: "Custom Web Mercator A",
-        });
-        let to = CrsDef::Projected(ProjectedCrsDef {
-            epsg: 0,
-            datum: datum::WGS84,
-            method: ProjectionMethod::WebMercator,
-            linear_unit_to_meter: 1.0,
-            name: "Custom Web Mercator B",
-        });
+        let from = CrsDef::Projected(ProjectedCrsDef::new(
+            0,
+            datum::WGS84,
+            ProjectionMethod::WebMercator,
+            LinearUnit::metre(),
+            "Custom Web Mercator A",
+        ));
+        let to = CrsDef::Projected(ProjectedCrsDef::new(
+            0,
+            datum::WGS84,
+            ProjectionMethod::WebMercator,
+            LinearUnit::metre(),
+            "Custom Web Mercator B",
+        ));
 
         let t = Transform::from_crs_defs(&from, &to).unwrap();
         assert!(matches!(t.pipeline, TransformPipeline::Identity));

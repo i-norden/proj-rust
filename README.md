@@ -11,7 +11,7 @@ This workspace currently contains:
 
 `proj-rust` is intended for production use within its supported CRS and projection set. It is not a full implementation of all PROJ capabilities.
 
-Current non-goals for `v0.1.0` include:
+Current non-goals for the `0.2` release line include:
 
 - grid-shift based datum transforms
 - vertical or time-dependent CRS operations

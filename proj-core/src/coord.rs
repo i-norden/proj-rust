@@ -2,7 +2,7 @@
 ///
 /// At the public API boundary, units match the CRS:
 /// - **Geographic CRS**: degrees (x = longitude, y = latitude)
-/// - **Projected CRS**: meters (x = easting, y = northing)
+/// - **Projected CRS**: the CRS's native linear unit (x = easting, y = northing)
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Coord {
     pub x: f64,
@@ -19,7 +19,7 @@ impl Coord {
 ///
 /// At the public API boundary:
 /// - **Geographic CRS**: x/y are longitude/latitude in degrees
-/// - **Projected CRS**: x/y are easting/northing in meters
+/// - **Projected CRS**: x/y are easting/northing in the CRS's native linear unit
 /// - `z` is preserved unchanged by the current horizontal-only transform pipeline
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Coord3D {
@@ -38,7 +38,7 @@ impl Coord3D {
 ///
 /// At the public API boundary, units match the CRS:
 /// - **Geographic CRS**: degrees
-/// - **Projected CRS**: meters
+/// - **Projected CRS**: the CRS's native linear unit
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Bounds {
     pub min_x: f64,
