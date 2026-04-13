@@ -1,0 +1,241 @@
+use crate::coord::{Bounds, Coord};
+use crate::crs::{LinearUnit, ProjectionMethod};
+use crate::datum::HelmertParams;
+use smallvec::SmallVec;
+use std::sync::Arc;
+
+/// Stable identifier for a registry-backed coordinate operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct CoordinateOperationId(pub u32);
+
+/// Stable identifier for a grid resource referenced by an operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct GridId(pub u32);
+
+/// Ranked area-of-use metadata for an operation or grid.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AreaOfUse {
+    pub west: f64,
+    pub south: f64,
+    pub east: f64,
+    pub north: f64,
+    pub name: String,
+}
+
+impl AreaOfUse {
+    pub fn contains_point(&self, point: Coord) -> bool {
+        point.x >= self.west && point.x <= self.east && point.y >= self.south && point.y <= self.north
+    }
+
+    pub fn contains_bounds(&self, bounds: Bounds) -> bool {
+        bounds.min_x >= self.west
+            && bounds.max_x <= self.east
+            && bounds.min_y >= self.south
+            && bounds.max_y <= self.north
+    }
+}
+
+/// Nominal operation accuracy in meters.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct OperationAccuracy {
+    pub meters: f64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OperationStepDirection {
+    Forward,
+    Reverse,
+}
+
+impl OperationStepDirection {
+    pub fn inverse(self) -> Self {
+        match self {
+            Self::Forward => Self::Reverse,
+            Self::Reverse => Self::Forward,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GridInterpolation {
+    Bilinear,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GridShiftDirection {
+    Forward,
+    Reverse,
+}
+
+impl GridShiftDirection {
+    pub fn inverse(self) -> Self {
+        match self {
+            Self::Forward => Self::Reverse,
+            Self::Reverse => Self::Forward,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct OperationStep {
+    pub operation_id: CoordinateOperationId,
+    pub direction: OperationStepDirection,
+}
+
+/// Enum-backed operation method model used by selection and compilation.
+#[derive(Debug, Clone, PartialEq)]
+pub enum OperationMethod {
+    Identity,
+    Helmert {
+        params: HelmertParams,
+    },
+    GridShift {
+        grid_id: GridId,
+        interpolation: GridInterpolation,
+        direction: GridShiftDirection,
+    },
+    Projection {
+        forward: bool,
+        method: ProjectionMethod,
+        linear_unit: LinearUnit,
+    },
+    AxisUnitNormalize,
+    Concatenated {
+        steps: SmallVec<[OperationStep; 4]>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OperationMatchKind {
+    ExactSourceTarget,
+    DerivedGeographic,
+    DatumCompatible,
+    ApproximateFallback,
+    Explicit,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CoordinateOperation {
+    pub id: Option<CoordinateOperationId>,
+    pub name: String,
+    pub source_crs_epsg: Option<u32>,
+    pub target_crs_epsg: Option<u32>,
+    pub source_datum_epsg: Option<u32>,
+    pub target_datum_epsg: Option<u32>,
+    pub accuracy: Option<OperationAccuracy>,
+    pub areas_of_use: SmallVec<[AreaOfUse; 1]>,
+    pub deprecated: bool,
+    pub preferred: bool,
+    pub approximate: bool,
+    pub method: OperationMethod,
+}
+
+impl CoordinateOperation {
+    pub fn metadata(&self) -> CoordinateOperationMetadata {
+        CoordinateOperationMetadata {
+            id: self.id,
+            name: self.name.clone(),
+            source_crs_epsg: self.source_crs_epsg,
+            target_crs_epsg: self.target_crs_epsg,
+            source_datum_epsg: self.source_datum_epsg,
+            target_datum_epsg: self.target_datum_epsg,
+            accuracy: self.accuracy,
+            area_of_use: self.areas_of_use.first().cloned(),
+            deprecated: self.deprecated,
+            preferred: self.preferred,
+            approximate: self.approximate,
+            uses_grids: self.uses_grids(),
+        }
+    }
+
+    pub fn uses_grids(&self) -> bool {
+        match &self.method {
+            OperationMethod::GridShift { .. } => true,
+            OperationMethod::Concatenated { .. } => false,
+            _ => false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CoordinateOperationMetadata {
+    pub id: Option<CoordinateOperationId>,
+    pub name: String,
+    pub source_crs_epsg: Option<u32>,
+    pub target_crs_epsg: Option<u32>,
+    pub source_datum_epsg: Option<u32>,
+    pub target_datum_epsg: Option<u32>,
+    pub accuracy: Option<OperationAccuracy>,
+    pub area_of_use: Option<AreaOfUse>,
+    pub deprecated: bool,
+    pub preferred: bool,
+    pub approximate: bool,
+    pub uses_grids: bool,
+}
+
+#[derive(Debug, Clone)]
+pub enum SelectionPolicy {
+    BestAvailable,
+    RequireGrids,
+    RequireExactAreaMatch,
+    AllowApproximateHelmertFallback,
+    Operation(CoordinateOperationId),
+}
+
+#[derive(Clone)]
+pub struct SelectionOptions {
+    pub point_of_interest: Option<Coord>,
+    pub area_of_interest: Option<Bounds>,
+    pub policy: SelectionPolicy,
+    pub grid_provider: Option<Arc<dyn crate::grid::GridProvider>>,
+}
+
+impl Default for SelectionOptions {
+    fn default() -> Self {
+        Self {
+            point_of_interest: None,
+            area_of_interest: None,
+            policy: SelectionPolicy::BestAvailable,
+            grid_provider: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SelectionReason {
+    ExplicitOperation,
+    ExactSourceTarget,
+    AreaOfUseMatch,
+    AccuracyPreferred,
+    NonDeprecated,
+    PreferredOperation,
+    ApproximateFallback,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SkippedOperationReason {
+    AreaOfUseMismatch,
+    MissingGrid,
+    UnsupportedGridFormat,
+    PolicyFiltered,
+    LessPreferred,
+    Deprecated,
+    Incompatible,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SkippedOperation {
+    pub metadata: CoordinateOperationMetadata,
+    pub reason: SkippedOperationReason,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct OperationSelectionDiagnostics {
+    pub selected_operation: CoordinateOperationMetadata,
+    pub selected_match_kind: OperationMatchKind,
+    pub selected_reasons: SmallVec<[SelectionReason; 4]>,
+    pub skipped_operations: Vec<SkippedOperation>,
+    pub approximate: bool,
+    pub missing_required_grid: Option<String>,
+}

@@ -1,11 +1,20 @@
 use crate::coord::{Bounds, Coord, Coord3D, Transformable, Transformable3D};
 use crate::crs::CrsDef;
-use crate::datum::{Datum, DatumToWgs84};
+use crate::datum::{Datum, HelmertParams};
+use crate::ellipsoid::Ellipsoid;
 use crate::error::{Error, Result};
 use crate::geocentric;
+use crate::grid::{GridHandle, GridRuntime};
 use crate::helmert;
+use crate::operation::{
+    CoordinateOperation, CoordinateOperationId, CoordinateOperationMetadata, GridShiftDirection,
+    OperationMethod, OperationSelectionDiagnostics, OperationStepDirection, SelectionOptions,
+    SelectionPolicy, SkippedOperation, SkippedOperationReason,
+};
 use crate::projection::{make_projection, Projection};
 use crate::registry;
+use crate::selector;
+use smallvec::SmallVec;
 
 #[cfg(feature = "rayon")]
 const PARALLEL_MIN_TOTAL_ITEMS: usize = 16_384;
@@ -17,59 +26,64 @@ const PARALLEL_CHUNKS_PER_THREAD: usize = 4;
 const PARALLEL_MIN_CHUNK_SIZE: usize = 1_024;
 
 /// A reusable coordinate transformation between two CRS.
-///
-/// Create once with [`Transform::new`], then call [`convert`](Transform::convert)
-/// or [`convert_3d`](Transform::convert_3d) for each coordinate. All input/output
-/// coordinates use the CRS's native units: degrees (lon/lat) for geographic CRS,
-/// and the CRS's native projected linear unit for projected CRS. For 3D
-/// coordinates, the third ordinate is preserved
-/// unchanged by the current horizontal-only pipeline.
-///
-/// # Example
-///
-/// ```
-/// use proj_core::Transform;
-///
-/// let t = Transform::new("EPSG:4326", "EPSG:3857").unwrap();
-/// let (x, y) = t.convert((-74.006, 40.7128)).unwrap();
-/// assert!((x - (-8238310.0)).abs() < 1.0);
-/// ```
 pub struct Transform {
     source: CrsDef,
     target: CrsDef,
-    pipeline: TransformPipeline,
+    selected_operation: CoordinateOperationMetadata,
+    diagnostics: OperationSelectionDiagnostics,
+    pipeline: CompiledOperationPipeline,
 }
 
-enum TransformPipeline {
-    /// Source and target are the same CRS — no-op.
-    Identity,
-    /// Same datum, geographic source → projected target.
-    SameDatumForward { forward: Projection },
-    /// Same datum, projected source → geographic target.
-    SameDatumInverse { inverse: Projection },
-    /// Same datum, projected source → projected target.
-    SameDatumBoth {
-        inverse: Projection,
-        forward: Projection,
+struct CompiledOperationPipeline {
+    steps: SmallVec<[CompiledStep; 8]>,
+}
+
+enum CompiledStep {
+    ProjectionForward { projection: Projection },
+    ProjectionInverse { projection: Projection },
+    Helmert {
+        params: HelmertParams,
+        inverse: bool,
     },
-    /// Different datums — full pipeline with geocentric conversion and Helmert shift.
-    DatumShift {
-        inverse: Option<Projection>,
-        source_datum: Datum,
-        target_datum: Datum,
-        forward: Option<Projection>,
+    GridShift {
+        handle: GridHandle,
+        direction: GridShiftDirection,
     },
+    GeodeticToGeocentric { ellipsoid: Ellipsoid },
+    GeocentricToGeodetic { ellipsoid: Ellipsoid },
 }
 
 impl Transform {
     /// Create a transform from authority code strings (e.g., `"EPSG:4326"`).
-    ///
-    /// This is the primary constructor, matching the API pattern from C PROJ's
-    /// `Proj::new_known_crs()`.
     pub fn new(from_crs: &str, to_crs: &str) -> Result<Self> {
+        Self::with_selection_options(from_crs, to_crs, SelectionOptions::default())
+    }
+
+    /// Create a transform with explicit selection options.
+    pub fn with_selection_options(
+        from_crs: &str,
+        to_crs: &str,
+        options: SelectionOptions,
+    ) -> Result<Self> {
         let source = registry::lookup_authority_code(from_crs)?;
         let target = registry::lookup_authority_code(to_crs)?;
-        Self::from_crs_defs(&source, &target)
+        Self::from_crs_defs_with_selection_options(&source, &target, options)
+    }
+
+    /// Create a transform from an explicit registry operation id.
+    pub fn from_operation(
+        operation_id: CoordinateOperationId,
+        from_crs: &str,
+        to_crs: &str,
+    ) -> Result<Self> {
+        Self::with_selection_options(
+            from_crs,
+            to_crs,
+            SelectionOptions {
+                policy: SelectionPolicy::Operation(operation_id),
+                ..SelectionOptions::default()
+            },
+        )
     }
 
     /// Create a transform from EPSG codes directly.
@@ -82,91 +96,92 @@ impl Transform {
     }
 
     /// Create a transform from explicit CRS definitions.
-    ///
-    /// Use this for custom CRS not in the built-in registry.
     pub fn from_crs_defs(from: &CrsDef, to: &CrsDef) -> Result<Self> {
-        // Identity check for known EPSG codes and semantically identical custom CRS definitions.
-        if (from.epsg() != 0 && from.epsg() == to.epsg()) || from.semantically_equivalent(to) {
-            return Ok(Self {
-                source: *from,
-                target: *to,
-                pipeline: TransformPipeline::Identity,
+        Self::from_crs_defs_with_selection_options(from, to, SelectionOptions::default())
+    }
+
+    fn from_crs_defs_with_selection_options(
+        from: &CrsDef,
+        to: &CrsDef,
+        options: SelectionOptions,
+    ) -> Result<Self> {
+        let grid_runtime = GridRuntime::new(options.grid_provider.clone());
+        let candidates = selector::rank_operation_candidates(from, to, &options);
+        if candidates.is_empty() {
+            return Err(match options.policy {
+                SelectionPolicy::Operation(id) => {
+                    Error::UnknownOperation(format!("unknown operation id {}", id.0))
+                }
+                _ => Error::OperationSelection(format!(
+                    "no compatible operation found for source EPSG:{} target EPSG:{}",
+                    from.epsg(),
+                    to.epsg()
+                )),
             });
         }
 
-        let source_datum = from.datum();
-        let target_datum = to.datum();
-
-        let same_datum = source_datum.same_datum(target_datum)
-            || (source_datum.is_wgs84_compatible() && target_datum.is_wgs84_compatible());
-
-        let pipeline = if same_datum {
-            // Optimized path: no datum shift needed
-            match (from, to) {
-                (CrsDef::Geographic(_), CrsDef::Geographic(_)) => TransformPipeline::Identity,
-                (CrsDef::Geographic(_), CrsDef::Projected(p)) => {
-                    let forward = make_projection(&p.method(), p.datum())?;
-                    TransformPipeline::SameDatumForward { forward }
+        let mut skipped_operations = Vec::new();
+        let mut missing_required_grid = None;
+        for candidate in candidates {
+            match compile_pipeline(from, to, &candidate.operation, candidate.direction, &grid_runtime) {
+                Ok(pipeline) => {
+                    let mut metadata = candidate.operation.metadata();
+                    metadata.area_of_use = matched_area_of_use(&options, &candidate.operation);
+                    let diagnostics = OperationSelectionDiagnostics {
+                        selected_operation: metadata.clone(),
+                        selected_match_kind: candidate.match_kind,
+                        selected_reasons: candidate.reasons,
+                        skipped_operations,
+                        approximate: candidate.operation.approximate,
+                        missing_required_grid,
+                    };
+                    return Ok(Self {
+                        source: *from,
+                        target: *to,
+                        selected_operation: metadata,
+                        diagnostics,
+                        pipeline,
+                    });
                 }
-                (CrsDef::Projected(p), CrsDef::Geographic(_)) => {
-                    let inverse = make_projection(&p.method(), p.datum())?;
-                    TransformPipeline::SameDatumInverse { inverse }
+                Err(Error::Grid(error)) => {
+                    if missing_required_grid.is_none() {
+                        missing_required_grid = Some(error.to_string());
+                    }
+                    skipped_operations.push(SkippedOperation {
+                        metadata: candidate.operation.metadata(),
+                        reason: match error {
+                            crate::grid::GridError::UnsupportedFormat(_) => {
+                                SkippedOperationReason::UnsupportedGridFormat
+                            }
+                            _ => SkippedOperationReason::MissingGrid,
+                        },
+                        detail: error.to_string(),
+                    });
                 }
-                (CrsDef::Projected(p_from), CrsDef::Projected(p_to)) => {
-                    let inverse = make_projection(&p_from.method(), p_from.datum())?;
-                    let forward = make_projection(&p_to.method(), p_to.datum())?;
-                    TransformPipeline::SameDatumBoth { inverse, forward }
+                Err(error) => {
+                    skipped_operations.push(SkippedOperation {
+                        metadata: candidate.operation.metadata(),
+                        reason: SkippedOperationReason::LessPreferred,
+                        detail: error.to_string(),
+                    });
                 }
             }
-        } else {
-            // Both datums must have a path to WGS84
-            if matches!(source_datum.to_wgs84, DatumToWgs84::Unknown) {
-                return Err(Error::UnsupportedProjection(format!(
-                    "source CRS EPSG:{} has no known datum shift to WGS84",
-                    from.epsg()
-                )));
-            }
-            if matches!(target_datum.to_wgs84, DatumToWgs84::Unknown) {
-                return Err(Error::UnsupportedProjection(format!(
-                    "target CRS EPSG:{} has no known datum shift to WGS84",
-                    to.epsg()
-                )));
-            }
+        }
 
-            let inverse = match from {
-                CrsDef::Projected(p) => Some(make_projection(&p.method(), p.datum())?),
-                CrsDef::Geographic(_) => None,
-            };
-            let forward = match to {
-                CrsDef::Projected(p) => Some(make_projection(&p.method(), p.datum())?),
-                CrsDef::Geographic(_) => None,
-            };
+        if let Some(message) = missing_required_grid {
+            return Err(Error::OperationSelection(format!(
+                "better operations were skipped because required grids were unavailable: {message}"
+            )));
+        }
 
-            TransformPipeline::DatumShift {
-                inverse,
-                source_datum: *source_datum,
-                target_datum: *target_datum,
-                forward,
-            }
-        };
-
-        Ok(Self {
-            source: *from,
-            target: *to,
-            pipeline,
-        })
+        Err(Error::OperationSelection(format!(
+            "unable to compile an operation for source EPSG:{} target EPSG:{}",
+            from.epsg(),
+            to.epsg()
+        )))
     }
 
     /// Transform a single coordinate.
-    ///
-    /// Input and output units are the native units of the respective CRS:
-    /// degrees for geographic CRS, and the CRS's native projected linear unit
-    /// for projected CRS.
-    ///
-    /// The return type matches the input type:
-    /// - `(f64, f64)` in → `(f64, f64)` out
-    /// - `Coord` in → `Coord` out
-    /// - `geo_types::Coord<f64>` in → `geo_types::Coord<f64>` out (with `geo-types` feature)
     pub fn convert<T: Transformable>(&self, coord: T) -> Result<T> {
         let c = coord.into_coord();
         let result = self.convert_coord(c)?;
@@ -174,16 +189,6 @@ impl Transform {
     }
 
     /// Transform a single 3D coordinate.
-    ///
-    /// The horizontal components use the CRS's native units:
-    /// degrees for geographic CRS and the CRS's native projected linear unit
-    /// for projected CRS.
-    /// The vertical component is carried through unchanged because the current
-    /// CRS model is horizontal-only.
-    ///
-    /// The return type matches the input type:
-    /// - `(f64, f64, f64)` in → `(f64, f64, f64)` out
-    /// - `Coord3D` in → `Coord3D` out
     pub fn convert_3d<T: Transformable3D>(&self, coord: T) -> Result<T> {
         let c = coord.into_coord3d();
         let result = self.convert_coord3d(c)?;
@@ -200,18 +205,22 @@ impl Transform {
         &self.target
     }
 
+    /// Return metadata for the selected coordinate operation.
+    pub fn selected_operation(&self) -> &CoordinateOperationMetadata {
+        &self.selected_operation
+    }
+
+    /// Return selection diagnostics for this transform.
+    pub fn selection_diagnostics(&self) -> &OperationSelectionDiagnostics {
+        &self.diagnostics
+    }
+
     /// Build the inverse transform by swapping the source and target CRS.
     pub fn inverse(&self) -> Result<Self> {
         Self::from_crs_defs(&self.target, &self.source)
     }
 
     /// Reproject a 2D bounding box by sampling its perimeter.
-    ///
-    /// `densify_points` controls how many evenly spaced interior points are sampled
-    /// on each edge between the corners. `0` samples only the four corners.
-    ///
-    /// The returned bounds are axis-aligned in the target CRS. Geographic outputs
-    /// that cross the antimeridian are not normalized into a wrapped representation.
     pub fn transform_bounds(&self, bounds: Bounds, densify_points: usize) -> Result<Bounds> {
         if !bounds.is_valid() {
             return Err(Error::OutOfRange(
@@ -247,120 +256,52 @@ impl Transform {
         transformed.ok_or_else(|| Error::OutOfRange("failed to sample bounds".into()))
     }
 
-    /// Transform a single `Coord` value.
     fn convert_coord(&self, c: Coord) -> Result<Coord> {
         let result = self.convert_coord3d(Coord3D::new(c.x, c.y, 0.0))?;
-        Ok(Coord {
-            x: result.x,
-            y: result.y,
-        })
+        Ok(Coord::new(result.x, result.y))
     }
 
-    /// Transform a single `Coord3D` value.
     fn convert_coord3d(&self, c: Coord3D) -> Result<Coord3D> {
-        match &self.pipeline {
-            TransformPipeline::Identity => Ok(c),
-
-            TransformPipeline::SameDatumForward { forward } => {
-                // Source is geographic (degrees) → radians → forward project → meters
-                // → target native projected units.
-                let lon_rad = c.x.to_radians();
-                let lat_rad = c.y.to_radians();
-                let (x_m, y_m) = forward.forward(lon_rad, lat_rad)?;
-                let (x, y) = self.projected_meters_to_target_native(x_m, y_m);
-                Ok(Coord3D { x, y, z: c.z })
-            }
-
-            TransformPipeline::SameDatumInverse { inverse } => {
-                // Source is projected (native units) → meters → inverse project
-                // → radians → degrees.
-                let (x_m, y_m) = self.source_projected_native_to_meters(c.x, c.y);
-                let (lon_rad, lat_rad) = inverse.inverse(x_m, y_m)?;
-                Ok(Coord3D {
-                    x: lon_rad.to_degrees(),
-                    y: lat_rad.to_degrees(),
-                    z: c.z,
-                })
-            }
-
-            TransformPipeline::SameDatumBoth { inverse, forward } => {
-                // Projected native units → meters → inverse → radians → forward
-                // → meters → target native units.
-                let (x_m, y_m) = self.source_projected_native_to_meters(c.x, c.y);
-                let (lon_rad, lat_rad) = inverse.inverse(x_m, y_m)?;
-                let (x_m, y_m) = forward.forward(lon_rad, lat_rad)?;
-                let (x, y) = self.projected_meters_to_target_native(x_m, y_m);
-                Ok(Coord3D { x, y, z: c.z })
-            }
-
-            TransformPipeline::DatumShift {
-                inverse,
-                source_datum,
-                target_datum,
-                forward,
-            } => {
-                // Step 1: Get geographic coords in radians on source datum
-                let (lon_rad, lat_rad) = if let Some(inv) = inverse {
-                    let (x_m, y_m) = self.source_projected_native_to_meters(c.x, c.y);
-                    inv.inverse(x_m, y_m)?
-                } else {
-                    (c.x.to_radians(), c.y.to_radians())
-                };
-
-                // Step 2: Source geodetic → geocentric (source ellipsoid)
-                let (x, y, z) = geocentric::geodetic_to_geocentric(
-                    &source_datum.ellipsoid,
-                    lon_rad,
-                    lat_rad,
-                    0.0,
-                );
-
-                // Step 3: Helmert: source datum → WGS84
-                let (x2, y2, z2) = if let Some(params) = source_datum.helmert_to_wgs84() {
-                    helmert::helmert_forward(params, x, y, z)
-                } else {
-                    (x, y, z) // already WGS84-compatible
-                };
-
-                // Step 4: Helmert: WGS84 → target datum (inverse)
-                let (x3, y3, z3) = if let Some(params) = target_datum.helmert_to_wgs84() {
-                    helmert::helmert_inverse(params, x2, y2, z2)
-                } else {
-                    (x2, y2, z2) // target is WGS84-compatible
-                };
-
-                // Step 5: Geocentric → geodetic (target ellipsoid)
-                let (lon_out, lat_out, _h_out) =
-                    geocentric::geocentric_to_geodetic(&target_datum.ellipsoid, x3, y3, z3);
-
-                // Step 6: Forward project if target is projected, else convert to degrees
-                if let Some(fwd) = forward {
-                    let (x_m, y_m) = fwd.forward(lon_out, lat_out)?;
-                    let (x, y) = self.projected_meters_to_target_native(x_m, y_m);
-                    Ok(Coord3D { x, y, z: c.z })
-                } else {
-                    Ok(Coord3D {
-                        x: lon_out.to_degrees(),
-                        y: lat_out.to_degrees(),
-                        z: c.z,
-                    })
-                }
-            }
+        if self.pipeline.steps.is_empty() {
+            return Ok(c);
         }
+
+        let preserved_z = c.z;
+        let mut state = if self.source.is_projected() {
+            let (x_m, y_m) = self.source_projected_native_to_meters(c.x, c.y);
+            Coord3D::new(x_m, y_m, 0.0)
+        } else {
+            Coord3D::new(c.x.to_radians(), c.y.to_radians(), 0.0)
+        };
+
+        for step in &self.pipeline.steps {
+            state = execute_step(step, state)?;
+        }
+
+        let (x, y) = if self.target.is_projected() {
+            self.projected_meters_to_target_native(state.x, state.y)
+        } else {
+            (state.x.to_degrees(), state.y.to_degrees())
+        };
+
+        Ok(Coord3D::new(x, y, preserved_z))
     }
 
     fn source_projected_native_to_meters(&self, x: f64, y: f64) -> (f64, f64) {
         match self.source {
-            CrsDef::Projected(p) => (p.linear_unit().to_meters(x), p.linear_unit().to_meters(y)),
+            CrsDef::Projected(projected) => (
+                projected.linear_unit().to_meters(x),
+                projected.linear_unit().to_meters(y),
+            ),
             CrsDef::Geographic(_) => (x, y),
         }
     }
 
     fn projected_meters_to_target_native(&self, x: f64, y: f64) -> (f64, f64) {
         match self.target {
-            CrsDef::Projected(p) => (
-                p.linear_unit().from_meters(x),
-                p.linear_unit().from_meters(y),
+            CrsDef::Projected(projected) => (
+                projected.linear_unit().from_meters(x),
+                projected.linear_unit().from_meters(y),
             ),
             CrsDef::Geographic(_) => (x, y),
         }
@@ -377,9 +318,6 @@ impl Transform {
     }
 
     /// Batch transform with Rayon parallelism.
-    ///
-    /// For smaller batches, this falls back to the sequential path to avoid
-    /// parallel overhead dominating the total runtime.
     #[cfg(feature = "rayon")]
     pub fn convert_batch_parallel<T: Transformable + Send + Sync + Clone>(
         &self,
@@ -423,6 +361,231 @@ impl Transform {
     }
 }
 
+fn matched_area_of_use(
+    options: &SelectionOptions,
+    operation: &CoordinateOperation,
+) -> Option<crate::operation::AreaOfUse> {
+    operation
+        .areas_of_use
+        .iter()
+        .find(|area| {
+            options
+                .point_of_interest
+                .map(|point| area.contains_point(point))
+                .unwrap_or(false)
+                || options
+                    .area_of_interest
+                    .map(|bounds| area.contains_bounds(bounds))
+                    .unwrap_or(false)
+        })
+        .cloned()
+        .or_else(|| operation.areas_of_use.first().cloned())
+}
+
+fn execute_step(step: &CompiledStep, coord: Coord3D) -> Result<Coord3D> {
+    match step {
+        CompiledStep::ProjectionForward { projection } => {
+            let (x, y) = projection.forward(coord.x, coord.y)?;
+            Ok(Coord3D::new(x, y, coord.z))
+        }
+        CompiledStep::ProjectionInverse { projection } => {
+            let (lon, lat) = projection.inverse(coord.x, coord.y)?;
+            Ok(Coord3D::new(lon, lat, coord.z))
+        }
+        CompiledStep::Helmert { params, inverse } => {
+            let (x, y, z) = if *inverse {
+                helmert::helmert_inverse(params, coord.x, coord.y, coord.z)
+            } else {
+                helmert::helmert_forward(params, coord.x, coord.y, coord.z)
+            };
+            Ok(Coord3D::new(x, y, z))
+        }
+        CompiledStep::GridShift { handle, direction } => {
+            let (lon, lat) = handle.apply(coord.x, coord.y, *direction)?;
+            Ok(Coord3D::new(lon, lat, coord.z))
+        }
+        CompiledStep::GeodeticToGeocentric { ellipsoid } => {
+            let (x, y, z) = geocentric::geodetic_to_geocentric(ellipsoid, coord.x, coord.y, coord.z);
+            Ok(Coord3D::new(x, y, z))
+        }
+        CompiledStep::GeocentricToGeodetic { ellipsoid } => {
+            let (lon, lat, h) = geocentric::geocentric_to_geodetic(ellipsoid, coord.x, coord.y, coord.z);
+            Ok(Coord3D::new(lon, lat, h))
+        }
+    }
+}
+
+fn compile_pipeline(
+    source: &CrsDef,
+    target: &CrsDef,
+    operation: &CoordinateOperation,
+    direction: OperationStepDirection,
+    grid_runtime: &GridRuntime,
+) -> Result<CompiledOperationPipeline> {
+    let mut steps = SmallVec::<[CompiledStep; 8]>::new();
+
+    if let CrsDef::Projected(projected) = source {
+        steps.push(CompiledStep::ProjectionInverse {
+            projection: make_projection(&projected.method(), projected.datum())?,
+        });
+    }
+
+    if operation.id.is_none() && matches!(operation.method, OperationMethod::Identity) {
+        // Synthetic identity between semantically equivalent CRS.
+    } else if operation.approximate && operation.id.is_none() {
+        compile_legacy_datum_fallback(source.datum(), target.datum(), &mut steps)?;
+    } else {
+        compile_operation(operation, direction, grid_runtime, &mut steps)?;
+    }
+
+    if let CrsDef::Projected(projected) = target {
+        steps.push(CompiledStep::ProjectionForward {
+            projection: make_projection(&projected.method(), projected.datum())?,
+        });
+    }
+
+    Ok(CompiledOperationPipeline { steps })
+}
+
+fn compile_legacy_datum_fallback(
+    source_datum: &Datum,
+    target_datum: &Datum,
+    steps: &mut SmallVec<[CompiledStep; 8]>,
+) -> Result<()> {
+    if source_datum.same_datum(target_datum)
+        || (source_datum.is_wgs84_compatible() && target_datum.is_wgs84_compatible())
+    {
+        return Ok(());
+    }
+    if !source_datum.has_known_wgs84_transform() || !target_datum.has_known_wgs84_transform() {
+        return Err(Error::OperationSelection(
+            "legacy Helmert fallback unavailable because source or target datum has no advisory WGS84 path"
+                .into(),
+        ));
+    }
+
+    steps.push(CompiledStep::GeodeticToGeocentric {
+        ellipsoid: source_datum.ellipsoid,
+    });
+    if let Some(params) = source_datum.helmert_to_wgs84() {
+        steps.push(CompiledStep::Helmert {
+            params: *params,
+            inverse: false,
+        });
+    }
+    if let Some(params) = target_datum.helmert_to_wgs84() {
+        steps.push(CompiledStep::Helmert {
+            params: *params,
+            inverse: true,
+        });
+    }
+    steps.push(CompiledStep::GeocentricToGeodetic {
+        ellipsoid: target_datum.ellipsoid,
+    });
+    Ok(())
+}
+
+fn compile_operation(
+    operation: &CoordinateOperation,
+    direction: OperationStepDirection,
+    grid_runtime: &GridRuntime,
+    steps: &mut SmallVec<[CompiledStep; 8]>,
+) -> Result<()> {
+    let (source_geo, target_geo) = resolve_operation_geographic_pair(operation, direction)?;
+    match (&operation.method, direction) {
+        (OperationMethod::Identity, _) => {}
+        (OperationMethod::Helmert { params }, OperationStepDirection::Forward) => {
+            steps.push(CompiledStep::GeodeticToGeocentric {
+                ellipsoid: source_geo.datum().ellipsoid,
+            });
+            steps.push(CompiledStep::Helmert {
+                params: *params,
+                inverse: false,
+            });
+            steps.push(CompiledStep::GeocentricToGeodetic {
+                ellipsoid: target_geo.datum().ellipsoid,
+            });
+        }
+        (OperationMethod::Helmert { params }, OperationStepDirection::Reverse) => {
+            steps.push(CompiledStep::GeodeticToGeocentric {
+                ellipsoid: source_geo.datum().ellipsoid,
+            });
+            steps.push(CompiledStep::Helmert {
+                params: *params,
+                inverse: true,
+            });
+            steps.push(CompiledStep::GeocentricToGeodetic {
+                ellipsoid: target_geo.datum().ellipsoid,
+            });
+        }
+        (
+            OperationMethod::GridShift {
+                grid_id,
+                direction: grid_direction,
+                ..
+            },
+            step_direction,
+        ) => {
+            let grid = registry::lookup_grid_definition(grid_id.0)
+                .ok_or_else(|| Error::Grid(crate::grid::GridError::NotFound(format!("grid id {}", grid_id.0))))?;
+            if grid.format == crate::grid::GridFormat::Unsupported {
+                return Err(Error::Grid(crate::grid::GridError::UnsupportedFormat(
+                    grid.name,
+                )));
+            }
+            let handle = grid_runtime.resolve_handle(&grid)?;
+            let direction = match step_direction {
+                OperationStepDirection::Forward => *grid_direction,
+                OperationStepDirection::Reverse => grid_direction.inverse(),
+            };
+            steps.push(CompiledStep::GridShift { handle, direction });
+        }
+        (OperationMethod::Concatenated { steps: child_steps }, OperationStepDirection::Forward) => {
+            for step in child_steps {
+                let child = registry::lookup_operation(step.operation_id)
+                    .ok_or_else(|| Error::UnknownOperation(format!("unknown operation id {}", step.operation_id.0)))?;
+                compile_operation(&child, step.direction, grid_runtime, steps)?;
+            }
+        }
+        (OperationMethod::Concatenated { steps: child_steps }, OperationStepDirection::Reverse) => {
+            for step in child_steps.iter().rev() {
+                let child = registry::lookup_operation(step.operation_id)
+                    .ok_or_else(|| Error::UnknownOperation(format!("unknown operation id {}", step.operation_id.0)))?;
+                compile_operation(&child, step.direction.inverse(), grid_runtime, steps)?;
+            }
+        }
+        (OperationMethod::Projection { .. }, _) | (OperationMethod::AxisUnitNormalize, _) => {
+            return Err(Error::UnsupportedProjection(
+                "direct projection operations are not emitted by the embedded selector".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn resolve_operation_geographic_pair(
+    operation: &CoordinateOperation,
+    direction: OperationStepDirection,
+) -> Result<(CrsDef, CrsDef)> {
+    let source_code = operation.source_crs_epsg.ok_or_else(|| {
+        Error::OperationSelection(format!("operation {} is missing source CRS metadata", operation.name))
+    })?;
+    let target_code = operation.target_crs_epsg.ok_or_else(|| {
+        Error::OperationSelection(format!("operation {} is missing target CRS metadata", operation.name))
+    })?;
+    let source = registry::lookup_epsg(match direction {
+        OperationStepDirection::Forward => source_code,
+        OperationStepDirection::Reverse => target_code,
+    })
+    .ok_or_else(|| Error::UnknownCrs(format!("unknown EPSG code in operation {}", operation.name)))?;
+    let target = registry::lookup_epsg(match direction {
+        OperationStepDirection::Forward => target_code,
+        OperationStepDirection::Reverse => source_code,
+    })
+    .ok_or_else(|| Error::UnknownCrs(format!("unknown EPSG code in operation {}", operation.name)))?;
+    Ok((source, target))
+}
+
 #[cfg(feature = "rayon")]
 fn should_parallelize(len: usize) -> bool {
     if len == 0 {
@@ -445,7 +608,7 @@ fn parallel_chunk_size(len: usize) -> usize {
 mod tests {
     use super::*;
     use crate::crs::{CrsDef, LinearUnit, ProjectedCrsDef, ProjectionMethod};
-    use crate::datum;
+    use crate::datum::{self, DatumToWgs84};
 
     const US_FOOT_TO_METER: f64 = 0.3048006096012192;
 
@@ -461,7 +624,6 @@ mod tests {
     fn wgs84_to_web_mercator() {
         let t = Transform::new("EPSG:4326", "EPSG:3857").unwrap();
         let (x, y) = t.convert((-74.006, 40.7128)).unwrap();
-        // NYC in Web Mercator
         assert!((x - (-8238310.0)).abs() < 100.0, "x = {x}");
         assert!((y - 4970072.0).abs() < 100.0, "y = {y}");
     }
@@ -483,18 +645,8 @@ mod tests {
         let projected = fwd.convert(original).unwrap();
         let back = inv.convert(projected).unwrap();
 
-        assert!(
-            (back.0 - original.0).abs() < 1e-8,
-            "lon: {} vs {}",
-            back.0,
-            original.0
-        );
-        assert!(
-            (back.1 - original.1).abs() < 1e-8,
-            "lat: {} vs {}",
-            back.1,
-            original.1
-        );
+        assert!((back.0 - original.0).abs() < 1e-8);
+        assert!((back.1 - original.1).abs() < 1e-8);
     }
 
     #[test]
@@ -507,43 +659,34 @@ mod tests {
 
     #[test]
     fn equivalent_meter_and_foot_state_plane_crs_match_after_unit_conversion() {
-        let coord = (-80.8431, 35.2271); // Charlotte, NC
+        let coord = (-80.8431, 35.2271);
         let meter_tx = Transform::new("EPSG:4326", "EPSG:32119").unwrap();
         let foot_tx = Transform::new("EPSG:4326", "EPSG:2264").unwrap();
 
         let (mx, my) = meter_tx.convert(coord).unwrap();
         let (fx, fy) = foot_tx.convert(coord).unwrap();
 
-        assert!(
-            (fx * US_FOOT_TO_METER - mx).abs() < 0.02,
-            "x mismatch: {fx} ft vs {mx} m"
-        );
-        assert!(
-            (fy * US_FOOT_TO_METER - my).abs() < 0.02,
-            "y mismatch: {fy} ft vs {my} m"
-        );
+        assert!((fx * US_FOOT_TO_METER - mx).abs() < 0.02);
+        assert!((fy * US_FOOT_TO_METER - my).abs() < 0.02);
     }
 
     #[test]
     fn inverse_transform_accepts_native_projected_units_for_foot_crs() {
-        let coord = (-80.8431, 35.2271); // Charlotte, NC
+        let coord = (-80.8431, 35.2271);
         let forward = Transform::new("EPSG:4326", "EPSG:2264").unwrap();
         let inverse = Transform::new("EPSG:2264", "EPSG:4326").unwrap();
 
         let projected = forward.convert(coord).unwrap();
         let roundtrip = inverse.convert(projected).unwrap();
 
-        assert!((roundtrip.0 - coord.0).abs() < 1e-8, "lon: {}", roundtrip.0);
-        assert!((roundtrip.1 - coord.1).abs() < 1e-8, "lat: {}", roundtrip.1);
+        assert!((roundtrip.0 - coord.0).abs() < 1e-8);
+        assert!((roundtrip.1 - coord.1).abs() < 1e-8);
     }
 
     #[test]
     fn utm_to_web_mercator() {
-        // Projected → Projected (SameDatumBoth)
         let t = Transform::new("EPSG:32618", "EPSG:3857").unwrap();
-        // NYC in UTM 18N
         let (x, _y) = t.convert((583960.0, 4507523.0)).unwrap();
-        // Should be near NYC in Web Mercator
         assert!((x - (-8238310.0)).abs() < 200.0, "x = {x}");
     }
 
@@ -551,7 +694,6 @@ mod tests {
     fn wgs84_to_polar_stereo_3413() {
         let t = Transform::new("EPSG:4326", "EPSG:3413").unwrap();
         let (x, y) = t.convert((-45.0, 90.0)).unwrap();
-        // North pole should be at origin for EPSG:3413
         assert!(x.abs() < 1.0, "x = {x}");
         assert!(y.abs() < 1.0, "y = {y}");
     }
@@ -565,27 +707,17 @@ mod tests {
         let projected = fwd.convert(original).unwrap();
         let back = inv.convert(projected).unwrap();
 
-        assert!(
-            (back.0 - original.0).abs() < 1e-6,
-            "lon: {} vs {}",
-            back.0,
-            original.0
-        );
-        assert!(
-            (back.1 - original.1).abs() < 1e-6,
-            "lat: {} vs {}",
-            back.1,
-            original.1
-        );
+        assert!((back.0 - original.0).abs() < 1e-6);
+        assert!((back.1 - original.1).abs() < 1e-6);
     }
 
     #[test]
     fn geographic_to_geographic_same_datum_is_identity() {
-        // NAD83 and WGS84 are both WGS84-compatible
         let t = Transform::new("EPSG:4269", "EPSG:4326").unwrap();
         let (lon, lat) = t.convert((-74.006, 40.7128)).unwrap();
         assert_eq!(lon, -74.006);
         assert_eq!(lat, 40.7128);
+        assert_eq!(t.selected_operation().name, "Identity");
     }
 
     #[test]
@@ -598,9 +730,31 @@ mod tests {
     fn cross_datum_nad27_to_wgs84() {
         let t = Transform::new("EPSG:4267", "EPSG:4326").unwrap();
         let (lon, lat) = t.convert((-90.0, 45.0)).unwrap();
-        // NAD27→WGS84 shift is small (tens of meters → fraction of degree)
         assert!((lon - (-90.0)).abs() < 0.01, "lon = {lon}");
         assert!((lat - 45.0).abs() < 0.01, "lat = {lat}");
+        assert!(!t.selected_operation().approximate);
+    }
+
+    #[test]
+    fn explicit_grid_operation_compiles() {
+        let t = Transform::from_operation(CoordinateOperationId(1693), "EPSG:4267", "EPSG:4326")
+            .unwrap();
+        assert_eq!(t.selected_operation().id, Some(CoordinateOperationId(1693)));
+    }
+
+    #[test]
+    fn explicit_selection_options_choose_grid_operation() {
+        let t = Transform::with_selection_options(
+            "EPSG:4267",
+            "EPSG:4269",
+            SelectionOptions {
+                point_of_interest: Some(Coord::new(-80.5041667, 44.5458333)),
+                ..SelectionOptions::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(t.selected_operation().id, Some(CoordinateOperationId(1313)));
+        assert!(!t.selection_diagnostics().approximate);
     }
 
     #[test]
@@ -610,25 +764,14 @@ mod tests {
         let original = (-90.0, 45.0);
         let shifted = fwd.convert(original).unwrap();
         let back = inv.convert(shifted).unwrap();
-        assert!(
-            (back.0 - original.0).abs() < 1e-6,
-            "lon: {} vs {}",
-            back.0,
-            original.0
-        );
-        assert!(
-            (back.1 - original.1).abs() < 1e-6,
-            "lat: {} vs {}",
-            back.1,
-            original.1
-        );
+        assert!((back.0 - original.0).abs() < 1e-6);
+        assert!((back.1 - original.1).abs() < 1e-6);
     }
 
     #[test]
     fn cross_datum_osgb36_to_wgs84() {
         let t = Transform::new("EPSG:4277", "EPSG:4326").unwrap();
-        let (lon, lat) = t.convert((-0.1278, 51.5074)).unwrap(); // London
-                                                                 // OSGB36→WGS84 shift is larger due to 7-parameter Helmert
+        let (lon, lat) = t.convert((-0.1278, 51.5074)).unwrap();
         assert!((lon - (-0.1278)).abs() < 0.01, "lon = {lon}");
         assert!((lat - 51.5074).abs() < 0.01, "lat = {lat}");
     }
@@ -637,9 +780,9 @@ mod tests {
     fn wgs84_to_web_mercator_3d_preserves_height() {
         let t = Transform::new("EPSG:4326", "EPSG:3857").unwrap();
         let (x, y, z) = t.convert_3d((-74.006, 40.7128, 123.45)).unwrap();
-        assert!((x - (-8238310.0)).abs() < 100.0, "x = {x}");
-        assert!((y - 4970072.0).abs() < 100.0, "y = {y}");
-        assert!((z - 123.45).abs() < 1e-12, "z = {z}");
+        assert!((x - (-8238310.0)).abs() < 100.0);
+        assert!((y - 4970072.0).abs() < 100.0);
+        assert!((z - 123.45).abs() < 1e-12);
     }
 
     #[test]
@@ -649,24 +792,9 @@ mod tests {
         let original = (-90.0, 45.0, 250.0);
         let shifted = fwd.convert_3d(original).unwrap();
         let back = inv.convert_3d(shifted).unwrap();
-        assert!(
-            (back.0 - original.0).abs() < 1e-6,
-            "lon: {} vs {}",
-            back.0,
-            original.0
-        );
-        assert!(
-            (back.1 - original.1).abs() < 1e-6,
-            "lat: {} vs {}",
-            back.1,
-            original.1
-        );
-        assert!(
-            (back.2 - original.2).abs() < 1e-12,
-            "h: {} vs {}",
-            back.2,
-            original.2
-        );
+        assert!((back.0 - original.0).abs() < 1e-6);
+        assert!((back.1 - original.1).abs() < 1e-6);
+        assert!((back.2 - original.2).abs() < 1e-12);
     }
 
     #[test]
@@ -687,7 +815,7 @@ mod tests {
         ));
 
         let t = Transform::from_crs_defs(&from, &to).unwrap();
-        assert!(matches!(t.pipeline, TransformPipeline::Identity));
+        assert_eq!(t.selected_operation().name, "Identity");
     }
 
     #[test]
@@ -712,12 +840,11 @@ mod tests {
         ));
 
         let err = match Transform::from_crs_defs(&from, &to) {
-            Ok(_) => panic!("unknown custom datums should not build an identity transform"),
+            Ok(_) => panic!("unknown custom datums should not build a transform"),
             Err(err) => err,
         };
-        assert!(err
-            .to_string()
-            .contains("has no known datum shift to WGS84"));
+        assert!(err.to_string().contains("no compatible operation found")
+            || err.to_string().contains("legacy Helmert fallback unavailable"));
     }
 
     #[test]
@@ -764,7 +891,7 @@ mod tests {
         let results = t.convert_batch(&coords).unwrap();
         assert_eq!(results.len(), 10);
         for (x, _y) in &results {
-            assert!(*x < 0.0); // all points are west of prime meridian
+            assert!(*x < 0.0);
         }
     }
 

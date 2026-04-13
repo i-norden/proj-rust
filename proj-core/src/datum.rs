@@ -63,7 +63,7 @@ pub enum DatumToWgs84 {
 /// [Y'] = [dy] + (1+ds)[  rz   1  -rx] [Y]
 /// [Z']   [dz]         [ -ry  rx   1 ] [Z]
 /// ```
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct HelmertParams {
     /// X-axis translation in meters.
     pub dx: f64,
