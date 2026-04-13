@@ -32,9 +32,12 @@ pub mod ellipsoid;
 mod epsg_db;
 pub mod error;
 mod geocentric;
+pub mod grid;
 mod helmert;
+pub mod operation;
 mod projection;
 pub mod registry;
+mod selector;
 pub mod transform;
 
 pub use coord::{Bounds, Coord, Coord3D, Transformable, Transformable3D};
@@ -42,5 +45,18 @@ pub use crs::{CrsDef, GeographicCrsDef, LinearUnit, ProjectedCrsDef, ProjectionM
 pub use datum::{Datum, DatumToWgs84, HelmertParams};
 pub use ellipsoid::Ellipsoid;
 pub use error::{Error, Result};
-pub use registry::{lookup_authority_code, lookup_datum_epsg, lookup_epsg};
+pub use grid::{
+    EmbeddedGridProvider, FilesystemGridProvider, GridDefinition, GridError, GridFormat,
+    GridHandle, GridProvider, GridSample,
+};
+pub use operation::{
+    AreaOfInterest, AreaOfInterestCrs, AreaOfUse, CoordinateOperation, CoordinateOperationId,
+    CoordinateOperationMetadata, GridId, GridInterpolation, GridShiftDirection, OperationAccuracy,
+    OperationMatchKind, OperationMethod, OperationSelectionDiagnostics, OperationStep,
+    OperationStepDirection, SelectionOptions, SelectionPolicy, SelectionReason, SkippedOperation,
+    SkippedOperationReason,
+};
+pub use registry::{
+    lookup_authority_code, lookup_datum_epsg, lookup_epsg, lookup_operation, operations_between,
+};
 pub use transform::Transform;

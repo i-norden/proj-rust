@@ -2,6 +2,8 @@ use crate::crs::CrsDef;
 use crate::datum::Datum;
 use crate::epsg_db;
 use crate::error::{Error, Result};
+use crate::grid::GridDefinition;
+use crate::operation::{CoordinateOperation, CoordinateOperationId};
 
 /// Look up a CRS definition by EPSG code.
 ///
@@ -16,6 +18,42 @@ pub fn lookup_epsg(code: u32) -> Option<CrsDef> {
 /// Look up a datum definition by EPSG code.
 pub fn lookup_datum_epsg(code: u32) -> Option<Datum> {
     epsg_db::lookup_datum(code)
+}
+
+/// Look up a coordinate operation by its identifier.
+pub fn lookup_operation(id: CoordinateOperationId) -> Option<CoordinateOperation> {
+    epsg_db::lookup_operation(id.0)
+}
+
+/// Look up a grid definition by its identifier.
+pub(crate) fn lookup_grid_definition(id: u32) -> Option<GridDefinition> {
+    epsg_db::lookup_grid(id)
+}
+
+pub(crate) fn all_operations() -> Vec<CoordinateOperation> {
+    epsg_db::operations()
+}
+
+/// Return all registry operations compatible with the source and target CRS.
+pub fn operations_between(source: &CrsDef, target: &CrsDef) -> Vec<CoordinateOperation> {
+    let source_geo = source.base_geographic_crs_epsg();
+    let target_geo = target.base_geographic_crs_epsg();
+    let source_datum = source_geo.and_then(epsg_db::lookup_datum_code_for_crs);
+    let target_datum = target_geo.and_then(epsg_db::lookup_datum_code_for_crs);
+    epsg_db::operations()
+        .into_iter()
+        .filter(|operation| match (source_geo, target_geo) {
+            (Some(source_code), Some(target_code)) => {
+                (operation.source_crs_epsg == Some(source_code)
+                    && operation.target_crs_epsg == Some(target_code))
+                    || (source_datum.is_some()
+                        && target_datum.is_some()
+                        && operation.source_datum_epsg == source_datum
+                        && operation.target_datum_epsg == target_datum)
+            }
+            _ => false,
+        })
+        .collect()
 }
 
 /// Parse an authority:code string (e.g., "EPSG:4326") and look up the CRS definition.

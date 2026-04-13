@@ -119,6 +119,17 @@ impl CrsDef {
         matches!(self, CrsDef::Projected(_))
     }
 
+    /// Returns the geographic CRS EPSG code used for operation selection, when known.
+    pub fn base_geographic_crs_epsg(&self) -> Option<u32> {
+        match self {
+            CrsDef::Geographic(g) if g.epsg() != 0 => Some(g.epsg()),
+            CrsDef::Projected(p) if p.base_geographic_crs_epsg() != 0 => {
+                Some(p.base_geographic_crs_epsg())
+            }
+            _ => None,
+        }
+    }
+
     /// Returns true when two CRS definitions map to the same internal semantics.
     pub fn semantically_equivalent(&self, other: &Self) -> bool {
         match (self, other) {
@@ -163,6 +174,7 @@ impl GeographicCrsDef {
 #[derive(Debug, Clone, Copy)]
 pub struct ProjectedCrsDef {
     epsg: u32,
+    base_geographic_crs_epsg: u32,
     datum: Datum,
     method: ProjectionMethod,
     linear_unit: LinearUnit,
@@ -177,8 +189,20 @@ impl ProjectedCrsDef {
         linear_unit: LinearUnit,
         name: &'static str,
     ) -> Self {
+        Self::new_with_base_geographic_crs(epsg, 0, datum, method, linear_unit, name)
+    }
+
+    pub const fn new_with_base_geographic_crs(
+        epsg: u32,
+        base_geographic_crs_epsg: u32,
+        datum: Datum,
+        method: ProjectionMethod,
+        linear_unit: LinearUnit,
+        name: &'static str,
+    ) -> Self {
         Self {
             epsg,
+            base_geographic_crs_epsg,
             datum,
             method,
             linear_unit,
@@ -192,6 +216,10 @@ impl ProjectedCrsDef {
 
     pub const fn datum(&self) -> &Datum {
         &self.datum
+    }
+
+    pub const fn base_geographic_crs_epsg(&self) -> u32 {
+        self.base_geographic_crs_epsg
     }
 
     pub const fn method(&self) -> ProjectionMethod {
@@ -215,7 +243,7 @@ impl ProjectedCrsDef {
 ///
 /// Angle parameters are stored in **degrees**. Conversion to radians happens
 /// at projection construction time (once), not per-transform.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ProjectionMethod {
     /// Web Mercator (EPSG:3857) — spherical Mercator on WGS84 semi-major axis.
     WebMercator,
