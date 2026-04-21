@@ -3,10 +3,10 @@ use smallvec::SmallVec;
 use std::collections::HashMap;
 use std::f64::consts::PI;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use thiserror::Error;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum GridFormat {
     Ntv2,
     Unsupported,
@@ -167,33 +167,32 @@ impl GridProvider for EmbeddedGridProvider {
         &self,
         grid: &GridDefinition,
     ) -> std::result::Result<Option<GridDefinition>, GridError> {
-        if embedded_grid_bytes(&grid.resource_names).is_some() {
+        if embedded_grid_resource(&grid.resource_names).is_some() {
             return Ok(Some(grid.clone()));
         }
         Ok(None)
     }
 
     fn load(&self, grid: &GridDefinition) -> std::result::Result<Option<GridHandle>, GridError> {
-        let Some(bytes) = embedded_grid_bytes(&grid.resource_names) else {
+        let Some((resource_name, bytes)) = embedded_grid_resource(&grid.resource_names) else {
             return Ok(None);
         };
 
-        let data = match grid.format {
-            GridFormat::Ntv2 => GridData::Ntv2(Ntv2GridSet::parse(bytes)?),
-            GridFormat::Unsupported => {
-                return Err(GridError::UnsupportedFormat(grid.name.clone()));
-            }
-        };
+        let key = GridDataCacheKey::new(grid.format, resource_name);
+        let data = cached_grid_data(embedded_grid_data_cache(), key, || {
+            parse_grid_data(grid.format, &grid.name, bytes)
+        })?;
 
         Ok(Some(GridHandle {
             definition: grid.clone(),
-            data: Arc::new(data),
+            data,
         }))
     }
 }
 
 pub struct FilesystemGridProvider {
     roots: Vec<PathBuf>,
+    data_cache: Mutex<HashMap<GridDataCacheKey, Arc<GridData>>>,
 }
 
 impl FilesystemGridProvider {
@@ -203,6 +202,7 @@ impl FilesystemGridProvider {
     {
         Self {
             roots: roots.into_iter().collect(),
+            data_cache: Mutex::new(HashMap::new()),
         }
     }
 
@@ -235,18 +235,17 @@ impl GridProvider for FilesystemGridProvider {
             return Ok(None);
         };
 
-        let bytes = std::fs::read(&path)
-            .map_err(|err| GridError::Unavailable(format!("{}: {err}", path.display())))?;
-        let data = match grid.format {
-            GridFormat::Ntv2 => GridData::Ntv2(Ntv2GridSet::parse(&bytes)?),
-            GridFormat::Unsupported => {
-                return Err(GridError::UnsupportedFormat(grid.name.clone()));
-            }
-        };
+        let cache_path = path.canonicalize().unwrap_or_else(|_| path.clone());
+        let key = GridDataCacheKey::new(grid.format, cache_path.to_string_lossy());
+        let data = cached_grid_data(&self.data_cache, key, || {
+            let bytes = std::fs::read(&path)
+                .map_err(|err| GridError::Unavailable(format!("{}: {err}", path.display())))?;
+            parse_grid_data(grid.format, &grid.name, &bytes)
+        })?;
 
         Ok(Some(GridHandle {
             definition: grid.clone(),
-            data: Arc::new(data),
+            data,
         }))
     }
 }
@@ -255,10 +254,61 @@ enum GridData {
     Ntv2(Ntv2GridSet),
 }
 
-fn embedded_grid_bytes(names: &[String]) -> Option<&'static [u8]> {
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct GridDataCacheKey {
+    format: GridFormat,
+    resource: String,
+}
+
+impl GridDataCacheKey {
+    fn new(format: GridFormat, resource: impl AsRef<str>) -> Self {
+        Self {
+            format,
+            resource: resource.as_ref().to_string(),
+        }
+    }
+}
+
+fn embedded_grid_data_cache() -> &'static Mutex<HashMap<GridDataCacheKey, Arc<GridData>>> {
+    static CACHE: OnceLock<Mutex<HashMap<GridDataCacheKey, Arc<GridData>>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn cached_grid_data(
+    cache: &Mutex<HashMap<GridDataCacheKey, Arc<GridData>>>,
+    key: GridDataCacheKey,
+    parse: impl FnOnce() -> std::result::Result<GridData, GridError>,
+) -> std::result::Result<Arc<GridData>, GridError> {
+    if let Some(cached) = cache
+        .lock()
+        .expect("grid data cache poisoned")
+        .get(&key)
+        .cloned()
+    {
+        return Ok(cached);
+    }
+
+    let parsed = Arc::new(parse()?);
+    let mut cache = cache.lock().expect("grid data cache poisoned");
+    let cached = cache.entry(key).or_insert_with(|| Arc::clone(&parsed));
+    Ok(Arc::clone(cached))
+}
+
+fn parse_grid_data(
+    format: GridFormat,
+    name: &str,
+    bytes: &[u8],
+) -> std::result::Result<GridData, GridError> {
+    match format {
+        GridFormat::Ntv2 => Ok(GridData::Ntv2(Ntv2GridSet::parse(bytes)?)),
+        GridFormat::Unsupported => Err(GridError::UnsupportedFormat(name.into())),
+    }
+}
+
+fn embedded_grid_resource(names: &[String]) -> Option<(&'static str, &'static [u8])> {
     for name in names {
         if name.eq_ignore_ascii_case("ntv2_0.gsb") {
-            return Some(include_bytes!("../data/grids/ntv2_0.gsb"));
+            return Some(("ntv2_0.gsb", include_bytes!("../data/grids/ntv2_0.gsb")));
         }
     }
     None
@@ -665,6 +715,20 @@ mod tests {
             "lon={lon}"
         );
         assert!((lat.to_degrees() - 44.5458827236).abs() < 3e-6, "lat={lat}");
+    }
+
+    #[test]
+    fn embedded_provider_reuses_parsed_grid_data() {
+        let provider = EmbeddedGridProvider;
+        let definition = test_grid_definition();
+
+        let first = provider.load(&definition).unwrap().expect("embedded grid");
+        let mut renamed = definition.clone();
+        renamed.name = "renamed ntv2 grid".into();
+        let second = provider.load(&renamed).unwrap().expect("embedded grid");
+
+        assert!(Arc::ptr_eq(&first.data, &second.data));
+        assert_eq!(second.definition().name, "renamed ntv2 grid");
     }
 
     struct TrackingGridProvider {
