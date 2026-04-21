@@ -247,12 +247,45 @@ pub(crate) fn validate_offset(name: &str, value: f64) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn normalize_longitude(mut lon: f64) -> f64 {
-    while lon > std::f64::consts::PI {
-        lon -= 2.0 * std::f64::consts::PI;
+pub(crate) fn normalize_longitude(lon: f64) -> f64 {
+    let normalized =
+        (lon + std::f64::consts::PI).rem_euclid(2.0 * std::f64::consts::PI) - std::f64::consts::PI;
+
+    if normalized == -std::f64::consts::PI && lon > 0.0 {
+        std::f64::consts::PI
+    } else {
+        normalized
     }
-    while lon < -std::f64::consts::PI {
-        lon += 2.0 * std::f64::consts::PI;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalize_longitude_handles_huge_finite_values() {
+        let normalized = normalize_longitude(1.0e20);
+
+        assert!(normalized.is_finite());
+        assert!(
+            (-std::f64::consts::PI..=std::f64::consts::PI).contains(&normalized),
+            "normalized longitude {normalized} outside [-pi, pi]"
+        );
     }
-    lon
+
+    #[test]
+    fn normalize_longitude_preserves_positive_pi_boundary() {
+        assert_eq!(
+            normalize_longitude(std::f64::consts::PI),
+            std::f64::consts::PI
+        );
+        assert_eq!(
+            normalize_longitude(3.0 * std::f64::consts::PI),
+            std::f64::consts::PI
+        );
+        assert_eq!(
+            normalize_longitude(-3.0 * std::f64::consts::PI),
+            -std::f64::consts::PI
+        );
+    }
 }
