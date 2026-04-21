@@ -1,13 +1,15 @@
-/// Generate compact binary EPSG registry from proj.db.
-///
-/// Run: cd gen-reference && cargo run --bin gen-registry
-///
-/// Outputs: ../proj-core/data/epsg.bin
+//! Generate compact binary EPSG registry from proj.db.
+//!
+//! Run: cd gen-reference && cargo run --bin gen-registry
+//!
+//! Outputs: ../proj-core/data/epsg.bin
 
 use rusqlite::{params, Connection};
 use std::collections::{BTreeMap, BTreeSet};
 use std::f64::consts::PI;
 use std::path::PathBuf;
+
+type ProjectedCrsRow = (u32, u32, u32, String, String, i64, Option<i64>, Option<f64>);
 
 fn find_proj_db() -> PathBuf {
     let target_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target");
@@ -560,7 +562,7 @@ fn main() {
                  ORDER BY pc.code",
             )
             .unwrap();
-        let rows: Vec<(u32, u32, u32, String, String, i64, Option<i64>, Option<f64>)> = stmt
+        let rows: Vec<ProjectedCrsRow> = stmt
             .query_map([], |row| {
                 Ok((
                     row.get(0)?,
@@ -574,7 +576,7 @@ fn main() {
                 ))
             })
             .unwrap()
-            .filter_map(|row| row.ok())
+            .map(|row| row.unwrap())
             .collect();
 
         for (
