@@ -747,6 +747,13 @@ mod tests {
 
     const US_FOOT_TO_METER: f64 = 0.3048006096012192;
 
+    fn expect_transform_error(result: Result<Transform>) -> Error {
+        match result {
+            Ok(_) => panic!("expected transform construction to fail"),
+            Err(err) => err,
+        }
+    }
+
     #[test]
     fn identity_same_crs() {
         let t = Transform::new("EPSG:4326", "EPSG:4326").unwrap();
@@ -932,6 +939,62 @@ mod tests {
             t.selection_diagnostics().selected_match_kind,
             OperationMatchKind::DerivedGeographic
         );
+    }
+
+    #[test]
+    fn area_of_interest_rejects_invalid_geographic_bounds() {
+        for bounds in [
+            Bounds::new(10.0, 5.0, -10.0, 20.0),
+            Bounds::new(f64::NAN, 5.0, 10.0, 20.0),
+            Bounds::new(-181.0, 5.0, -170.0, 20.0),
+            Bounds::new(-80.0, -91.0, -70.0, -80.0),
+        ] {
+            let err = expect_transform_error(Transform::with_selection_options(
+                "EPSG:4267",
+                "EPSG:4269",
+                SelectionOptions {
+                    area_of_interest: Some(AreaOfInterest::geographic_bounds(bounds)),
+                    ..SelectionOptions::default()
+                },
+            ));
+
+            assert!(matches!(err, Error::OutOfRange(_)), "got {err}");
+        }
+    }
+
+    #[test]
+    fn area_of_interest_validates_geographic_source_and_target_bounds() {
+        for area_of_interest in [
+            AreaOfInterest::source_crs_bounds(Bounds::new(-181.0, 40.0, -170.0, 45.0)),
+            AreaOfInterest::target_crs_bounds(Bounds::new(-80.0, 40.0, -70.0, 91.0)),
+        ] {
+            let err = expect_transform_error(Transform::with_selection_options(
+                "EPSG:4267",
+                "EPSG:4269",
+                SelectionOptions {
+                    area_of_interest: Some(area_of_interest),
+                    ..SelectionOptions::default()
+                },
+            ));
+
+            assert!(matches!(err, Error::OutOfRange(_)), "got {err}");
+        }
+    }
+
+    #[test]
+    fn area_of_interest_rejects_invalid_projected_bounds_before_sampling() {
+        let err = expect_transform_error(Transform::with_selection_options(
+            "EPSG:3857",
+            "EPSG:4326",
+            SelectionOptions {
+                area_of_interest: Some(AreaOfInterest::source_crs_bounds(Bounds::new(
+                    10.0, 0.0, -10.0, 10.0,
+                ))),
+                ..SelectionOptions::default()
+            },
+        ));
+
+        assert!(matches!(err, Error::OutOfRange(_)), "got {err}");
     }
 
     #[test]

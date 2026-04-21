@@ -65,7 +65,8 @@ impl Bounds {
         self.max_y - self.min_y
     }
 
-    pub(crate) fn is_valid(&self) -> bool {
+    /// Return true when all bounds are finite and both axes satisfy `min <= max`.
+    pub fn is_valid(&self) -> bool {
         self.min_x.is_finite()
             && self.min_y.is_finite()
             && self.max_x.is_finite()
@@ -250,5 +251,13 @@ mod tests {
         assert_eq!(bounds.width(), 40.0);
         assert_eq!(bounds.height(), 20.0);
         assert!(bounds.is_valid());
+    }
+
+    #[test]
+    fn bounds_invalid_when_non_finite_or_reversed() {
+        assert!(!Bounds::new(f64::NAN, 20.0, 30.0, 40.0).is_valid());
+        assert!(!Bounds::new(-10.0, 20.0, f64::INFINITY, 40.0).is_valid());
+        assert!(!Bounds::new(30.0, 20.0, -10.0, 40.0).is_valid());
+        assert!(!Bounds::new(-10.0, 40.0, 30.0, 20.0).is_valid());
     }
 }
