@@ -1,6 +1,6 @@
 use crate::coord::{Bounds, Coord};
 use crate::crs::CrsDef;
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::operation::{
     AreaOfInterest, AreaOfUse, CoordinateOperation, CoordinateOperationMetadata,
     OperationMatchKind, OperationMethod, OperationStepDirection, SelectionOptions, SelectionPolicy,
@@ -409,7 +409,7 @@ fn resolve_area_point(
 ) -> Result<Coord> {
     match area.crs {
         crate::operation::AreaOfInterestCrs::GeographicDegrees => {
-            validate_lon_lat(point.x.to_radians(), point.y.to_radians())?;
+            validate_geographic_area_point(point)?;
             Ok(point)
         }
         crate::operation::AreaOfInterestCrs::SourceCrs => geographic_from_crs_point(source, point),
@@ -423,13 +423,19 @@ fn resolve_area_bounds(
     source: &CrsDef,
     target: &CrsDef,
 ) -> Result<Bounds> {
+    validate_area_bounds_shape(bounds)?;
+
     let crs = match area.crs {
-        crate::operation::AreaOfInterestCrs::GeographicDegrees => return Ok(bounds),
+        crate::operation::AreaOfInterestCrs::GeographicDegrees => {
+            validate_geographic_area_bounds(bounds)?;
+            return Ok(bounds);
+        }
         crate::operation::AreaOfInterestCrs::SourceCrs => source,
         crate::operation::AreaOfInterestCrs::TargetCrs => target,
     };
 
     if matches!(crs, CrsDef::Geographic(_)) {
+        validate_geographic_area_bounds(bounds)?;
         return Ok(bounds);
     }
 
@@ -459,7 +465,7 @@ fn resolve_area_bounds(
 fn geographic_from_crs_point(crs: &CrsDef, point: Coord) -> Result<Coord> {
     match crs {
         CrsDef::Geographic(_) => {
-            validate_lon_lat(point.x.to_radians(), point.y.to_radians())?;
+            validate_geographic_area_point(point)?;
             Ok(point)
         }
         CrsDef::Projected(projected) => {
@@ -469,9 +475,55 @@ fn geographic_from_crs_point(crs: &CrsDef, point: Coord) -> Result<Coord> {
                 projected.linear_unit().to_meters(point.x),
                 projected.linear_unit().to_meters(point.y),
             )?;
-            Ok(Coord::new(lon.to_degrees(), lat.to_degrees()))
+            let geographic = Coord::new(lon.to_degrees(), lat.to_degrees());
+            validate_geographic_area_point(geographic)?;
+            Ok(geographic)
         }
     }
+}
+
+fn validate_area_bounds_shape(bounds: Bounds) -> Result<()> {
+    if !bounds.is_valid() {
+        return Err(Error::OutOfRange(
+            "area-of-interest bounds must be finite and satisfy min <= max".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_geographic_area_bounds(bounds: Bounds) -> Result<()> {
+    validate_area_bounds_shape(bounds)?;
+    for point in [
+        Coord::new(bounds.min_x, bounds.min_y),
+        Coord::new(bounds.min_x, bounds.max_y),
+        Coord::new(bounds.max_x, bounds.min_y),
+        Coord::new(bounds.max_x, bounds.max_y),
+    ] {
+        validate_geographic_area_point(point)?;
+    }
+    Ok(())
+}
+
+fn validate_geographic_area_point(point: Coord) -> Result<()> {
+    if !point.x.is_finite() || !point.y.is_finite() {
+        return Err(Error::OutOfRange(
+            "geographic area-of-interest coordinate must be finite".into(),
+        ));
+    }
+    if !(-180.0..=180.0).contains(&point.x) {
+        return Err(Error::OutOfRange(format!(
+            "geographic area-of-interest longitude {:.8}° is outside [-180°, 180°]",
+            point.x
+        )));
+    }
+    if !(-90.0..=90.0).contains(&point.y) {
+        return Err(Error::OutOfRange(format!(
+            "geographic area-of-interest latitude {:.8}° is outside [-90°, 90°]",
+            point.y
+        )));
+    }
+
+    validate_lon_lat(point.x.to_radians(), point.y.to_radians())
 }
 
 fn synthetic_helmert_fallback(source: &CrsDef, target: &CrsDef) -> Option<CoordinateOperation> {
