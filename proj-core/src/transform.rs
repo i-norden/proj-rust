@@ -392,6 +392,52 @@ impl Transform {
         coords.iter().map(|c| self.convert_3d(c.clone())).collect()
     }
 
+    /// Transform 2D coordinates in place without allocating.
+    ///
+    /// Coordinates before a failing coordinate are left converted; the failing
+    /// coordinate and subsequent coordinates are left unchanged.
+    pub fn convert_coords_in_place(&self, coords: &mut [Coord]) -> Result<()> {
+        for coord in coords {
+            *coord = self.convert_coord(*coord)?;
+        }
+        Ok(())
+    }
+
+    /// Transform 3D coordinates in place without allocating.
+    ///
+    /// Coordinates before a failing coordinate are left converted; the failing
+    /// coordinate and subsequent coordinates are left unchanged.
+    pub fn convert_coords_3d_in_place(&self, coords: &mut [Coord3D]) -> Result<()> {
+        for coord in coords {
+            *coord = self.convert_coord3d(*coord)?;
+        }
+        Ok(())
+    }
+
+    /// Transform 2D coordinates from `input` into an existing `output` slice.
+    ///
+    /// `output` must have exactly the same length as `input`. This API performs
+    /// no allocation and does not require cloning input coordinates.
+    pub fn convert_coords_into(&self, input: &[Coord], output: &mut [Coord]) -> Result<()> {
+        validate_output_len(input.len(), output.len())?;
+        for (source, target) in input.iter().zip(output.iter_mut()) {
+            *target = self.convert_coord(*source)?;
+        }
+        Ok(())
+    }
+
+    /// Transform 3D coordinates from `input` into an existing `output` slice.
+    ///
+    /// `output` must have exactly the same length as `input`. This API performs
+    /// no allocation and does not require cloning input coordinates.
+    pub fn convert_coords_3d_into(&self, input: &[Coord3D], output: &mut [Coord3D]) -> Result<()> {
+        validate_output_len(input.len(), output.len())?;
+        for (source, target) in input.iter().zip(output.iter_mut()) {
+            *target = self.convert_coord3d(*source)?;
+        }
+        Ok(())
+    }
+
     /// Batch transform with Rayon parallelism.
     #[cfg(feature = "rayon")]
     pub fn convert_batch_parallel<T: Transformable + Send + Sync + Clone>(
@@ -444,6 +490,15 @@ fn selected_metadata(
     let mut metadata = operation.metadata_for_direction(direction);
     metadata.area_of_use = matched_area_of_use.or_else(|| operation.areas_of_use.first().cloned());
     metadata
+}
+
+fn validate_output_len(input_len: usize, output_len: usize) -> Result<()> {
+    if input_len != output_len {
+        return Err(Error::OutOfRange(format!(
+            "output coordinate slice length {output_len} does not match input length {input_len}"
+        )));
+    }
+    Ok(())
 }
 
 fn selected_reasons_for(
@@ -1275,6 +1330,62 @@ mod tests {
             assert!(*x < 0.0);
             assert!((*z - index as f64).abs() < 1e-12);
         }
+    }
+
+    #[test]
+    fn batch_transform_coords_in_place_matches_vec_batch() {
+        let t = Transform::new("EPSG:4326", "EPSG:3857").unwrap();
+        let input: Vec<Coord> = (0..10)
+            .map(|i| Coord::new(-74.0 + i as f64 * 0.1, 40.0 + i as f64 * 0.1))
+            .collect();
+        let expected = t.convert_batch(&input).unwrap();
+        let mut actual = input.clone();
+
+        t.convert_coords_in_place(&mut actual).unwrap();
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn batch_transform_coords_into_reuses_output_slice() {
+        let t = Transform::new("EPSG:4326", "EPSG:3857").unwrap();
+        let input: Vec<Coord> = (0..10)
+            .map(|i| Coord::new(-74.0 + i as f64 * 0.1, 40.0 + i as f64 * 0.1))
+            .collect();
+        let expected = t.convert_batch(&input).unwrap();
+        let mut actual = vec![Coord::new(0.0, 0.0); input.len()];
+
+        t.convert_coords_into(&input, &mut actual).unwrap();
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn batch_transform_coords_into_rejects_mismatched_output_len() {
+        let t = Transform::new("EPSG:4326", "EPSG:3857").unwrap();
+        let input = [Coord::new(-74.0, 40.0), Coord::new(-73.0, 41.0)];
+        let mut output = [Coord::new(0.0, 0.0)];
+
+        let err = t.convert_coords_into(&input, &mut output).unwrap_err();
+
+        assert!(matches!(err, Error::OutOfRange(_)));
+    }
+
+    #[test]
+    fn batch_transform_coords_3d_in_place_and_into_preserve_height() {
+        let t = Transform::new("EPSG:4326", "EPSG:3857").unwrap();
+        let input: Vec<Coord3D> = (0..10)
+            .map(|i| Coord3D::new(-74.0 + i as f64 * 0.1, 40.0 + i as f64 * 0.1, i as f64))
+            .collect();
+        let expected = t.convert_batch_3d(&input).unwrap();
+
+        let mut in_place = input.clone();
+        t.convert_coords_3d_in_place(&mut in_place).unwrap();
+        assert_eq!(in_place, expected);
+
+        let mut output = vec![Coord3D::new(0.0, 0.0, 0.0); input.len()];
+        t.convert_coords_3d_into(&input, &mut output).unwrap();
+        assert_eq!(output, expected);
     }
 
     #[test]
