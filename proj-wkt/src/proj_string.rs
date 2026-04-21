@@ -9,11 +9,24 @@ use proj_core::DatumToWgs84;
 use crate::semantics::normalize_key;
 use crate::{ParseError, Result};
 
+const COMMON_PROJ_PARAMS: &[&str] = &[
+    "proj", "datum", "ellps", "towgs84", "pm", "axis", "lon_wrap", "over", "no_defs", "type",
+];
+const LINEAR_UNIT_PARAMS: &[&str] = &["units", "to_meter"];
+const GEOGRAPHIC_UNIT_PARAMS: &[&str] = &["units", "to_meter"];
+const UTM_PARAMS: &[&str] = &["zone", "south"];
+const TMERC_PARAMS: &[&str] = &["lat_0", "lon_0", "k_0", "k", "x_0", "y_0"];
+const MERC_PARAMS: &[&str] = &["lon_0", "lat_ts", "k_0", "k", "x_0", "y_0"];
+const STERE_PARAMS: &[&str] = &["lat_0", "lon_0", "lat_ts", "k_0", "k", "x_0", "y_0"];
+const CONIC_PARAMS: &[&str] = &["lat_0", "lon_0", "lat_1", "lat_2", "x_0", "y_0"];
+const EQC_PARAMS: &[&str] = &["lon_0", "lat_ts", "x_0", "y_0"];
+
 /// Parse a PROJ format string like `+proj=utm +zone=18 +datum=WGS84 +units=m`.
 pub(crate) fn parse_proj_string(s: &str) -> Result<CrsDef> {
     let params = parse_params(s)?;
 
-    if !params.contains_key("proj") {
+    if !params.contains_key("proj") && params.contains_key("init") {
+        validate_supported_proj_init_params(&params)?;
         if let Some(crs) = parse_init_authority(&params)? {
             return Ok(crs);
         }
@@ -74,21 +87,27 @@ fn parse_init_authority(params: &HashMap<String, String>) -> Result<Option<CrsDe
 }
 
 fn resolve_datum(params: &HashMap<String, String>) -> Result<Datum> {
+    let towgs84 = parse_towgs84(params)?;
+
     if let Some(d) = params.get("datum") {
-        match d.to_uppercase().as_str() {
-            "WGS84" => return Ok(datum::WGS84),
-            "NAD83" => return Ok(datum::NAD83),
-            "NAD27" => return Ok(datum::NAD27),
-            "OSGB36" => return Ok(datum::OSGB36),
-            "ETRS89" => return Ok(datum::ETRS89),
-            "ED50" => return Ok(datum::ED50),
-            "TOKYO" => return Ok(datum::TOKYO),
+        let mut datum = match d.to_uppercase().as_str() {
+            "WGS84" => datum::WGS84,
+            "NAD83" => datum::NAD83,
+            "NAD27" => datum::NAD27,
+            "OSGB36" => datum::OSGB36,
+            "ETRS89" => datum::ETRS89,
+            "ED50" => datum::ED50,
+            "TOKYO" => datum::TOKYO,
             other => {
                 return Err(ParseError::Parse(format!(
                     "unsupported PROJ datum: {other}"
                 )));
             }
+        };
+        if let Some(to_wgs84) = towgs84 {
+            datum.to_wgs84 = to_wgs84;
         }
+        return Ok(datum);
     }
 
     if let Some(e) = params.get("ellps") {
@@ -108,7 +127,7 @@ fn resolve_datum(params: &HashMap<String, String>) -> Result<Datum> {
         };
         return Ok(proj_core::Datum {
             ellipsoid: ellps,
-            to_wgs84: parse_towgs84(params).unwrap_or_else(|| {
+            to_wgs84: towgs84.unwrap_or_else(|| {
                 if (ellps.a - ellipsoid::WGS84.a).abs() < 1e-9
                     && (ellps.f - ellipsoid::WGS84.f).abs() < 1e-15
                 {
@@ -120,41 +139,90 @@ fn resolve_datum(params: &HashMap<String, String>) -> Result<Datum> {
         });
     }
 
+    if let Some(to_wgs84) = towgs84 {
+        return Ok(proj_core::Datum {
+            ellipsoid: ellipsoid::WGS84,
+            to_wgs84,
+        });
+    }
+
     Ok(datum::WGS84)
 }
 
-fn parse_towgs84(params: &HashMap<String, String>) -> Option<DatumToWgs84> {
-    let s = params.get("towgs84")?;
-    let vals: Vec<f64> = s.split(',').filter_map(|v| v.trim().parse().ok()).collect();
-    if vals.len() >= 3 {
-        let helmert = proj_core::HelmertParams {
-            dx: vals[0],
-            dy: vals[1],
-            dz: vals[2],
-            rx: *vals.get(3).unwrap_or(&0.0),
-            ry: *vals.get(4).unwrap_or(&0.0),
-            rz: *vals.get(5).unwrap_or(&0.0),
-            ds: *vals.get(6).unwrap_or(&0.0),
-        };
-        Some(if vals.iter().all(|value| *value == 0.0) {
-            DatumToWgs84::Identity
-        } else {
-            DatumToWgs84::Helmert(helmert)
+fn parse_towgs84(params: &HashMap<String, String>) -> Result<Option<DatumToWgs84>> {
+    let Some(s) = params.get("towgs84") else {
+        return Ok(None);
+    };
+    let vals = s
+        .split(',')
+        .map(|value| {
+            let value = value.trim();
+            let parsed = value.parse::<f64>().map_err(|_| {
+                ParseError::Parse(format!("invalid +towgs84 numeric value: {value}"))
+            })?;
+            if parsed.is_finite() {
+                Ok(parsed)
+            } else {
+                Err(ParseError::Parse(format!(
+                    "invalid +towgs84 numeric value: {value}"
+                )))
+            }
         })
+        .collect::<Result<Vec<_>>>()?;
+
+    if !matches!(vals.len(), 3 | 7) {
+        return Err(ParseError::Parse(format!(
+            "+towgs84 requires 3 or 7 comma-separated numeric values, got {}",
+            vals.len()
+        )));
+    }
+
+    let helmert = proj_core::HelmertParams {
+        dx: vals[0],
+        dy: vals[1],
+        dz: vals[2],
+        rx: *vals.get(3).unwrap_or(&0.0),
+        ry: *vals.get(4).unwrap_or(&0.0),
+        rz: *vals.get(5).unwrap_or(&0.0),
+        ds: *vals.get(6).unwrap_or(&0.0),
+    };
+    Ok(Some(if vals.iter().all(|value| *value == 0.0) {
+        DatumToWgs84::Identity
     } else {
-        None
+        DatumToWgs84::Helmert(helmert)
+    }))
+}
+
+fn get_f64(params: &HashMap<String, String>, key: &str) -> Result<f64> {
+    match params.get(key) {
+        Some(value) => parse_f64_param(key, value),
+        None => Ok(0.0),
     }
 }
 
-fn get_f64(params: &HashMap<String, String>, key: &str) -> f64 {
-    params.get(key).and_then(|v| v.parse().ok()).unwrap_or(0.0)
+fn get_scale(params: &HashMap<String, String>) -> Result<f64> {
+    if let Some(value) = params.get("k_0") {
+        return parse_f64_param("k_0", value);
+    }
+    if let Some(value) = params.get("k") {
+        return parse_f64_param("k", value);
+    }
+    Ok(1.0)
+}
+
+fn parse_f64_param(key: &str, value: &str) -> Result<f64> {
+    let parsed = value
+        .parse::<f64>()
+        .map_err(|_| ParseError::Parse(format!("invalid +{key} value: {value}")))?;
+    if !parsed.is_finite() {
+        return Err(ParseError::Parse(format!("invalid +{key} value: {value}")));
+    }
+    Ok(parsed)
 }
 
 fn resolve_linear_unit_to_meter(params: &HashMap<String, String>) -> Result<f64> {
     if let Some(to_meter) = params.get("to_meter") {
-        return to_meter
-            .parse::<f64>()
-            .map_err(|_| ParseError::Parse(format!("invalid +to_meter value: {to_meter}")));
+        return parse_f64_param("to_meter", to_meter);
     }
 
     let factor = match params.get("units").map(|s| s.as_str()) {
@@ -183,17 +251,32 @@ fn resolve_linear_unit(params: &HashMap<String, String>) -> Result<LinearUnit> {
 }
 
 fn parse_geographic(params: &HashMap<String, String>) -> Result<CrsDef> {
+    validate_supported_proj_params(
+        params,
+        &[],
+        GEOGRAPHIC_UNIT_PARAMS,
+        "PROJ geographic CRS definition",
+    )?;
     validate_supported_proj_geographic_semantics(params)?;
     let d = resolve_datum(params)?;
     Ok(CrsDef::Geographic(GeographicCrsDef::new(0, d, "")))
 }
 
 fn parse_utm(params: &HashMap<String, String>) -> Result<CrsDef> {
+    validate_supported_proj_params(
+        params,
+        UTM_PARAMS,
+        LINEAR_UNIT_PARAMS,
+        "PROJ UTM definition",
+    )?;
     validate_supported_proj_common_semantics(params, "PROJ UTM definition")?;
-    let zone: u8 = params
+    validate_empty_flag(params, "south", "PROJ UTM definition")?;
+    let zone_value = params
         .get("zone")
-        .and_then(|v| v.parse().ok())
         .ok_or_else(|| ParseError::Parse("UTM requires +zone parameter".into()))?;
+    let zone: u8 = zone_value
+        .parse()
+        .map_err(|_| ParseError::Parse(format!("invalid UTM zone: {zone_value}")))?;
     if !(1..=60).contains(&zone) {
         return Err(ParseError::Parse(format!(
             "UTM zone out of range: {zone} (expected 1..=60)"
@@ -223,6 +306,12 @@ fn parse_utm(params: &HashMap<String, String>) -> Result<CrsDef> {
 }
 
 fn parse_tmerc(params: &HashMap<String, String>) -> Result<CrsDef> {
+    validate_supported_proj_params(
+        params,
+        TMERC_PARAMS,
+        LINEAR_UNIT_PARAMS,
+        "PROJ Transverse Mercator definition",
+    )?;
     validate_supported_proj_common_semantics(params, "PROJ Transverse Mercator definition")?;
     let d = resolve_datum(params)?;
     let linear_unit = resolve_linear_unit(params)?;
@@ -230,15 +319,11 @@ fn parse_tmerc(params: &HashMap<String, String>) -> Result<CrsDef> {
         0,
         d,
         ProjectionMethod::TransverseMercator {
-            lon0: get_f64(params, "lon_0"),
-            lat0: get_f64(params, "lat_0"),
-            k0: params
-                .get("k_0")
-                .or(params.get("k"))
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(1.0),
-            false_easting: linear_unit.to_meters(get_f64(params, "x_0")),
-            false_northing: linear_unit.to_meters(get_f64(params, "y_0")),
+            lon0: get_f64(params, "lon_0")?,
+            lat0: get_f64(params, "lat_0")?,
+            k0: get_scale(params)?,
+            false_easting: linear_unit.to_meters(get_f64(params, "x_0")?),
+            false_northing: linear_unit.to_meters(get_f64(params, "y_0")?),
         },
         linear_unit,
         "",
@@ -246,6 +331,12 @@ fn parse_tmerc(params: &HashMap<String, String>) -> Result<CrsDef> {
 }
 
 fn parse_merc(params: &HashMap<String, String>) -> Result<CrsDef> {
+    validate_supported_proj_params(
+        params,
+        MERC_PARAMS,
+        LINEAR_UNIT_PARAMS,
+        "PROJ Mercator definition",
+    )?;
     validate_supported_proj_common_semantics(params, "PROJ Mercator definition")?;
     let d = resolve_datum(params)?;
     let linear_unit = resolve_linear_unit(params)?;
@@ -253,15 +344,11 @@ fn parse_merc(params: &HashMap<String, String>) -> Result<CrsDef> {
         0,
         d,
         ProjectionMethod::Mercator {
-            lon0: get_f64(params, "lon_0"),
-            lat_ts: get_f64(params, "lat_ts"),
-            k0: params
-                .get("k_0")
-                .or(params.get("k"))
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(1.0),
-            false_easting: linear_unit.to_meters(get_f64(params, "x_0")),
-            false_northing: linear_unit.to_meters(get_f64(params, "y_0")),
+            lon0: get_f64(params, "lon_0")?,
+            lat_ts: get_f64(params, "lat_ts")?,
+            k0: get_scale(params)?,
+            false_easting: linear_unit.to_meters(get_f64(params, "x_0")?),
+            false_northing: linear_unit.to_meters(get_f64(params, "y_0")?),
         },
         linear_unit,
         "",
@@ -269,10 +356,16 @@ fn parse_merc(params: &HashMap<String, String>) -> Result<CrsDef> {
 }
 
 fn parse_stereo(params: &HashMap<String, String>) -> Result<CrsDef> {
+    validate_supported_proj_params(
+        params,
+        STERE_PARAMS,
+        LINEAR_UNIT_PARAMS,
+        "PROJ Polar Stereographic definition",
+    )?;
     validate_supported_proj_common_semantics(params, "PROJ Polar Stereographic definition")?;
-    let lat0 = get_f64(params, "lat_0");
+    let lat0 = get_f64(params, "lat_0")?;
     let lat_ts = if params.contains_key("lat_ts") {
-        get_f64(params, "lat_ts")
+        get_f64(params, "lat_ts")?
     } else {
         lat0
     };
@@ -291,15 +384,11 @@ fn parse_stereo(params: &HashMap<String, String>) -> Result<CrsDef> {
         0,
         d,
         ProjectionMethod::PolarStereographic {
-            lon0: get_f64(params, "lon_0"),
+            lon0: get_f64(params, "lon_0")?,
             lat_ts: lat_ts.copysign(pole),
-            k0: params
-                .get("k_0")
-                .or(params.get("k"))
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(1.0),
-            false_easting: linear_unit.to_meters(get_f64(params, "x_0")),
-            false_northing: linear_unit.to_meters(get_f64(params, "y_0")),
+            k0: get_scale(params)?,
+            false_easting: linear_unit.to_meters(get_f64(params, "x_0")?),
+            false_northing: linear_unit.to_meters(get_f64(params, "y_0")?),
         },
         linear_unit,
         "",
@@ -307,6 +396,12 @@ fn parse_stereo(params: &HashMap<String, String>) -> Result<CrsDef> {
 }
 
 fn parse_lcc(params: &HashMap<String, String>) -> Result<CrsDef> {
+    validate_supported_proj_params(
+        params,
+        CONIC_PARAMS,
+        LINEAR_UNIT_PARAMS,
+        "PROJ Lambert Conformal Conic definition",
+    )?;
     validate_supported_proj_common_semantics(params, "PROJ Lambert Conformal Conic definition")?;
     let d = resolve_datum(params)?;
     let linear_unit = resolve_linear_unit(params)?;
@@ -314,12 +409,12 @@ fn parse_lcc(params: &HashMap<String, String>) -> Result<CrsDef> {
         0,
         d,
         ProjectionMethod::LambertConformalConic {
-            lon0: get_f64(params, "lon_0"),
-            lat0: get_f64(params, "lat_0"),
-            lat1: get_f64(params, "lat_1"),
-            lat2: get_f64(params, "lat_2"),
-            false_easting: linear_unit.to_meters(get_f64(params, "x_0")),
-            false_northing: linear_unit.to_meters(get_f64(params, "y_0")),
+            lon0: get_f64(params, "lon_0")?,
+            lat0: get_f64(params, "lat_0")?,
+            lat1: get_f64(params, "lat_1")?,
+            lat2: get_f64(params, "lat_2")?,
+            false_easting: linear_unit.to_meters(get_f64(params, "x_0")?),
+            false_northing: linear_unit.to_meters(get_f64(params, "y_0")?),
         },
         linear_unit,
         "",
@@ -327,6 +422,12 @@ fn parse_lcc(params: &HashMap<String, String>) -> Result<CrsDef> {
 }
 
 fn parse_aea(params: &HashMap<String, String>) -> Result<CrsDef> {
+    validate_supported_proj_params(
+        params,
+        CONIC_PARAMS,
+        LINEAR_UNIT_PARAMS,
+        "PROJ Albers Equal Area definition",
+    )?;
     validate_supported_proj_common_semantics(params, "PROJ Albers Equal Area definition")?;
     let d = resolve_datum(params)?;
     let linear_unit = resolve_linear_unit(params)?;
@@ -334,12 +435,12 @@ fn parse_aea(params: &HashMap<String, String>) -> Result<CrsDef> {
         0,
         d,
         ProjectionMethod::AlbersEqualArea {
-            lon0: get_f64(params, "lon_0"),
-            lat0: get_f64(params, "lat_0"),
-            lat1: get_f64(params, "lat_1"),
-            lat2: get_f64(params, "lat_2"),
-            false_easting: linear_unit.to_meters(get_f64(params, "x_0")),
-            false_northing: linear_unit.to_meters(get_f64(params, "y_0")),
+            lon0: get_f64(params, "lon_0")?,
+            lat0: get_f64(params, "lat_0")?,
+            lat1: get_f64(params, "lat_1")?,
+            lat2: get_f64(params, "lat_2")?,
+            false_easting: linear_unit.to_meters(get_f64(params, "x_0")?),
+            false_northing: linear_unit.to_meters(get_f64(params, "y_0")?),
         },
         linear_unit,
         "",
@@ -347,6 +448,12 @@ fn parse_aea(params: &HashMap<String, String>) -> Result<CrsDef> {
 }
 
 fn parse_eqc(params: &HashMap<String, String>) -> Result<CrsDef> {
+    validate_supported_proj_params(
+        params,
+        EQC_PARAMS,
+        LINEAR_UNIT_PARAMS,
+        "PROJ Equidistant Cylindrical definition",
+    )?;
     validate_supported_proj_common_semantics(params, "PROJ Equidistant Cylindrical definition")?;
     let d = resolve_datum(params)?;
     let linear_unit = resolve_linear_unit(params)?;
@@ -354,14 +461,61 @@ fn parse_eqc(params: &HashMap<String, String>) -> Result<CrsDef> {
         0,
         d,
         ProjectionMethod::EquidistantCylindrical {
-            lon0: get_f64(params, "lon_0"),
-            lat_ts: get_f64(params, "lat_ts"),
-            false_easting: linear_unit.to_meters(get_f64(params, "x_0")),
-            false_northing: linear_unit.to_meters(get_f64(params, "y_0")),
+            lon0: get_f64(params, "lon_0")?,
+            lat_ts: get_f64(params, "lat_ts")?,
+            false_easting: linear_unit.to_meters(get_f64(params, "x_0")?),
+            false_northing: linear_unit.to_meters(get_f64(params, "y_0")?),
         },
         linear_unit,
         "",
     )))
+}
+
+fn validate_supported_proj_init_params(params: &HashMap<String, String>) -> Result<()> {
+    for key in params.keys() {
+        if matches!(key.as_str(), "init" | "type" | "no_defs") {
+            continue;
+        }
+        return Err(unsupported_proj_parameter_error(
+            "PROJ init authority reference",
+            key,
+        ));
+    }
+    validate_empty_flag(params, "no_defs", "PROJ init authority reference")?;
+    validate_proj_type(params, "PROJ init authority reference")
+}
+
+fn validate_supported_proj_params(
+    params: &HashMap<String, String>,
+    projection_params: &[&str],
+    unit_params: &[&str],
+    context: &str,
+) -> Result<()> {
+    for key in params.keys() {
+        if COMMON_PROJ_PARAMS.contains(&key.as_str())
+            || projection_params.contains(&key.as_str())
+            || unit_params.contains(&key.as_str())
+        {
+            continue;
+        }
+        return Err(unsupported_proj_parameter_error(context, key));
+    }
+    Ok(())
+}
+
+fn unsupported_proj_parameter_error(context: &str, key: &str) -> ParseError {
+    let detail = match key {
+        "nadgrids" => "grid-based horizontal datum shifts are not supported in PROJ strings",
+        "geoidgrids" => "vertical geoid grid shifts are not supported in PROJ strings",
+        "vunits" | "vto_meter" => "vertical coordinate units are not supported in PROJ strings",
+        "a" | "b" | "es" | "f" | "rf" | "r" => {
+            "custom ellipsoid parameters are not supported; use a supported +ellps value"
+        }
+        _ => "parameter is not supported by this PROJ parser",
+    };
+    ParseError::UnsupportedSemantics(format!(
+        "{context} uses unsupported PROJ parameter `+{key}`: {detail}"
+    ))
 }
 
 fn validate_supported_proj_geographic_semantics(params: &HashMap<String, String>) -> Result<()> {
@@ -389,6 +543,9 @@ fn validate_supported_proj_common_semantics(
     params: &HashMap<String, String>,
     context: &str,
 ) -> Result<()> {
+    validate_empty_flag(params, "no_defs", context)?;
+    validate_proj_type(params, context)?;
+
     if let Some(prime_meridian) = params.get("pm") {
         let normalized_prime_meridian = normalize_key(prime_meridian);
         let is_greenwich = normalized_prime_meridian.is_empty()
@@ -419,6 +576,34 @@ fn validate_supported_proj_common_semantics(
         )));
     }
 
+    if params.contains_key("over") {
+        return Err(ParseError::UnsupportedSemantics(format!(
+            "{context} uses unsupported over-range longitude semantics"
+        )));
+    }
+
+    Ok(())
+}
+
+fn validate_empty_flag(params: &HashMap<String, String>, key: &str, context: &str) -> Result<()> {
+    if let Some(value) = params.get(key) {
+        if !value.is_empty() {
+            return Err(ParseError::UnsupportedSemantics(format!(
+                "{context} uses unsupported +{key} value `{value}`"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_proj_type(params: &HashMap<String, String>, context: &str) -> Result<()> {
+    if let Some(value) = params.get("type") {
+        if normalize_key(value) != "crs" {
+            return Err(ParseError::UnsupportedSemantics(format!(
+                "{context} uses unsupported PROJ object type `{value}`"
+            )));
+        }
+    }
     Ok(())
 }
 
@@ -518,6 +703,50 @@ mod tests {
     fn reject_non_default_axis_order() {
         let err = parse_proj_string("+proj=longlat +datum=WGS84 +axis=neu").unwrap_err();
         assert!(err.to_string().contains("unsupported axis order"));
+    }
+
+    #[test]
+    fn reject_grid_shift_proj_params() {
+        let err = parse_proj_string("+proj=longlat +ellps=WGS84 +nadgrids=conus").unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("unsupported PROJ parameter `+nadgrids`"));
+
+        let err =
+            parse_proj_string("+proj=longlat +ellps=WGS84 +geoidgrids=egm96_15.gtx").unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("unsupported PROJ parameter `+geoidgrids`"));
+    }
+
+    #[test]
+    fn reject_over_range_longitude_semantics() {
+        let err = parse_proj_string("+proj=longlat +datum=WGS84 +over").unwrap_err();
+        assert!(err.to_string().contains("over-range longitude semantics"));
+    }
+
+    #[test]
+    fn reject_unknown_proj_parameter() {
+        let err = parse_proj_string("+proj=utm +zone=18 +datum=WGS84 +foo=bar").unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("unsupported PROJ parameter `+foo`"));
+    }
+
+    #[test]
+    fn reject_malformed_towgs84() {
+        let err =
+            parse_proj_string("+proj=longlat +ellps=WGS84 +towgs84=1,not-a-number,3").unwrap_err();
+        assert!(err.to_string().contains("invalid +towgs84 numeric value"));
+
+        let err = parse_proj_string("+proj=longlat +ellps=WGS84 +towgs84=1,2,3,4").unwrap_err();
+        assert!(err.to_string().contains("+towgs84 requires 3 or 7"));
+    }
+
+    #[test]
+    fn reject_invalid_numeric_proj_parameter() {
+        let err = parse_proj_string("+proj=tmerc +lat_0=not-a-number +lon_0=-2").unwrap_err();
+        assert!(err.to_string().contains("invalid +lat_0 value"));
     }
 
     #[test]

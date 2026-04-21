@@ -73,9 +73,12 @@ fn main() {
     let cols = s.column_names().iter().map(|c| c.to_string()).collect::<Vec<_>>();
     println!("Columns: {}", cols.join(", "));
     s.query_row(rusqlite::params![row.0, row.1], |r| {
-        for i in 0..n {
-            let val: String = r.get::<_, rusqlite::types::Value>(i).map(|v| format!("{:?}", v)).unwrap_or_default();
-            println!("  {}: {}", cols[i], val);
+        for (i, col) in cols.iter().enumerate().take(n) {
+            let val: String = r
+                .get::<_, rusqlite::types::Value>(i)
+                .map(|v| format!("{v:?}"))
+                .unwrap_or_default();
+            println!("  {col}: {val}");
         }
         Ok(())
     }).unwrap();
