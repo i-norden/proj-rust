@@ -4,12 +4,12 @@ use crate::datum::HelmertParams;
 use crate::ellipsoid::Ellipsoid;
 use crate::error::{Error, Result};
 use crate::geocentric;
-use crate::grid::{GridHandle, GridRuntime};
+use crate::grid::{GridError, GridHandle, GridRuntime};
 use crate::helmert;
 use crate::operation::{
-    CoordinateOperation, CoordinateOperationId, CoordinateOperationMetadata, GridShiftDirection,
-    OperationMethod, OperationSelectionDiagnostics, OperationStepDirection, SelectionOptions,
-    SelectionPolicy, SkippedOperation, SkippedOperationReason,
+    CoordinateOperation, CoordinateOperationId, CoordinateOperationMetadata, GridCoverageMiss,
+    GridShiftDirection, OperationMethod, OperationSelectionDiagnostics, OperationStepDirection,
+    SelectionOptions, SelectionPolicy, SkippedOperation, SkippedOperationReason, TransformOutcome,
 };
 use crate::projection::{make_projection, Projection};
 use crate::registry;
@@ -35,10 +35,16 @@ pub struct Transform {
     diagnostics: OperationSelectionDiagnostics,
     selection_options: SelectionOptions,
     pipeline: CompiledOperationPipeline,
+    fallback_pipelines: Vec<CompiledOperationFallback>,
 }
 
 struct CompiledOperationPipeline {
     steps: SmallVec<[CompiledStep; 8]>,
+}
+
+struct CompiledOperationFallback {
+    metadata: CoordinateOperationMetadata,
+    pipeline: CompiledOperationPipeline,
 }
 
 enum CompiledStep {
@@ -139,7 +145,25 @@ impl Transform {
 
         let mut skipped_operations = candidate_set.skipped;
         let mut missing_required_grid = None;
+        let mut selected: Option<(
+            usize,
+            &selector::RankedOperationCandidate,
+            CoordinateOperationMetadata,
+            CompiledOperationPipeline,
+        )> = None;
+        let mut fallback_pipelines = Vec::new();
+
         for (index, candidate) in candidate_set.ranked.iter().enumerate() {
+            if let Some((_, selected_candidate, ..)) = &selected {
+                if !selected_candidate.operation.uses_grids() {
+                    skipped_operations.push(skipped_for_unselected_candidate(
+                        candidate,
+                        !selected_candidate.operation.deprecated,
+                    ));
+                    continue;
+                }
+            }
+
             match compile_pipeline(
                 from,
                 to,
@@ -153,34 +177,18 @@ impl Transform {
                         candidate.direction,
                         candidate.matched_area_of_use.clone(),
                     );
-                    let selected_reasons =
-                        selected_reasons_for(candidate, &candidate_set.ranked[index + 1..]);
-                    skipped_operations.extend(candidate_set.ranked[index + 1..].iter().map(
-                        |other| {
-                            skipped_for_unselected_candidate(other, !candidate.operation.deprecated)
-                        },
-                    ));
-                    let diagnostics = OperationSelectionDiagnostics {
-                        selected_operation: metadata.clone(),
-                        selected_match_kind: candidate.match_kind,
-                        selected_reasons,
-                        skipped_operations,
-                        approximate: candidate.operation.approximate,
-                        missing_required_grid,
-                    };
-                    return Ok(Self {
-                        source: *from,
-                        target: *to,
-                        selected_operation_definition: candidate.operation.clone().into_owned(),
-                        selected_direction: candidate.direction,
-                        selected_operation: metadata,
-                        diagnostics,
-                        selection_options: options,
-                        pipeline,
-                    });
+                    if let Some((_, selected_candidate, ..)) = &selected {
+                        skipped_operations.push(skipped_for_unselected_candidate(
+                            candidate,
+                            !selected_candidate.operation.deprecated,
+                        ));
+                        fallback_pipelines.push(CompiledOperationFallback { metadata, pipeline });
+                    } else {
+                        selected = Some((index, candidate, metadata, pipeline));
+                    }
                 }
                 Err(Error::Grid(error)) => {
-                    if missing_required_grid.is_none() {
+                    if selected.is_none() && missing_required_grid.is_none() {
                         missing_required_grid = Some(error.to_string());
                     }
                     skipped_operations.push(SkippedOperation {
@@ -212,6 +220,34 @@ impl Transform {
             }
         }
 
+        if let Some((index, candidate, metadata, pipeline)) = selected {
+            let selected_reasons =
+                selected_reasons_for(candidate, &candidate_set.ranked[index + 1..]);
+            let diagnostics = OperationSelectionDiagnostics {
+                selected_operation: metadata.clone(),
+                selected_match_kind: candidate.match_kind,
+                selected_reasons,
+                fallback_operations: fallback_pipelines
+                    .iter()
+                    .map(|fallback| fallback.metadata.clone())
+                    .collect(),
+                skipped_operations,
+                approximate: candidate.operation.approximate,
+                missing_required_grid,
+            };
+            return Ok(Self {
+                source: *from,
+                target: *to,
+                selected_operation_definition: candidate.operation.clone().into_owned(),
+                selected_direction: candidate.direction,
+                selected_operation: metadata,
+                diagnostics,
+                selection_options: options,
+                pipeline,
+                fallback_pipelines,
+            });
+        }
+
         if let Some(message) = missing_required_grid {
             return Err(Error::OperationSelection(format!(
                 "better operations were skipped because required grids were unavailable: {message}"
@@ -237,6 +273,42 @@ impl Transform {
         let c = coord.into_coord3d();
         let result = self.convert_coord3d(c)?;
         Ok(T::from_coord3d(result))
+    }
+
+    /// Transform a single coordinate and report the operation actually used.
+    ///
+    /// When the selected grid-backed operation misses grid coverage, this
+    /// reports the coverage misses and the lower-ranked fallback operation that
+    /// produced the result.
+    pub fn convert_with_diagnostics<T: Transformable>(
+        &self,
+        coord: T,
+    ) -> Result<TransformOutcome<T>> {
+        let c = coord.into_coord();
+        let outcome = self.convert_coord_with_diagnostics(c)?;
+        Ok(TransformOutcome {
+            coord: T::from_coord(outcome.coord),
+            operation: outcome.operation,
+            grid_coverage_misses: outcome.grid_coverage_misses,
+        })
+    }
+
+    /// Transform a single 3D coordinate and report the operation actually used.
+    ///
+    /// When the selected grid-backed operation misses grid coverage, this
+    /// reports the coverage misses and the lower-ranked fallback operation that
+    /// produced the result.
+    pub fn convert_3d_with_diagnostics<T: Transformable3D>(
+        &self,
+        coord: T,
+    ) -> Result<TransformOutcome<T>> {
+        let c = coord.into_coord3d();
+        let outcome = self.convert_coord3d_with_diagnostics(c)?;
+        Ok(TransformOutcome {
+            coord: T::from_coord3d(outcome.coord),
+            operation: outcome.operation,
+            grid_coverage_misses: outcome.grid_coverage_misses,
+        })
     }
 
     /// Return the source CRS definition for this transform.
@@ -279,6 +351,7 @@ impl Transform {
             selected_operation: selected_operation.clone(),
             selected_match_kind: self.diagnostics.selected_match_kind,
             selected_reasons: self.diagnostics.selected_reasons.clone(),
+            fallback_operations: Vec::new(),
             skipped_operations: Vec::new(),
             approximate: self.diagnostics.approximate,
             missing_required_grid: self.diagnostics.missing_required_grid.clone(),
@@ -292,6 +365,7 @@ impl Transform {
             diagnostics,
             selection_options: self.selection_options.inverse(),
             pipeline,
+            fallback_pipelines: Vec::new(),
         })
     }
 
@@ -337,10 +411,78 @@ impl Transform {
     }
 
     fn convert_coord3d(&self, c: Coord3D) -> Result<Coord3D> {
-        if self.pipeline.steps.is_empty() {
-            return Ok(c);
+        Ok(self.convert_coord3d_with_diagnostics(c)?.coord)
+    }
+
+    fn convert_coord_with_diagnostics(&self, c: Coord) -> Result<TransformOutcome<Coord>> {
+        let outcome = self.convert_coord3d_with_diagnostics(Coord3D::new(c.x, c.y, 0.0))?;
+        Ok(TransformOutcome {
+            coord: Coord::new(outcome.coord.x, outcome.coord.y),
+            operation: outcome.operation,
+            grid_coverage_misses: outcome.grid_coverage_misses,
+        })
+    }
+
+    fn convert_coord3d_with_diagnostics(&self, c: Coord3D) -> Result<TransformOutcome<Coord3D>> {
+        let mut grid_coverage_misses = Vec::new();
+        match self.execute_pipeline(&self.pipeline, c) {
+            Ok(coord) => {
+                return Ok(TransformOutcome {
+                    coord,
+                    operation: self.selected_operation.clone(),
+                    grid_coverage_misses,
+                });
+            }
+            Err(error) => {
+                if let Some(detail) = grid_coverage_miss_detail(&error) {
+                    grid_coverage_misses.push(GridCoverageMiss {
+                        operation: self.selected_operation.clone(),
+                        detail,
+                    });
+                } else {
+                    return Err(error);
+                }
+            }
         }
 
+        for fallback in &self.fallback_pipelines {
+            match self.execute_pipeline(&fallback.pipeline, c) {
+                Ok(coord) => {
+                    return Ok(TransformOutcome {
+                        coord,
+                        operation: fallback.metadata.clone(),
+                        grid_coverage_misses,
+                    });
+                }
+                Err(error) => {
+                    if let Some(detail) = grid_coverage_miss_detail(&error) {
+                        grid_coverage_misses.push(GridCoverageMiss {
+                            operation: fallback.metadata.clone(),
+                            detail,
+                        });
+                    } else {
+                        return Err(error);
+                    }
+                }
+            }
+        }
+
+        Err(Error::Grid(GridError::OutsideCoverage(
+            grid_coverage_misses
+                .last()
+                .map(|miss| miss.detail.clone())
+                .unwrap_or_else(|| "grid coverage miss".into()),
+        )))
+    }
+
+    fn execute_pipeline(
+        &self,
+        pipeline: &CompiledOperationPipeline,
+        c: Coord3D,
+    ) -> Result<Coord3D> {
+        if pipeline.steps.is_empty() {
+            return Ok(c);
+        }
         let preserved_z = c.z;
         let mut state = if self.source.is_projected() {
             let (x_m, y_m) = self.source_projected_native_to_meters(c.x, c.y);
@@ -349,7 +491,7 @@ impl Transform {
             Coord3D::new(c.x.to_radians(), c.y.to_radians(), 0.0)
         };
 
-        for step in &self.pipeline.steps {
+        for step in &pipeline.steps {
             state = execute_step(step, state)?;
         }
 
@@ -490,6 +632,13 @@ fn selected_metadata(
     let mut metadata = operation.metadata_for_direction(direction);
     metadata.area_of_use = matched_area_of_use.or_else(|| operation.areas_of_use.first().cloned());
     metadata
+}
+
+fn grid_coverage_miss_detail(error: &Error) -> Option<String> {
+    match error {
+        Error::Grid(GridError::OutsideCoverage(detail)) => Some(detail.clone()),
+        _ => None,
+    }
 }
 
 fn validate_output_len(input_len: usize, output_len: usize) -> Result<()> {
@@ -1122,6 +1271,62 @@ mod tests {
     }
 
     #[test]
+    fn grid_coverage_miss_falls_back_under_best_available_policy() {
+        let t = Transform::with_selection_options(
+            "EPSG:4267",
+            "EPSG:4269",
+            SelectionOptions {
+                area_of_interest: Some(AreaOfInterest::geographic_point(Coord::new(
+                    -80.5041667,
+                    44.5458333,
+                ))),
+                ..SelectionOptions::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(t.selected_operation().id, Some(CoordinateOperationId(1313)));
+        assert!(!t.selection_diagnostics().fallback_operations.is_empty());
+
+        let outcome = t.convert_with_diagnostics((0.0, 0.0)).unwrap();
+        let plain = t.convert((0.0, 0.0)).unwrap();
+
+        assert_eq!(plain, outcome.coord);
+        assert_ne!(outcome.operation.id, Some(CoordinateOperationId(1313)));
+        assert!(outcome
+            .grid_coverage_misses
+            .iter()
+            .any(|miss| miss.operation.id == Some(CoordinateOperationId(1313))));
+    }
+
+    #[test]
+    fn grid_coverage_miss_does_not_use_non_grid_fallback_when_grids_are_required() {
+        let t = Transform::with_selection_options(
+            "EPSG:4267",
+            "EPSG:4269",
+            SelectionOptions {
+                area_of_interest: Some(AreaOfInterest::geographic_point(Coord::new(
+                    -80.5041667,
+                    44.5458333,
+                ))),
+                policy: SelectionPolicy::RequireGrids,
+                ..SelectionOptions::default()
+            },
+        )
+        .unwrap();
+
+        assert!(t
+            .selection_diagnostics()
+            .fallback_operations
+            .iter()
+            .all(|operation| operation.uses_grids));
+
+        let err = t.convert((0.0, 0.0)).unwrap_err();
+
+        assert!(matches!(err, Error::Grid(GridError::OutsideCoverage(_))));
+    }
+
+    #[test]
     fn cross_datum_roundtrip_nad27() {
         let fwd = Transform::new("EPSG:4267", "EPSG:4326").unwrap();
         let inv = fwd.inverse().unwrap();
@@ -1156,6 +1361,10 @@ mod tests {
 
         assert_eq!(inv.source_crs().epsg(), 4326);
         assert_eq!(inv.target_crs().epsg(), 4267);
+        assert_eq!(
+            inv.selected_operation().direction,
+            OperationStepDirection::Reverse
+        );
         assert_eq!(inv.selected_operation().source_crs_epsg, Some(4326));
         assert_eq!(inv.selected_operation().target_crs_epsg, Some(4267));
         assert_eq!(

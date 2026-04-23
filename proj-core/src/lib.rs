@@ -57,10 +57,10 @@ pub use grid::{
 };
 pub use operation::{
     AreaOfInterest, AreaOfInterestCrs, AreaOfUse, CoordinateOperation, CoordinateOperationId,
-    CoordinateOperationMetadata, GridId, GridInterpolation, GridShiftDirection, OperationAccuracy,
-    OperationMatchKind, OperationMethod, OperationSelectionDiagnostics, OperationStep,
-    OperationStepDirection, SelectionOptions, SelectionPolicy, SelectionReason, SkippedOperation,
-    SkippedOperationReason,
+    CoordinateOperationMetadata, GridCoverageMiss, GridId, GridInterpolation, GridShiftDirection,
+    OperationAccuracy, OperationMatchKind, OperationMethod, OperationSelectionDiagnostics,
+    OperationStep, OperationStepDirection, SelectionOptions, SelectionPolicy, SelectionReason,
+    SkippedOperation, SkippedOperationReason, TransformOutcome,
 };
 pub use registry::{
     lookup_authority_code, lookup_datum_epsg, lookup_epsg, lookup_operation, operations_between,
