@@ -3,7 +3,10 @@ use crate::datum::Datum;
 use crate::epsg_db;
 use crate::error::{Error, Result};
 use crate::grid::GridDefinition;
-use crate::operation::{CoordinateOperation, CoordinateOperationId};
+use crate::operation::{
+    CoordinateOperation, CoordinateOperationId, CoordinateOperationMetadata, SelectionOptions,
+};
+use crate::selector;
 
 /// Look up a CRS definition by EPSG code.
 ///
@@ -49,6 +52,45 @@ pub fn operations_between(source: &CrsDef, target: &CrsDef) -> Vec<CoordinateOpe
     .into_iter()
     .cloned()
     .collect()
+}
+
+/// Return selectable operation metadata for the source and target CRS.
+///
+/// Unlike [`operations_between`], this discovery API reports the direction each
+/// operation would run for this CRS pair and includes reverse-compatible
+/// operations.
+pub fn operation_candidates_between(
+    source: &CrsDef,
+    target: &CrsDef,
+) -> Result<Vec<CoordinateOperationMetadata>> {
+    operation_candidates_between_with_selection_options(
+        source,
+        target,
+        &SelectionOptions::default(),
+    )
+}
+
+/// Return selectable operation metadata using the same policy and AOI validation
+/// rules as [`crate::Transform::with_selection_options`].
+pub fn operation_candidates_between_with_selection_options(
+    source: &CrsDef,
+    target: &CrsDef,
+    options: &SelectionOptions,
+) -> Result<Vec<CoordinateOperationMetadata>> {
+    let candidates = selector::rank_operation_candidates(source, target, options)?;
+    Ok(candidates
+        .ranked
+        .into_iter()
+        .map(|candidate| {
+            let mut metadata = candidate
+                .operation
+                .metadata_for_direction(candidate.direction);
+            metadata.area_of_use = candidate
+                .matched_area_of_use
+                .or_else(|| candidate.operation.areas_of_use.first().cloned());
+            metadata
+        })
+        .collect())
 }
 
 /// Parse an authority:code string (e.g., "EPSG:4326") and look up the CRS definition.
@@ -188,5 +230,36 @@ mod tests {
                 || (operation.source_datum_epsg == source_datum
                     && operation.target_datum_epsg == target_datum)
         }));
+    }
+
+    #[test]
+    fn operation_candidates_between_reports_direction() {
+        let source = lookup_epsg(4326).expect("should find WGS84");
+        let target = lookup_epsg(4267).expect("should find NAD27");
+
+        let candidates = operation_candidates_between(&source, &target).unwrap();
+
+        assert!(candidates.iter().any(|candidate| {
+            candidate.direction == crate::operation::OperationStepDirection::Reverse
+                && candidate.source_crs_epsg == Some(4326)
+                && candidate.target_crs_epsg == Some(4267)
+        }));
+    }
+
+    #[test]
+    fn operation_candidate_discovery_validates_aoi_bounds() {
+        let source = lookup_epsg(4267).expect("should find NAD27");
+        let target = lookup_epsg(4326).expect("should find WGS84");
+        let options = SelectionOptions {
+            area_of_interest: Some(crate::operation::AreaOfInterest::geographic_bounds(
+                crate::coord::Bounds::new(10.0, 0.0, -10.0, 1.0),
+            )),
+            ..SelectionOptions::default()
+        };
+
+        let err = operation_candidates_between_with_selection_options(&source, &target, &options)
+            .unwrap_err();
+
+        assert!(matches!(err, Error::OutOfRange(_)));
     }
 }

@@ -88,7 +88,7 @@ Custom CRS definitions can be constructed and passed to `Transform::from_crs_def
 
 `proj-core` `0.3` adds embedded coordinate-operation metadata, default operation selection, and explicit operation execution. `Transform::new()` and `Transform::from_crs_defs()` choose the best supported operation for the CRS pair, while `Transform::with_selection_options()` lets callers supply an area of interest or require grid-backed or exact-area matches.
 
-Use `Transform::selected_operation()`, `Transform::selection_diagnostics()`, `registry::operations_between()`, and `lookup_operation()` when you need deterministic operation inspection. NTv2 grid-backed transforms are supported through the embedded registry, `EmbeddedGridProvider`, `FilesystemGridProvider`, and custom `GridProvider` implementations.
+Use `Transform::selected_operation()`, `Transform::selection_diagnostics()`, `registry::operation_candidates_between()`, and `lookup_operation()` when you need deterministic operation inspection including operation direction. NTv2 grid-backed transforms are supported through the embedded registry, `EmbeddedGridProvider`, `FilesystemGridProvider`, and custom `GridProvider` implementations.
 
 ## Compatibility Surface
 

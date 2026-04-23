@@ -63,6 +63,8 @@ pub use operation::{
     SkippedOperation, SkippedOperationReason, TransformOutcome,
 };
 pub use registry::{
-    lookup_authority_code, lookup_datum_epsg, lookup_epsg, lookup_operation, operations_between,
+    lookup_authority_code, lookup_datum_epsg, lookup_epsg, lookup_operation,
+    operation_candidates_between, operation_candidates_between_with_selection_options,
+    operations_between,
 };
 pub use transform::Transform;
