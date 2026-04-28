@@ -767,7 +767,9 @@ fn validate_supported_proj_params(
 
 fn unsupported_proj_parameter_error(context: &str, key: &str) -> ParseError {
     let detail = match key {
-        "nadgrids" => "grid-based horizontal datum shifts are only supported on full PROJ CRS definitions",
+        "nadgrids" => {
+            "grid-based horizontal datum shifts are only supported on full PROJ CRS definitions"
+        }
         "geoidgrids" => "vertical geoid grid shifts are not supported in PROJ strings",
         "vunits" | "vto_meter" => "vertical coordinate units are not supported in PROJ strings",
         "a" | "b" | "es" | "f" | "rf" | "r" => {
