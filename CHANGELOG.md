@@ -5,6 +5,8 @@
 - add embedded coordinate-operation metadata and selection APIs, including explicit operation lookup, `Transform::from_operation`, `Transform::with_selection_options`, selected-operation introspection, and detailed selection diagnostics
 - add NTv2 grid runtime support with embedded and application-provided grid providers, recursive concatenated operation handling, and bundled registry-backed grid resources
 - expand the embedded EPSG registry with explicit datum-shift states, coordinate operations, areas of use, grid definitions, and CRS names
+- add Lambert Azimuthal Equal Area, EPSG Oblique Stereographic, Hotine Oblique Mercator variants A/B, and Cassini-Soldner projection families, extending embedded projected CRS coverage for common European, Swiss, North American, Malaysian, and Caribbean grids
+- normalize non-metre EPSG ellipsoid axes to metres in the generated registry so historical CRS definitions with foot-based ellipsoids use correct projection radii
 - make transform construction operation-aware with typed area-of-interest selection, inverse-aware metadata, and indexed operation lookup instead of registry-wide scans
 - switch projections onto precomputed enum-backed hot paths and compiled transform pipelines, improving construction and execution costs
 - tighten CRS parsing semantics across WKT, PROJJSON, and authority wrappers, rejecting contradictory or unsupported inputs instead of silently normalizing them

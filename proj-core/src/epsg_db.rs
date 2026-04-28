@@ -15,7 +15,7 @@ use std::sync::OnceLock;
 static EPSG_DATA: &[u8] = include_bytes!("../data/epsg.bin");
 
 const MAGIC: u32 = 0x4550_5347;
-const VERSION: u16 = 5;
+const VERSION: u16 = 6;
 const HEADER_SIZE: usize = 36;
 
 const ELLIPSOID_RECORD_SIZE: usize = 20;
@@ -34,6 +34,12 @@ const METHOD_LCC: u8 = 4;
 const METHOD_ALBERS: u8 = 5;
 const METHOD_POLAR_STEREO: u8 = 6;
 const METHOD_EQUIDISTANT_CYL: u8 = 7;
+const METHOD_LAEA: u8 = 8;
+const METHOD_OBLIQUE_STEREO: u8 = 9;
+const METHOD_HOTINE_OBLIQUE_MERCATOR_A: u8 = 10;
+const METHOD_HOTINE_OBLIQUE_MERCATOR_B: u8 = 11;
+const METHOD_CASSINI_SOLDNER: u8 = 12;
+const METHOD_LAEA_SPHERICAL: u8 = 13;
 
 const OP_IDENTITY: u8 = 0;
 const OP_HELMERT: u8 = 1;
@@ -428,6 +434,51 @@ fn decode_projection_method(method_id: u8, params: [f64; 7]) -> ProjectionMethod
         METHOD_EQUIDISTANT_CYL => ProjectionMethod::EquidistantCylindrical {
             lon0: p0,
             lat_ts: p1,
+            false_easting: p3,
+            false_northing: p4,
+        },
+        METHOD_LAEA => ProjectionMethod::LambertAzimuthalEqualArea {
+            lon0: p0,
+            lat0: p1,
+            false_easting: p3,
+            false_northing: p4,
+        },
+        METHOD_LAEA_SPHERICAL => ProjectionMethod::LambertAzimuthalEqualAreaSpherical {
+            lon0: p0,
+            lat0: p1,
+            false_easting: p3,
+            false_northing: p4,
+        },
+        METHOD_OBLIQUE_STEREO => ProjectionMethod::ObliqueStereographic {
+            lon0: p0,
+            lat0: p1,
+            k0: p2,
+            false_easting: p3,
+            false_northing: p4,
+        },
+        METHOD_HOTINE_OBLIQUE_MERCATOR_A => ProjectionMethod::HotineObliqueMercator {
+            latc: p0,
+            lonc: p1,
+            azimuth: p2,
+            rectified_grid_angle: p3,
+            k0: p4,
+            false_easting: p5,
+            false_northing: p6,
+            variant_b: false,
+        },
+        METHOD_HOTINE_OBLIQUE_MERCATOR_B => ProjectionMethod::HotineObliqueMercator {
+            latc: p0,
+            lonc: p1,
+            azimuth: p2,
+            rectified_grid_angle: p3,
+            k0: p4,
+            false_easting: p5,
+            false_northing: p6,
+            variant_b: true,
+        },
+        METHOD_CASSINI_SOLDNER => ProjectionMethod::CassiniSoldner {
+            lon0: p0,
+            lat0: p1,
             false_easting: p3,
             false_northing: p4,
         },

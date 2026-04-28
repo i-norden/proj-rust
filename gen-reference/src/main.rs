@@ -109,16 +109,28 @@ fn main() {
     // Web Mercator (3857) — all geo points within ±85° lat
     for &(lon, lat, name) in GEO_POINTS {
         if lat.abs() <= 85.0 {
-            points.extend(transform(4326, 3857, lon, lat, 0.001,
-                &format!("{name} 4326→3857")));
+            points.extend(transform(
+                4326,
+                3857,
+                lon,
+                lat,
+                0.001,
+                &format!("{name} 4326→3857"),
+            ));
         }
     }
 
     // World Mercator (3395)
     for &(lon, lat, name) in GEO_POINTS {
         if lat.abs() <= 80.0 {
-            points.extend(transform(4326, 3395, lon, lat, 0.01,
-                &format!("{name} 4326→3395")));
+            points.extend(transform(
+                4326,
+                3395,
+                lon,
+                lat,
+                0.01,
+                &format!("{name} 4326→3395"),
+            ));
         }
     }
 
@@ -138,26 +150,54 @@ fn main() {
         (1, false, -177.0, -10.0, "zone1S"),
     ];
     for &(zone, north, lon, lat, name) in utm_samples {
-        let epsg = if north { 32600 + zone as u32 } else { 32700 + zone as u32 };
-        points.extend(transform(4326, epsg, lon, lat, 0.01,
-            &format!("{name} 4326→UTM{epsg}")));
+        let epsg = if north {
+            32600 + zone as u32
+        } else {
+            32700 + zone as u32
+        };
+        points.extend(transform(
+            4326,
+            epsg,
+            lon,
+            lat,
+            0.01,
+            &format!("{name} 4326→UTM{epsg}"),
+        ));
         // Also test inverse
         if let Some(fwd) = transform(4326, epsg, lon, lat, 0.01, "") {
-            points.extend(transform(epsg, 4326, fwd.expected_x, fwd.expected_y, 2e-7,
-                &format!("{name} UTM{epsg}→4326 inverse")));
+            points.extend(transform(
+                epsg,
+                4326,
+                fwd.expected_x,
+                fwd.expected_y,
+                2e-7,
+                &format!("{name} UTM{epsg}→4326 inverse"),
+            ));
         }
     }
 
     // Polar Stereographic North (3413)
     for &(lon, lat, name) in ARCTIC_POINTS {
-        points.extend(transform(4326, 3413, lon, lat, 0.01,
-            &format!("{name} 4326→3413")));
+        points.extend(transform(
+            4326,
+            3413,
+            lon,
+            lat,
+            0.01,
+            &format!("{name} 4326→3413"),
+        ));
     }
 
     // Antarctic Polar Stereographic (3031)
     for &(lon, lat, name) in ANTARCTIC_POINTS {
-        points.extend(transform(4326, 3031, lon, lat, 0.1,
-            &format!("{name} 4326→3031")));
+        points.extend(transform(
+            4326,
+            3031,
+            lon,
+            lat,
+            0.1,
+            &format!("{name} 4326→3031"),
+        ));
     }
 
     // Arctic Polar Stereographic (3995)
@@ -165,28 +205,204 @@ fn main() {
     points.extend(transform(4326, 3995, 90.0, 75.0, 0.01, "75N 90E 4326→3995"));
 
     // France Lambert-93 (2154)
-    points.extend(transform(4326, 2154, 2.3522, 48.8566, 0.1, "Paris 4326→2154"));
-    points.extend(transform(4326, 2154, -1.6778, 48.1173, 0.1, "Rennes 4326→2154"));
-    points.extend(transform(4326, 2154, 7.2620, 43.7102, 0.1, "Nice 4326→2154"));
+    points.extend(transform(
+        4326,
+        2154,
+        2.3522,
+        48.8566,
+        0.1,
+        "Paris 4326→2154",
+    ));
+    points.extend(transform(
+        4326,
+        2154,
+        -1.6778,
+        48.1173,
+        0.1,
+        "Rennes 4326→2154",
+    ));
+    points.extend(transform(
+        4326,
+        2154,
+        7.2620,
+        43.7102,
+        0.1,
+        "Nice 4326→2154",
+    ));
 
     // CONUS Albers (5070)
-    points.extend(transform(4326, 5070, -96.0, 37.0, 0.1, "US center 4326→5070"));
+    points.extend(transform(
+        4326,
+        5070,
+        -96.0,
+        37.0,
+        0.1,
+        "US center 4326→5070",
+    ));
     points.extend(transform(4326, 5070, -74.0, 40.7, 0.1, "NYC 4326→5070"));
     points.extend(transform(4326, 5070, -122.4, 37.8, 0.1, "SF 4326→5070"));
 
     // BC Albers (3005)
-    points.extend(transform(4326, 3005, -123.1, 49.3, 0.1, "Vancouver 4326→3005"));
+    points.extend(transform(
+        4326,
+        3005,
+        -123.1,
+        49.3,
+        0.1,
+        "Vancouver 4326→3005",
+    ));
 
     // Canada Lambert (3347)
     points.extend(transform(4326, 3347, -75.7, 45.4, 0.1, "Ottawa 4326→3347"));
 
+    // Lambert Azimuthal Equal Area (3035, 6931, 6932)
+    points.extend(transform(
+        4258,
+        3035,
+        5.0,
+        50.0,
+        0.05,
+        "Europe 4258→3035 LAEA",
+    ));
+    points.extend(transform(
+        4258,
+        3035,
+        10.0,
+        52.0,
+        0.05,
+        "origin 4258→3035 LAEA",
+    ));
+    points.extend(transform(
+        4326,
+        6931,
+        -150.0,
+        70.0,
+        0.05,
+        "Alaska 4326→6931 LAEA north",
+    ));
+    points.extend(transform(
+        4326,
+        6932,
+        45.0,
+        -75.0,
+        0.05,
+        "Antarctic 4326→6932 LAEA south",
+    ));
+    points.extend(transform(
+        10346,
+        3408,
+        -150.0,
+        70.0,
+        0.05,
+        "Alaska 10346→3408 spherical LAEA north",
+    ));
+    points.extend(transform(
+        10346,
+        3409,
+        45.0,
+        -75.0,
+        0.05,
+        "Antarctic 10346→3409 spherical LAEA south",
+    ));
+    points.extend(transform(
+        4267,
+        9311,
+        -96.0,
+        37.0,
+        0.05,
+        "US center 4267→9311 spherical LAEA",
+    ));
+
+    // Oblique Stereographic / Double Stereographic (28992)
+    points.extend(transform(
+        4289,
+        28992,
+        5.0,
+        53.0,
+        0.02,
+        "RD example 4289→28992",
+    ));
+    points.extend(transform(
+        4289,
+        28992,
+        4.9,
+        52.37,
+        0.02,
+        "Amsterdam 4289→28992",
+    ));
+
+    // Hotine Oblique Mercator variants A and B
+    points.extend(transform(
+        4269,
+        3078,
+        -86.0,
+        45.3,
+        0.05,
+        "Michigan 4269→3078 Hotine A",
+    ));
+    points.extend(transform(
+        4269,
+        3078,
+        -83.0,
+        42.3,
+        0.05,
+        "Detroit 4269→3078 Hotine A",
+    ));
+    points.extend(transform(
+        4150,
+        2056,
+        7.4386,
+        46.9511,
+        0.05,
+        "Bern 4150→2056 Hotine B",
+    ));
+    points.extend(transform(
+        4150,
+        2056,
+        8.5417,
+        47.3769,
+        0.05,
+        "Zurich 4150→2056 Hotine B",
+    ));
+
+    // Cassini-Soldner (30200, 3377)
+    points.extend(transform(
+        4302,
+        30200,
+        -62.0,
+        10.0,
+        0.1,
+        "Trinidad 4302→30200 Cassini",
+    ));
+    points.extend(transform(
+        4742,
+        3377,
+        103.75,
+        1.5,
+        0.1,
+        "Johor 4742→3377 Cassini",
+    ));
+
     // British National Grid (27700) — requires datum shift OSGB36
-    points.extend(transform(4326, 27700, -0.1278, 51.5074, 1.0, "London 4326→27700"));
+    points.extend(transform(
+        4326,
+        27700,
+        -0.1278,
+        51.5074,
+        1.0,
+        "London 4326→27700",
+    ));
 
     // Plate Carree (32662)
     for &(lon, lat, name) in GEO_POINTS {
-        points.extend(transform(4326, 32662, lon, lat, 0.01,
-            &format!("{name} 4326→32662")));
+        points.extend(transform(
+            4326,
+            32662,
+            lon,
+            lat,
+            0.01,
+            &format!("{name} 4326→32662"),
+        ));
     }
 
     // =========================================================================
@@ -194,13 +410,41 @@ fn main() {
     // =========================================================================
 
     // 3857 → 4326 inverse
-    points.extend(transform(3857, 4326, -8242596.0, 4966606.0, 1e-8, "NYC 3857→4326"));
+    points.extend(transform(
+        3857,
+        4326,
+        -8242596.0,
+        4966606.0,
+        1e-8,
+        "NYC 3857→4326",
+    ));
     points.extend(transform(3857, 4326, 0.0, 0.0, 1e-8, "origin 3857→4326"));
-    points.extend(transform(3857, 4326, 15550408.0, 4257980.0, 1e-8, "Tokyo 3857→4326"));
+    points.extend(transform(
+        3857,
+        4326,
+        15550408.0,
+        4257980.0,
+        1e-8,
+        "Tokyo 3857→4326",
+    ));
 
     // 3413 → 4326 inverse
-    points.extend(transform(3413, 4326, 0.0, 0.0, 1e-6, "north pole 3413→4326"));
-    points.extend(transform(3413, 4326, 0.0, -1633879.0, 1e-6, "75N on CM 3413→4326"));
+    points.extend(transform(
+        3413,
+        4326,
+        0.0,
+        0.0,
+        1e-6,
+        "north pole 3413→4326",
+    ));
+    points.extend(transform(
+        3413,
+        4326,
+        0.0,
+        -1633879.0,
+        1e-6,
+        "75N on CM 3413→4326",
+    ));
 
     // =========================================================================
     // 3. DATUM SHIFTS: cross-datum geographic transforms
@@ -216,21 +460,69 @@ fn main() {
         (-105.0, 40.0, "Denver area"),
     ];
     for &(lon, lat, name) in nad27_points {
-        points.extend(transform(4267, 4326, lon, lat, 0.001,
-            &format!("{name} NAD27→WGS84")));
+        points.extend(transform(
+            4267,
+            4326,
+            lon,
+            lat,
+            0.001,
+            &format!("{name} NAD27→WGS84"),
+        ));
     }
 
     // WGS84 → NAD27 (inverse datum shift)
-    points.extend(transform(4326, 4267, -90.0, 45.0, 0.001, "US Midwest WGS84→NAD27"));
+    points.extend(transform(
+        4326,
+        4267,
+        -90.0,
+        45.0,
+        0.001,
+        "US Midwest WGS84→NAD27",
+    ));
 
     // OSGB36 → WGS84
-    points.extend(transform(4277, 4326, -0.1278, 51.5074, 0.001, "London OSGB36→WGS84"));
-    points.extend(transform(4277, 4326, -3.1883, 55.9533, 0.001, "Edinburgh OSGB36→WGS84"));
-    points.extend(transform(4277, 4326, -1.8904, 52.4862, 0.001, "Birmingham OSGB36→WGS84"));
+    points.extend(transform(
+        4277,
+        4326,
+        -0.1278,
+        51.5074,
+        0.001,
+        "London OSGB36→WGS84",
+    ));
+    points.extend(transform(
+        4277,
+        4326,
+        -3.1883,
+        55.9533,
+        0.001,
+        "Edinburgh OSGB36→WGS84",
+    ));
+    points.extend(transform(
+        4277,
+        4326,
+        -1.8904,
+        52.4862,
+        0.001,
+        "Birmingham OSGB36→WGS84",
+    ));
 
     // ED50 → WGS84
-    points.extend(transform(4230, 4326, 2.3522, 48.8566, 0.001, "Paris ED50→WGS84"));
-    points.extend(transform(4230, 4326, 13.4050, 52.5200, 0.001, "Berlin ED50→WGS84"));
+    points.extend(transform(
+        4230,
+        4326,
+        2.3522,
+        48.8566,
+        0.001,
+        "Paris ED50→WGS84",
+    ));
+    points.extend(transform(
+        4230,
+        4326,
+        13.4050,
+        52.5200,
+        0.001,
+        "Berlin ED50→WGS84",
+    ));
 
     // =========================================================================
     // 4. ROUNDTRIP verification points (forward then inverse)
@@ -249,8 +541,40 @@ fn main() {
     ];
     for &(to_epsg, lon, lat, name) in roundtrip_targets {
         if let Some(fwd) = transform(4326, to_epsg, lon, lat, 0.001, "") {
-            points.extend(transform(to_epsg, 4326, fwd.expected_x, fwd.expected_y, 1e-7,
-                &format!("roundtrip {name} inverse")));
+            points.extend(transform(
+                to_epsg,
+                4326,
+                fwd.expected_x,
+                fwd.expected_y,
+                1e-7,
+                &format!("roundtrip {name} inverse"),
+            ));
+        }
+    }
+
+    let projected_roundtrip_targets: &[(u32, u32, f64, f64, &str)] = &[
+        (4258, 3035, 5.0, 50.0, "Europe↔LAEA"),
+        (4326, 6931, -150.0, 70.0, "Alaska↔LAEA north"),
+        (4326, 6932, 45.0, -75.0, "Antarctic↔LAEA south"),
+        (10346, 3408, -150.0, 70.0, "Alaska↔spherical LAEA north"),
+        (10346, 3409, 45.0, -75.0, "Antarctic↔spherical LAEA south"),
+        (4267, 9311, -96.0, 37.0, "USCenter↔spherical LAEA"),
+        (4289, 28992, 5.0, 53.0, "Netherlands↔RD New"),
+        (4269, 3078, -86.0, 45.3, "Michigan↔Hotine A"),
+        (4150, 2056, 7.4386, 46.9511, "Bern↔Hotine B"),
+        (4302, 30200, -62.0, 10.0, "Trinidad↔Cassini"),
+        (4742, 3377, 103.75, 1.5, "Johor↔Cassini"),
+    ];
+    for &(from_epsg, to_epsg, lon, lat, name) in projected_roundtrip_targets {
+        if let Some(fwd) = transform(from_epsg, to_epsg, lon, lat, 0.001, "") {
+            points.extend(transform(
+                to_epsg,
+                from_epsg,
+                fwd.expected_x,
+                fwd.expected_y,
+                1e-7,
+                &format!("roundtrip {name} inverse"),
+            ));
         }
     }
 

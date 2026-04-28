@@ -880,6 +880,156 @@
     "description": "Ottawa 4326→3347"
   },
   {
+    "from_epsg": 4258,
+    "to_epsg": 3035,
+    "input_x": 5.0,
+    "input_y": 50.0,
+    "expected_x": 3962799.4509550678,
+    "expected_y": 2999718.8531595627,
+    "tolerance": 0.05,
+    "description": "Europe 4258→3035 LAEA"
+  },
+  {
+    "from_epsg": 4258,
+    "to_epsg": 3035,
+    "input_x": 10.0,
+    "input_y": 52.0,
+    "expected_x": 4321000.0,
+    "expected_y": 3210000.0,
+    "tolerance": 0.05,
+    "description": "origin 4258→3035 LAEA"
+  },
+  {
+    "from_epsg": 4326,
+    "to_epsg": 6931,
+    "input_x": -150.0,
+    "input_y": 70.0,
+    "expected_x": -1110835.44374809,
+    "expected_y": 1924023.427420012,
+    "tolerance": 0.05,
+    "description": "Alaska 4326→6931 LAEA north"
+  },
+  {
+    "from_epsg": 4326,
+    "to_epsg": 6932,
+    "input_x": 45.0,
+    "input_y": -75.0,
+    "expected_x": 1181045.110923064,
+    "expected_y": 1181045.110923064,
+    "tolerance": 0.05,
+    "description": "Antarctic 4326→6932 LAEA south"
+  },
+  {
+    "from_epsg": 10346,
+    "to_epsg": 3408,
+    "input_x": -150.0,
+    "input_y": 70.0,
+    "expected_x": -1106352.131700521,
+    "expected_y": 1916258.1031674372,
+    "tolerance": 0.05,
+    "description": "Alaska 10346→3408 spherical LAEA north"
+  },
+  {
+    "from_epsg": 10346,
+    "to_epsg": 3409,
+    "input_x": 45.0,
+    "input_y": -75.0,
+    "expected_x": 1176077.1537366714,
+    "expected_y": 1176077.1537366717,
+    "tolerance": 0.05,
+    "description": "Antarctic 10346→3409 spherical LAEA south"
+  },
+  {
+    "from_epsg": 4267,
+    "to_epsg": 9311,
+    "input_x": -96.0,
+    "input_y": 37.0,
+    "expected_x": 355917.95839832776,
+    "expected_y": -880355.3553409994,
+    "tolerance": 0.05,
+    "description": "US center 4267→9311 spherical LAEA"
+  },
+  {
+    "from_epsg": 4289,
+    "to_epsg": 28992,
+    "input_x": 5.0,
+    "input_y": 53.0,
+    "expected_x": 128979.2632852691,
+    "expected_y": 556953.1903958509,
+    "tolerance": 0.02,
+    "description": "RD example 4289→28992"
+  },
+  {
+    "from_epsg": 4289,
+    "to_epsg": 28992,
+    "input_x": 4.9,
+    "input_y": 52.37,
+    "expected_x": 121793.91939738547,
+    "expected_y": 486901.2741795551,
+    "tolerance": 0.02,
+    "description": "Amsterdam 4289→28992"
+  },
+  {
+    "from_epsg": 4269,
+    "to_epsg": 3078,
+    "input_x": -86.0,
+    "input_y": 45.3,
+    "expected_x": 499840.2523874142,
+    "expected_y": 527581.9483510787,
+    "tolerance": 0.05,
+    "description": "Michigan 4269→3078 Hotine A"
+  },
+  {
+    "from_epsg": 4269,
+    "to_epsg": 3078,
+    "input_x": -83.0,
+    "input_y": 42.3,
+    "expected_x": 747137.7454709082,
+    "expected_y": 198860.47993395198,
+    "tolerance": 0.05,
+    "description": "Detroit 4269→3078 Hotine A"
+  },
+  {
+    "from_epsg": 4150,
+    "to_epsg": 2056,
+    "input_x": 7.4386,
+    "input_y": 46.9511,
+    "expected_x": 2599925.1524788374,
+    "expected_y": 1199854.87823513,
+    "tolerance": 0.05,
+    "description": "Bern 4150→2056 Hotine B"
+  },
+  {
+    "from_epsg": 4150,
+    "to_epsg": 2056,
+    "input_x": 8.5417,
+    "input_y": 47.3769,
+    "expected_x": 2683220.7548285224,
+    "expected_y": 1247772.848570864,
+    "tolerance": 0.05,
+    "description": "Zurich 4150→2056 Hotine B"
+  },
+  {
+    "from_epsg": 4302,
+    "to_epsg": 30200,
+    "input_x": -62.0,
+    "input_y": 10.0,
+    "expected_x": 66644.94040882034,
+    "expected_y": 82536.21873655319,
+    "tolerance": 0.1,
+    "description": "Trinidad 4302→30200 Cassini"
+  },
+  {
+    "from_epsg": 4742,
+    "to_epsg": 3377,
+    "input_x": 103.75,
+    "input_y": 1.5,
+    "expected_x": 21029.208695953384,
+    "expected_y": -59981.52676016915,
+    "tolerance": 0.1,
+    "description": "Johor 4742→3377 Cassini"
+  },
+  {
     "from_epsg": 4326,
     "to_epsg": 27700,
     "input_x": -0.1278,
@@ -1348,5 +1498,115 @@
     "expected_y": 40.7128,
     "tolerance": 1e-7,
     "description": "roundtrip NYC↔PlateCarree inverse"
+  },
+  {
+    "from_epsg": 3035,
+    "to_epsg": 4258,
+    "input_x": 3962799.4509550678,
+    "input_y": 2999718.8531595627,
+    "expected_x": 5.000000000000003,
+    "expected_y": 49.99999999689985,
+    "tolerance": 1e-7,
+    "description": "roundtrip Europe↔LAEA inverse"
+  },
+  {
+    "from_epsg": 6931,
+    "to_epsg": 4326,
+    "input_x": -1110835.44374809,
+    "input_y": 1924023.427420012,
+    "expected_x": -150.0,
+    "expected_y": 69.99999999905754,
+    "tolerance": 1e-7,
+    "description": "roundtrip Alaska↔LAEA north inverse"
+  },
+  {
+    "from_epsg": 6932,
+    "to_epsg": 4326,
+    "input_x": 1181045.110923064,
+    "input_y": 1181045.110923064,
+    "expected_x": 45.0,
+    "expected_y": -74.99999999927697,
+    "tolerance": 1e-7,
+    "description": "roundtrip Antarctic↔LAEA south inverse"
+  },
+  {
+    "from_epsg": 3408,
+    "to_epsg": 10346,
+    "input_x": -1106352.131700521,
+    "input_y": 1916258.1031674372,
+    "expected_x": -150.0,
+    "expected_y": 70.0,
+    "tolerance": 1e-7,
+    "description": "roundtrip Alaska↔spherical LAEA north inverse"
+  },
+  {
+    "from_epsg": 3409,
+    "to_epsg": 10346,
+    "input_x": 1176077.1537366714,
+    "input_y": 1176077.1537366717,
+    "expected_x": 44.99999999999999,
+    "expected_y": -75.00000000000001,
+    "tolerance": 1e-7,
+    "description": "roundtrip Antarctic↔spherical LAEA south inverse"
+  },
+  {
+    "from_epsg": 9311,
+    "to_epsg": 4267,
+    "input_x": 355917.95839832776,
+    "input_y": -880355.3553409994,
+    "expected_x": -96.00000000000001,
+    "expected_y": 37.0,
+    "tolerance": 1e-7,
+    "description": "roundtrip USCenter↔spherical LAEA inverse"
+  },
+  {
+    "from_epsg": 28992,
+    "to_epsg": 4289,
+    "input_x": 128979.2632852691,
+    "input_y": 556953.1903958509,
+    "expected_x": 5.0,
+    "expected_y": 53.000000000000014,
+    "tolerance": 1e-7,
+    "description": "roundtrip Netherlands↔RD New inverse"
+  },
+  {
+    "from_epsg": 3078,
+    "to_epsg": 4269,
+    "input_x": 499840.2523874142,
+    "input_y": 527581.9483510787,
+    "expected_x": -86.0,
+    "expected_y": 45.30000000000001,
+    "tolerance": 1e-7,
+    "description": "roundtrip Michigan↔Hotine A inverse"
+  },
+  {
+    "from_epsg": 2056,
+    "to_epsg": 4150,
+    "input_x": 2599925.1524788374,
+    "input_y": 1199854.87823513,
+    "expected_x": 7.438599999999998,
+    "expected_y": 46.95109999999996,
+    "tolerance": 1e-7,
+    "description": "roundtrip Bern↔Hotine B inverse"
+  },
+  {
+    "from_epsg": 30200,
+    "to_epsg": 4302,
+    "input_x": 66644.94040882034,
+    "input_y": 82536.21873655319,
+    "expected_x": -61.999999999999936,
+    "expected_y": 10.000000000011687,
+    "tolerance": 1e-7,
+    "description": "roundtrip Trinidad↔Cassini inverse"
+  },
+  {
+    "from_epsg": 3377,
+    "to_epsg": 4742,
+    "input_x": 21029.208695953384,
+    "input_y": -59981.52676016915,
+    "expected_x": 103.75,
+    "expected_y": 1.499999999999999,
+    "tolerance": 1e-7,
+    "description": "roundtrip Johor↔Cassini inverse"
   }
 ]

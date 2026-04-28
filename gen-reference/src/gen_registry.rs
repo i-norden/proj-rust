@@ -37,7 +37,7 @@ fn walkdir(dir: &std::path::Path, name: &str) -> Vec<PathBuf> {
 }
 
 const MAGIC: u32 = 0x4550_5347;
-const VERSION: u16 = 5;
+const VERSION: u16 = 6;
 
 const ELLIPSOID_RECORD_SIZE: usize = 20;
 const DATUM_RECORD_SIZE: usize = 72;
@@ -51,6 +51,12 @@ const METHOD_LCC: u8 = 4;
 const METHOD_ALBERS: u8 = 5;
 const METHOD_POLAR_STEREO: u8 = 6;
 const METHOD_EQUIDISTANT_CYL: u8 = 7;
+const METHOD_LAEA: u8 = 8;
+const METHOD_OBLIQUE_STEREO: u8 = 9;
+const METHOD_HOTINE_OBLIQUE_MERCATOR_A: u8 = 10;
+const METHOD_HOTINE_OBLIQUE_MERCATOR_B: u8 = 11;
+const METHOD_CASSINI_SOLDNER: u8 = 12;
+const METHOD_LAEA_SPHERICAL: u8 = 13;
 
 const DATUM_SHIFT_UNKNOWN: u8 = 0;
 const DATUM_SHIFT_IDENTITY: u8 = 1;
@@ -82,6 +88,13 @@ const EASTING_FALSE_ORIGIN: i64 = 8826;
 const NORTHING_FALSE_ORIGIN: i64 = 8827;
 const LAT_STD_PARALLEL: i64 = 8832;
 const LON_OF_ORIGIN: i64 = 8833;
+const LAT_PROJECTION_CENTRE: i64 = 8811;
+const LON_PROJECTION_CENTRE: i64 = 8812;
+const AZIMUTH_INITIAL_LINE: i64 = 8813;
+const RECTIFIED_GRID_ANGLE: i64 = 8814;
+const SCALE_FACTOR_PROJECTION_CENTRE: i64 = 8815;
+const EASTING_PROJECTION_CENTRE: i64 = 8816;
+const NORTHING_PROJECTION_CENTRE: i64 = 8817;
 
 #[derive(Clone, Copy)]
 enum DatumShiftKind {
@@ -135,8 +148,14 @@ struct GridRecord {
 #[derive(Clone)]
 enum OperationPayload {
     Helmert([f64; 7]),
-    GridShift { grid_id: u32, direction: u8, interpolation: u8 },
-    Concatenated { steps: Vec<(u32, u8)> },
+    GridShift {
+        grid_id: u32,
+        direction: u8,
+        interpolation: u8,
+    },
+    Concatenated {
+        steps: Vec<(u32, u8)>,
+    },
 }
 
 #[derive(Clone)]
@@ -164,6 +183,12 @@ fn method_code_to_id(code: i64) -> Option<u8> {
         9822 => Some(METHOD_ALBERS),
         9810 | 9829 => Some(METHOD_POLAR_STEREO),
         9842 | 9843 => Some(METHOD_EQUIDISTANT_CYL),
+        9820 => Some(METHOD_LAEA),
+        1027 => Some(METHOD_LAEA_SPHERICAL),
+        9809 => Some(METHOD_OBLIQUE_STEREO),
+        9812 => Some(METHOD_HOTINE_OBLIQUE_MERCATOR_A),
+        9815 => Some(METHOD_HOTINE_OBLIQUE_MERCATOR_B),
+        9806 => Some(METHOD_CASSINI_SOLDNER),
         1024 => Some(METHOD_WEB_MERCATOR),
         _ => None,
     }
@@ -297,6 +322,60 @@ fn encode_params(method_id: u8, cp: &ConvParams, linear_uoms: &BTreeMap<i64, f64
             0.0,
             0.0,
         ],
+        METHOD_LAEA => [
+            get_degrees(cp, &[LON_ORIGIN]),
+            get_degrees(cp, &[LAT_ORIGIN]),
+            0.0,
+            get_meters(cp, &[FALSE_EASTING], linear_uoms),
+            get_meters(cp, &[FALSE_NORTHING], linear_uoms),
+            0.0,
+            0.0,
+        ],
+        METHOD_LAEA_SPHERICAL => [
+            get_degrees(cp, &[LON_ORIGIN]),
+            get_degrees(cp, &[LAT_ORIGIN]),
+            0.0,
+            get_meters(cp, &[FALSE_EASTING], linear_uoms),
+            get_meters(cp, &[FALSE_NORTHING], linear_uoms),
+            0.0,
+            0.0,
+        ],
+        METHOD_OBLIQUE_STEREO => [
+            get_degrees(cp, &[LON_ORIGIN]),
+            get_degrees(cp, &[LAT_ORIGIN]),
+            get_scale(cp, &[SCALE_FACTOR]),
+            get_meters(cp, &[FALSE_EASTING], linear_uoms),
+            get_meters(cp, &[FALSE_NORTHING], linear_uoms),
+            0.0,
+            0.0,
+        ],
+        METHOD_HOTINE_OBLIQUE_MERCATOR_A => [
+            get_degrees(cp, &[LAT_PROJECTION_CENTRE]),
+            get_degrees(cp, &[LON_PROJECTION_CENTRE]),
+            get_degrees(cp, &[AZIMUTH_INITIAL_LINE]),
+            get_degrees(cp, &[RECTIFIED_GRID_ANGLE]),
+            get_scale(cp, &[SCALE_FACTOR_PROJECTION_CENTRE]),
+            get_meters(cp, &[FALSE_EASTING], linear_uoms),
+            get_meters(cp, &[FALSE_NORTHING], linear_uoms),
+        ],
+        METHOD_HOTINE_OBLIQUE_MERCATOR_B => [
+            get_degrees(cp, &[LAT_PROJECTION_CENTRE]),
+            get_degrees(cp, &[LON_PROJECTION_CENTRE]),
+            get_degrees(cp, &[AZIMUTH_INITIAL_LINE]),
+            get_degrees(cp, &[RECTIFIED_GRID_ANGLE]),
+            get_scale(cp, &[SCALE_FACTOR_PROJECTION_CENTRE]),
+            get_meters(cp, &[EASTING_PROJECTION_CENTRE], linear_uoms),
+            get_meters(cp, &[NORTHING_PROJECTION_CENTRE], linear_uoms),
+        ],
+        METHOD_CASSINI_SOLDNER => [
+            get_degrees(cp, &[LON_ORIGIN]),
+            get_degrees(cp, &[LAT_ORIGIN]),
+            0.0,
+            get_meters(cp, &[FALSE_EASTING], linear_uoms),
+            get_meters(cp, &[FALSE_NORTHING], linear_uoms),
+            0.0,
+            0.0,
+        ],
         _ => [0.0; 7],
     }
 }
@@ -318,9 +397,16 @@ fn main() {
     {
         let mut stmt = conn
             .prepare(
-                "SELECT code, semi_major_axis, inv_flattening, semi_minor_axis
-                 FROM ellipsoid
-                 WHERE auth_name='EPSG'",
+                "SELECT e.code,
+                        e.semi_major_axis,
+                        e.inv_flattening,
+                        e.semi_minor_axis,
+                        u.conv_factor
+                 FROM ellipsoid e
+                 JOIN unit_of_measure u
+                   ON u.auth_name = e.uom_auth_name
+                  AND u.code = e.uom_code
+                 WHERE e.auth_name='EPSG'",
             )
             .unwrap();
         for row in stmt
@@ -329,14 +415,19 @@ fn main() {
                 let a: f64 = row.get(1)?;
                 let inv_f: Option<f64> = row.get(2)?;
                 let b: Option<f64> = row.get(3)?;
+                let unit_to_meter: f64 = row.get(4)?;
+                let a_m = a * unit_to_meter;
+                let b_m = b.map(|value| value * unit_to_meter);
                 let rf = match inv_f {
                     Some(value) if value != 0.0 => value,
-                    _ => match b {
-                        Some(semi_minor) if (a - semi_minor).abs() > 0.001 => a / (a - semi_minor),
+                    _ => match b_m {
+                        Some(semi_minor) if (a_m - semi_minor).abs() > 0.001 => {
+                            a_m / (a_m - semi_minor)
+                        }
                         _ => 0.0,
                     },
                 };
-                Ok((code, a, rf))
+                Ok((code, a_m, rf))
             })
             .unwrap()
             .flatten()
@@ -384,11 +475,13 @@ fn main() {
                  WHERE auth_name='EPSG' AND type='length'",
             )
             .unwrap();
-        stmt.query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<f64>>(1)?)))
-            .unwrap()
-            .filter_map(|row| row.ok())
-            .filter_map(|(code, factor)| factor.map(|factor| (code, factor)))
-            .collect()
+        stmt.query_map([], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, Option<f64>>(1)?))
+        })
+        .unwrap()
+        .filter_map(|row| row.ok())
+        .filter_map(|(code, factor)| factor.map(|factor| (code, factor)))
+        .collect()
     };
     let angle_uoms: BTreeMap<i64, f64> = {
         let mut stmt = conn
@@ -398,11 +491,13 @@ fn main() {
                  WHERE auth_name='EPSG' AND type='angle'",
             )
             .unwrap();
-        stmt.query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<f64>>(1)?)))
-            .unwrap()
-            .filter_map(|row| row.ok())
-            .filter_map(|(code, factor)| factor.map(|factor| (code, factor)))
-            .collect()
+        stmt.query_map([], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, Option<f64>>(1)?))
+        })
+        .unwrap()
+        .filter_map(|row| row.ok())
+        .filter_map(|(code, factor)| factor.map(|factor| (code, factor)))
+        .collect()
     };
     let scale_uoms: BTreeMap<i64, f64> = {
         let mut stmt = conn
@@ -412,11 +507,13 @@ fn main() {
                  WHERE auth_name='EPSG' AND type='scale'",
             )
             .unwrap();
-        stmt.query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<f64>>(1)?)))
-            .unwrap()
-            .filter_map(|row| row.ok())
-            .filter_map(|(code, factor)| factor.map(|factor| (code, factor)))
-            .collect()
+        stmt.query_map([], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, Option<f64>>(1)?))
+        })
+        .unwrap()
+        .filter_map(|row| row.ok())
+        .filter_map(|(code, factor)| factor.map(|factor| (code, factor)))
+        .collect()
     };
 
     {
@@ -493,8 +590,9 @@ fn main() {
                 if let Some(datum) = datums.get_mut(&datum_code) {
                     let prev_accuracy = datum_accuracy.get(&datum_code).copied().unwrap_or(999.0);
                     let has_rotation = helmert[3] != 0.0 || helmert[4] != 0.0 || helmert[5] != 0.0;
-                    let prev_has_rotation =
-                        datum.helmert[3] != 0.0 || datum.helmert[4] != 0.0 || datum.helmert[5] != 0.0;
+                    let prev_has_rotation = datum.helmert[3] != 0.0
+                        || datum.helmert[4] != 0.0
+                        || datum.helmert[5] != 0.0;
                     let first = !datum_accuracy.contains_key(&datum_code);
                     let better = first
                         || (has_rotation && !prev_has_rotation)
@@ -595,7 +693,9 @@ fn main() {
                 (Some(uom_code), None) => {
                     panic!("projected CRS EPSG:{code} uses unsupported axis linear unit EPSG:{uom_code}")
                 }
-                (None, _) => panic!("projected CRS EPSG:{code} is missing axis linear unit metadata"),
+                (None, _) => {
+                    panic!("projected CRS EPSG:{code} is missing axis linear unit metadata")
+                }
             };
             let conv = match conn.query_row(
                 "SELECT method_code,
@@ -617,11 +717,16 @@ fn main() {
                         let param_code: Option<i64> = row.get(base)?;
                         let param_value: Option<f64> = row.get(base + 1)?;
                         let param_uom: Option<i64> = row.get(base + 2)?;
-                        if let (Some(code), Some(value), Some(uom)) = (param_code, param_value, param_uom) {
+                        if let (Some(code), Some(value), Some(uom)) =
+                            (param_code, param_value, param_uom)
+                        {
                             params.insert(code, (value, uom));
                         }
                     }
-                    Ok(ConvParams { method_code, params })
+                    Ok(ConvParams {
+                        method_code,
+                        params,
+                    })
                 },
             ) {
                 Ok(value) => value,
@@ -844,16 +949,38 @@ fn main() {
                 continue;
             }
 
-            let rotation_factor = row.13.and_then(|uom| angle_uoms.get(&uom).copied()).unwrap_or(0.0);
-            let scale_factor = row.15.and_then(|uom| scale_uoms.get(&uom).copied()).unwrap_or(0.0);
+            let rotation_factor = row
+                .13
+                .and_then(|uom| angle_uoms.get(&uom).copied())
+                .unwrap_or(0.0);
+            let scale_factor = row
+                .15
+                .and_then(|uom| scale_uoms.get(&uom).copied())
+                .unwrap_or(0.0);
             let params = [
                 row.7,
                 row.8,
                 row.9,
-                if row.10 == 0.0 { 0.0 } else { row.10 * rotation_factor * 180.0 / PI * 3600.0 },
-                if row.11 == 0.0 { 0.0 } else { row.11 * rotation_factor * 180.0 / PI * 3600.0 },
-                if row.12 == 0.0 { 0.0 } else { row.12 * rotation_factor * 180.0 / PI * 3600.0 },
-                if row.14 == 0.0 { 0.0 } else { row.14 * scale_factor * 1_000_000.0 },
+                if row.10 == 0.0 {
+                    0.0
+                } else {
+                    row.10 * rotation_factor * 180.0 / PI * 3600.0
+                },
+                if row.11 == 0.0 {
+                    0.0
+                } else {
+                    row.11 * rotation_factor * 180.0 / PI * 3600.0
+                },
+                if row.12 == 0.0 {
+                    0.0
+                } else {
+                    row.12 * rotation_factor * 180.0 / PI * 3600.0
+                },
+                if row.14 == 0.0 {
+                    0.0
+                } else {
+                    row.14 * scale_factor * 1_000_000.0
+                },
             ];
 
             operations.push(OperationRecord {
@@ -940,7 +1067,9 @@ fn main() {
                 .unwrap();
             let mut valid = true;
             for step in step_stmt
-                .query_map([code], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
+                .query_map([code], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })
                 .unwrap()
                 .flatten()
             {

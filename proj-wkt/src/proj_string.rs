@@ -18,8 +18,14 @@ const UTM_PARAMS: &[&str] = &["zone", "south"];
 const TMERC_PARAMS: &[&str] = &["lat_0", "lon_0", "k_0", "k", "x_0", "y_0"];
 const MERC_PARAMS: &[&str] = &["lon_0", "lat_ts", "k_0", "k", "x_0", "y_0"];
 const STERE_PARAMS: &[&str] = &["lat_0", "lon_0", "lat_ts", "k_0", "k", "x_0", "y_0"];
+const STEREA_PARAMS: &[&str] = &["lat_0", "lon_0", "k_0", "k", "x_0", "y_0"];
 const CONIC_PARAMS: &[&str] = &["lat_0", "lon_0", "lat_1", "lat_2", "x_0", "y_0"];
 const EQC_PARAMS: &[&str] = &["lon_0", "lat_ts", "x_0", "y_0"];
+const LAEA_PARAMS: &[&str] = &["lat_0", "lon_0", "x_0", "y_0"];
+const OMERC_PARAMS: &[&str] = &[
+    "lat_0", "lonc", "lon_0", "alpha", "gamma", "k_0", "k", "x_0", "y_0", "no_uoff", "no_off",
+];
+const CASS_PARAMS: &[&str] = &["lat_0", "lon_0", "x_0", "y_0"];
 
 /// Parse a PROJ format string like `+proj=utm +zone=18 +datum=WGS84 +units=m`.
 pub(crate) fn parse_proj_string(s: &str) -> Result<CrsDef> {
@@ -40,9 +46,13 @@ pub(crate) fn parse_proj_string(s: &str) -> Result<CrsDef> {
         "tmerc" => parse_tmerc(&params),
         "merc" => parse_merc(&params),
         "stere" => parse_stereo(&params),
+        "sterea" => parse_sterea(&params),
         "lcc" => parse_lcc(&params),
         "aea" => parse_aea(&params),
         "eqc" => parse_eqc(&params),
+        "laea" => parse_laea(&params),
+        "omerc" => parse_omerc(&params),
+        "cass" => parse_cass(&params),
         other => Err(ParseError::Parse(format!(
             "unsupported PROJ projection: {other}"
         ))),
@@ -421,6 +431,58 @@ fn parse_lcc(params: &HashMap<String, String>) -> Result<CrsDef> {
     )))
 }
 
+fn parse_laea(params: &HashMap<String, String>) -> Result<CrsDef> {
+    validate_supported_proj_params(
+        params,
+        LAEA_PARAMS,
+        LINEAR_UNIT_PARAMS,
+        "PROJ Lambert Azimuthal Equal Area definition",
+    )?;
+    validate_supported_proj_common_semantics(
+        params,
+        "PROJ Lambert Azimuthal Equal Area definition",
+    )?;
+    let d = resolve_datum(params)?;
+    let linear_unit = resolve_linear_unit(params)?;
+    Ok(CrsDef::Projected(ProjectedCrsDef::new(
+        0,
+        d,
+        ProjectionMethod::LambertAzimuthalEqualArea {
+            lon0: get_f64(params, "lon_0")?,
+            lat0: get_f64(params, "lat_0")?,
+            false_easting: linear_unit.to_meters(get_f64(params, "x_0")?),
+            false_northing: linear_unit.to_meters(get_f64(params, "y_0")?),
+        },
+        linear_unit,
+        "",
+    )))
+}
+
+fn parse_sterea(params: &HashMap<String, String>) -> Result<CrsDef> {
+    validate_supported_proj_params(
+        params,
+        STEREA_PARAMS,
+        LINEAR_UNIT_PARAMS,
+        "PROJ Oblique Stereographic definition",
+    )?;
+    validate_supported_proj_common_semantics(params, "PROJ Oblique Stereographic definition")?;
+    let d = resolve_datum(params)?;
+    let linear_unit = resolve_linear_unit(params)?;
+    Ok(CrsDef::Projected(ProjectedCrsDef::new(
+        0,
+        d,
+        ProjectionMethod::ObliqueStereographic {
+            lon0: get_f64(params, "lon_0")?,
+            lat0: get_f64(params, "lat_0")?,
+            k0: get_scale(params)?,
+            false_easting: linear_unit.to_meters(get_f64(params, "x_0")?),
+            false_northing: linear_unit.to_meters(get_f64(params, "y_0")?),
+        },
+        linear_unit,
+        "",
+    )))
+}
+
 fn parse_aea(params: &HashMap<String, String>) -> Result<CrsDef> {
     validate_supported_proj_params(
         params,
@@ -439,6 +501,77 @@ fn parse_aea(params: &HashMap<String, String>) -> Result<CrsDef> {
             lat0: get_f64(params, "lat_0")?,
             lat1: get_f64(params, "lat_1")?,
             lat2: get_f64(params, "lat_2")?,
+            false_easting: linear_unit.to_meters(get_f64(params, "x_0")?),
+            false_northing: linear_unit.to_meters(get_f64(params, "y_0")?),
+        },
+        linear_unit,
+        "",
+    )))
+}
+
+fn parse_omerc(params: &HashMap<String, String>) -> Result<CrsDef> {
+    validate_supported_proj_params(
+        params,
+        OMERC_PARAMS,
+        LINEAR_UNIT_PARAMS,
+        "PROJ Hotine Oblique Mercator definition",
+    )?;
+    validate_supported_proj_common_semantics(params, "PROJ Hotine Oblique Mercator definition")?;
+    validate_empty_flag(params, "no_uoff", "PROJ Hotine Oblique Mercator definition")?;
+    validate_empty_flag(params, "no_off", "PROJ Hotine Oblique Mercator definition")?;
+    let d = resolve_datum(params)?;
+    let linear_unit = resolve_linear_unit(params)?;
+    let azimuth = if params.contains_key("alpha") {
+        get_f64(params, "alpha")?
+    } else {
+        get_f64(params, "gamma")?
+    };
+    let rectified_grid_angle = if params.contains_key("gamma") {
+        get_f64(params, "gamma")?
+    } else {
+        azimuth
+    };
+    let lonc = if params.contains_key("lonc") {
+        get_f64(params, "lonc")?
+    } else {
+        get_f64(params, "lon_0")?
+    };
+    let variant_b = !params.contains_key("no_uoff") && !params.contains_key("no_off");
+
+    Ok(CrsDef::Projected(ProjectedCrsDef::new(
+        0,
+        d,
+        ProjectionMethod::HotineObliqueMercator {
+            latc: get_f64(params, "lat_0")?,
+            lonc,
+            azimuth,
+            rectified_grid_angle,
+            k0: get_scale(params)?,
+            false_easting: linear_unit.to_meters(get_f64(params, "x_0")?),
+            false_northing: linear_unit.to_meters(get_f64(params, "y_0")?),
+            variant_b,
+        },
+        linear_unit,
+        "",
+    )))
+}
+
+fn parse_cass(params: &HashMap<String, String>) -> Result<CrsDef> {
+    validate_supported_proj_params(
+        params,
+        CASS_PARAMS,
+        LINEAR_UNIT_PARAMS,
+        "PROJ Cassini-Soldner definition",
+    )?;
+    validate_supported_proj_common_semantics(params, "PROJ Cassini-Soldner definition")?;
+    let d = resolve_datum(params)?;
+    let linear_unit = resolve_linear_unit(params)?;
+    Ok(CrsDef::Projected(ProjectedCrsDef::new(
+        0,
+        d,
+        ProjectionMethod::CassiniSoldner {
+            lon0: get_f64(params, "lon_0")?,
+            lat0: get_f64(params, "lat_0")?,
             false_easting: linear_unit.to_meters(get_f64(params, "x_0")?),
             false_northing: linear_unit.to_meters(get_f64(params, "y_0")?),
         },
@@ -757,9 +890,54 @@ mod tests {
     }
 
     #[test]
-    fn reject_oblique_stereographic() {
-        let err = parse_proj_string("+proj=sterea +lat_0=52 +lon_0=5 +k=0.9999").unwrap_err();
-        assert!(err.to_string().contains("unsupported PROJ projection"));
+    fn parse_oblique_stereographic() {
+        let crs = parse_proj_string(
+            "+proj=sterea +lat_0=52.1561605555556 +lon_0=5.38763888888889 +k=0.9999079 +x_0=155000 +y_0=463000 +ellps=bessel +units=m",
+        )
+        .unwrap();
+        assert!(matches!(
+            crs,
+            CrsDef::Projected(p)
+                if matches!(p.method(), ProjectionMethod::ObliqueStereographic { .. })
+        ));
+    }
+
+    #[test]
+    fn parse_laea_omerc_and_cass() {
+        let laea = parse_proj_string(
+            "+proj=laea +lat_0=52 +lon_0=10 +x_0=4321000 +y_0=3210000 +ellps=GRS80 +units=m",
+        )
+        .unwrap();
+        assert!(matches!(
+            laea,
+            CrsDef::Projected(p)
+                if matches!(p.method(), ProjectionMethod::LambertAzimuthalEqualArea { .. })
+        ));
+
+        let omerc = parse_proj_string(
+            "+proj=omerc +no_uoff +lat_0=45.3091666666667 +lonc=-86 +alpha=337.25556 +gamma=337.25556 +k=0.9996 +x_0=2546731.496 +y_0=-4354009.816 +datum=NAD83 +units=m",
+        )
+        .unwrap();
+        assert!(matches!(
+            omerc,
+            CrsDef::Projected(p)
+                if matches!(
+                    p.method(),
+                    ProjectionMethod::HotineObliqueMercator {
+                        variant_b: false,
+                        ..
+                    }
+                )
+        ));
+
+        let cass = parse_proj_string(
+            "+proj=cass +lat_0=10.4416666667 +lon_0=-61.3333333333 +x_0=430000 +y_0=325000 +ellps=WGS84 +units=m",
+        )
+        .unwrap();
+        assert!(matches!(
+            cass,
+            CrsDef::Projected(p) if matches!(p.method(), ProjectionMethod::CassiniSoldner { .. })
+        ));
     }
 
     #[test]

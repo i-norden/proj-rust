@@ -221,6 +221,7 @@ impl CoordinateOperation {
         CoordinateOperationMetadata {
             id: self.id,
             name: self.name.clone(),
+            direction: OperationStepDirection::Forward,
             source_crs_epsg: self.source_crs_epsg,
             target_crs_epsg: self.target_crs_epsg,
             source_datum_epsg: self.source_datum_epsg,
@@ -239,6 +240,7 @@ impl CoordinateOperation {
         direction: OperationStepDirection,
     ) -> CoordinateOperationMetadata {
         let mut metadata = self.metadata();
+        metadata.direction = direction;
         if matches!(direction, OperationStepDirection::Reverse) {
             std::mem::swap(&mut metadata.source_crs_epsg, &mut metadata.target_crs_epsg);
             std::mem::swap(
@@ -276,6 +278,7 @@ impl CoordinateOperation {
 pub struct CoordinateOperationMetadata {
     pub id: Option<CoordinateOperationId>,
     pub name: String,
+    pub direction: OperationStepDirection,
     pub source_crs_epsg: Option<u32>,
     pub target_crs_epsg: Option<u32>,
     pub source_datum_epsg: Option<u32>,
@@ -357,7 +360,21 @@ pub struct OperationSelectionDiagnostics {
     pub selected_operation: CoordinateOperationMetadata,
     pub selected_match_kind: OperationMatchKind,
     pub selected_reasons: SmallVec<[SelectionReason; 4]>,
+    pub fallback_operations: Vec<CoordinateOperationMetadata>,
     pub skipped_operations: Vec<SkippedOperation>,
     pub approximate: bool,
     pub missing_required_grid: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct GridCoverageMiss {
+    pub operation: CoordinateOperationMetadata,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TransformOutcome<T> {
+    pub coord: T,
+    pub operation: CoordinateOperationMetadata,
+    pub grid_coverage_misses: Vec<GridCoverageMiss>,
 }
