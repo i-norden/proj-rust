@@ -7,13 +7,26 @@ use crate::projection::{
 
 const POLE_EPSILON: f64 = 1e-12;
 const ECCENTRICITY_EPSILON: f64 = 1e-15;
+const RIGHT_ANGLE_EPSILON: f64 = 1e-12;
+const SWISS_INVERSE_TOLERANCE: f64 = 1e-13;
+const SWISS_INVERSE_ITERATIONS: usize = 10;
 
 /// Hotine Oblique Mercator / Rectified Skew Orthomorphic projection.
 ///
 /// Implements EPSG methods 9812 (variant A) and 9815 (variant B). Variant B
-/// uses easting/northing at the projection centre and applies the centre-line
-/// `u` offset; variant A uses false easting/northing at the natural origin.
+/// uses easting/northing at the projection centre. The Swiss right-angle form
+/// is evaluated with its dedicated conformal-sphere equations to avoid the
+/// numerically singular Hotine centre-line offset at 90 degrees.
 pub(crate) struct HotineObliqueMercator {
+    kernel: HotineKernel,
+}
+
+enum HotineKernel {
+    General(GeneralHotineObliqueMercator),
+    Swiss(SwissObliqueMercator),
+}
+
+struct GeneralHotineObliqueMercator {
     e: f64,
     a_const: f64,
     b: f64,
@@ -46,6 +59,49 @@ impl HotineObliqueMercator {
         validate_scale("scale factor", k0)?;
         validate_offset("false easting", false_easting)?;
         validate_offset("false northing", false_northing)?;
+
+        if variant_b && is_swiss_right_angle_form(azimuth, rectified_grid_angle) {
+            return Ok(Self {
+                kernel: HotineKernel::Swiss(SwissObliqueMercator::new(
+                    ellipsoid,
+                    latc,
+                    lonc,
+                    k0,
+                    false_easting,
+                    false_northing,
+                )?),
+            });
+        }
+
+        Ok(Self {
+            kernel: HotineKernel::General(GeneralHotineObliqueMercator::new(
+                ellipsoid,
+                latc,
+                lonc,
+                azimuth,
+                rectified_grid_angle,
+                k0,
+                false_easting,
+                false_northing,
+                variant_b,
+            )?),
+        })
+    }
+}
+
+impl GeneralHotineObliqueMercator {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        ellipsoid: Ellipsoid,
+        latc: f64,
+        lonc: f64,
+        azimuth: f64,
+        rectified_grid_angle: f64,
+        k0: f64,
+        false_easting: f64,
+        false_northing: f64,
+        variant_b: bool,
+    ) -> Result<Self> {
         if (latc.abs() - std::f64::consts::FRAC_PI_2).abs() < POLE_EPSILON {
             return Err(Error::InvalidDefinition(
                 "Hotine Oblique Mercator projection centre cannot be at a pole".into(),
@@ -78,7 +134,7 @@ impl HotineObliqueMercator {
             0.0
         };
 
-        Ok(Self {
+        Ok(GeneralHotineObliqueMercator {
             e,
             a_const,
             b,
@@ -91,6 +147,158 @@ impl HotineObliqueMercator {
             false_northing,
         })
     }
+}
+
+struct SwissObliqueMercator {
+    e: f64,
+    half_e: f64,
+    c: f64,
+    k: f64,
+    k_r: f64,
+    cos_chi0: f64,
+    sin_chi0: f64,
+    lon0: f64,
+    false_easting: f64,
+    false_northing: f64,
+    one_minus_e2: f64,
+}
+
+impl SwissObliqueMercator {
+    fn new(
+        ellipsoid: Ellipsoid,
+        lat0: f64,
+        lon0: f64,
+        k0: f64,
+        false_easting: f64,
+        false_northing: f64,
+    ) -> Result<Self> {
+        if (lat0.abs() - std::f64::consts::FRAC_PI_2).abs() < POLE_EPSILON {
+            return Err(Error::InvalidDefinition(
+                "Swiss Oblique Mercator projection centre cannot be at a pole".into(),
+            ));
+        }
+
+        let e2 = ellipsoid.e2();
+        let e = ellipsoid.e();
+        let one_minus_e2 = 1.0 - e2;
+        let half_e = 0.5 * e;
+        let sin_lat0 = lat0.sin();
+        let cos_lat0 = lat0.cos();
+        let c = (1.0 + e2 * cos_lat0.powi(4) / one_minus_e2).sqrt();
+        let sin_chi0 = sin_lat0 / c;
+        let chi0 = unit_asin(sin_chi0, "Swiss Oblique Mercator origin constants")?;
+        let cos_chi0 = chi0.cos();
+        let e_sin_lat0 = e * sin_lat0;
+        let k = isometric_latitude_sphere(chi0)
+            - c * isometric_latitude_ellipsoid(lat0, half_e, e_sin_lat0);
+        let k_r = ellipsoid.a * k0 * one_minus_e2.sqrt() / (1.0 - e_sin_lat0 * e_sin_lat0);
+
+        Ok(Self {
+            e,
+            half_e,
+            c,
+            k,
+            k_r,
+            cos_chi0,
+            sin_chi0,
+            lon0,
+            false_easting,
+            false_northing,
+            one_minus_e2,
+        })
+    }
+
+    fn forward(&self, lon: f64, lat: f64) -> Result<(f64, f64)> {
+        let e_sin_lat = self.e * lat.sin();
+        let chi = 2.0
+            * (self.c * isometric_latitude_ellipsoid(lat, self.half_e, e_sin_lat) + self.k)
+                .exp()
+                .atan()
+            - std::f64::consts::FRAC_PI_2;
+        let lambda = self.c * normalize_longitude(lon - self.lon0);
+        let cos_chi = chi.cos();
+        let chi_rot = unit_asin(
+            self.cos_chi0 * chi.sin() - self.sin_chi0 * cos_chi * lambda.cos(),
+            "Swiss Oblique Mercator",
+        )?;
+        let cos_chi_rot = chi_rot.cos();
+        if cos_chi_rot.abs() < POLE_EPSILON {
+            return Err(Error::OutOfRange(
+                "Swiss Oblique Mercator is undefined at this coordinate".into(),
+            ));
+        }
+        let lambda_rot = unit_asin(
+            cos_chi * lambda.sin() / cos_chi_rot,
+            "Swiss Oblique Mercator",
+        )?;
+
+        let x = self.false_easting + self.k_r * lambda_rot;
+        let y = self.false_northing + self.k_r * isometric_latitude_sphere(chi_rot);
+        ensure_finite_xy("Swiss Oblique Mercator", x, y)
+    }
+
+    fn inverse(&self, x: f64, y: f64) -> Result<(f64, f64)> {
+        let dx = x - self.false_easting;
+        let dy = y - self.false_northing;
+        let chi_rot = 2.0 * ((dy / self.k_r).exp().atan() - std::f64::consts::FRAC_PI_4);
+        let lambda_rot = dx / self.k_r;
+        let cos_chi_rot = chi_rot.cos();
+        let chi = unit_asin(
+            self.cos_chi0 * chi_rot.sin() + self.sin_chi0 * cos_chi_rot * lambda_rot.cos(),
+            "Swiss Oblique Mercator inverse",
+        )?;
+        let cos_chi = chi.cos();
+        if cos_chi.abs() < POLE_EPSILON {
+            return Err(Error::OutOfRange(
+                "Swiss Oblique Mercator inverse is undefined at this coordinate".into(),
+            ));
+        }
+        let lambda = unit_asin(
+            cos_chi_rot * lambda_rot.sin() / cos_chi,
+            "Swiss Oblique Mercator inverse",
+        )?;
+
+        let target = (self.k - isometric_latitude_sphere(chi)) / self.c;
+        let mut lat = chi;
+        for _ in 0..SWISS_INVERSE_ITERATIONS {
+            let e_sin = self.e * lat.sin();
+            let delta = (target + isometric_latitude_ellipsoid(lat, self.half_e, e_sin))
+                * (1.0 - e_sin * e_sin)
+                * lat.cos()
+                / self.one_minus_e2;
+            lat -= delta;
+            if delta.abs() < SWISS_INVERSE_TOLERANCE {
+                let lon = self.lon0 + lambda / self.c;
+                return ensure_finite_lon_lat("Swiss Oblique Mercator", lon, lat);
+            }
+        }
+
+        Err(Error::OutOfRange(
+            "Swiss Oblique Mercator inverse did not converge".into(),
+        ))
+    }
+}
+
+fn is_swiss_right_angle_form(azimuth: f64, rectified_grid_angle: f64) -> bool {
+    (azimuth - std::f64::consts::FRAC_PI_2).abs() < RIGHT_ANGLE_EPSILON
+        && (rectified_grid_angle - std::f64::consts::FRAC_PI_2).abs() < RIGHT_ANGLE_EPSILON
+}
+
+fn isometric_latitude_sphere(lat: f64) -> f64 {
+    (std::f64::consts::FRAC_PI_4 + 0.5 * lat).tan().ln()
+}
+
+fn isometric_latitude_ellipsoid(lat: f64, half_e: f64, e_sin_lat: f64) -> f64 {
+    isometric_latitude_sphere(lat) - half_e * ((1.0 + e_sin_lat) / (1.0 - e_sin_lat)).ln()
+}
+
+fn unit_asin(value: f64, projection: &str) -> Result<f64> {
+    if !value.is_finite() || value.abs() > 1.0 + 1e-12 {
+        return Err(Error::OutOfRange(format!(
+            "{projection} is undefined for this coordinate"
+        )));
+    }
+    Ok(value.clamp(-1.0, 1.0).asin())
 }
 
 fn t_func(lat: f64, e: f64) -> f64 {
@@ -124,6 +332,23 @@ fn lat_from_t(t: f64, e: f64) -> f64 {
 impl super::ProjectionImpl for HotineObliqueMercator {
     fn forward(&self, lon: f64, lat: f64) -> Result<(f64, f64)> {
         validate_lon_lat(lon, lat)?;
+        match &self.kernel {
+            HotineKernel::General(proj) => proj.forward(lon, lat),
+            HotineKernel::Swiss(proj) => proj.forward(lon, lat),
+        }
+    }
+
+    fn inverse(&self, x: f64, y: f64) -> Result<(f64, f64)> {
+        validate_projected(x, y)?;
+        match &self.kernel {
+            HotineKernel::General(proj) => proj.inverse(x, y),
+            HotineKernel::Swiss(proj) => proj.inverse(x, y),
+        }
+    }
+}
+
+impl GeneralHotineObliqueMercator {
+    fn forward(&self, lon: f64, lat: f64) -> Result<(f64, f64)> {
         let d_lon = normalize_longitude(lon - self.lon0);
         let b_d_lon = self.b * d_lon;
         let t = t_func(lat, self.e);
@@ -151,7 +376,6 @@ impl super::ProjectionImpl for HotineObliqueMercator {
     }
 
     fn inverse(&self, x: f64, y: f64) -> Result<(f64, f64)> {
-        validate_projected(x, y)?;
         let dx = x - self.false_easting;
         let dy = y - self.false_northing;
         let skew_v = dx * self.gamma_c.cos() - dy * self.gamma_c.sin();
@@ -191,6 +415,10 @@ mod tests {
 
     fn everest_1830_1967() -> Ellipsoid {
         Ellipsoid::from_a_rf(6_377_298.556, 300.8017)
+    }
+
+    fn bessel_1841() -> Ellipsoid {
+        Ellipsoid::from_a_rf(6_377_397.155, 299.1528128)
     }
 
     #[test]
@@ -245,5 +473,45 @@ mod tests {
         let (lon2, lat2) = proj.inverse(x, y).unwrap();
         assert!((lon2 - lon).abs() < 1e-8);
         assert!((lat2 - lat).abs() < 1e-8);
+    }
+
+    #[test]
+    fn swiss_right_angle_variant_b_matches_lv95() {
+        let proj = HotineObliqueMercator::new(
+            bessel_1841(),
+            dms(46.0, 57.0, 8.66).to_radians(),
+            dms(7.0, 26.0, 22.5).to_radians(),
+            90.0_f64.to_radians(),
+            90.0_f64.to_radians(),
+            1.0,
+            2_600_000.0,
+            1_200_000.0,
+            true,
+        )
+        .unwrap();
+
+        let bern_lon = 7.4386_f64.to_radians();
+        let bern_lat = 46.9511_f64.to_radians();
+        let (x, y) = proj.forward(bern_lon, bern_lat).unwrap();
+
+        assert!((x - 2_599_925.1524788374).abs() < 1e-6, "x = {x}");
+        assert!((y - 1_199_854.87823513).abs() < 1e-6, "y = {y}");
+
+        let (lon, lat) = proj.inverse(x, y).unwrap();
+        assert!((lon - bern_lon).abs() < 1e-12, "lon = {lon}");
+        assert!((lat - bern_lat).abs() < 1e-12, "lat = {lat}");
+
+        let (zurich_x, zurich_y) = proj
+            .forward(8.5417_f64.to_radians(), 47.3769_f64.to_radians())
+            .unwrap();
+
+        assert!(
+            (zurich_x - 2_683_220.7548285224).abs() < 1e-6,
+            "x = {zurich_x}"
+        );
+        assert!(
+            (zurich_y - 1_247_772.848570864).abs() < 1e-6,
+            "y = {zurich_y}"
+        );
     }
 }
