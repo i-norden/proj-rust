@@ -80,7 +80,7 @@ pub enum DatumToWgs84 {
     /// The datum requires the provided Helmert transform to reach WGS84.
     Helmert(HelmertParams),
     /// The datum requires horizontal grid interpolation to reach WGS84.
-    GridShift(DatumGridShift),
+    GridShift(Box<DatumGridShift>),
     /// The datum's path to WGS84 is not known.
     Unknown,
 }

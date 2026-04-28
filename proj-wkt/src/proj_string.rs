@@ -187,7 +187,7 @@ fn resolve_datum(params: &HashMap<String, String>) -> Result<Datum> {
 
 fn datum_grid_shift_to_wgs84(grid_shift: DatumGridShift) -> DatumToWgs84 {
     if grid_shift.uses_grid_shift() {
-        DatumToWgs84::GridShift(grid_shift)
+        DatumToWgs84::GridShift(Box::new(grid_shift))
     } else {
         DatumToWgs84::Identity
     }

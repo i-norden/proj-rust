@@ -63,7 +63,7 @@ enum CompiledStep {
         direction: GridShiftDirection,
     },
     GridShiftList {
-        handles: SmallVec<[GridHandle; 4]>,
+        handles: Box<[GridHandle]>,
         allow_null: bool,
         direction: GridShiftDirection,
     },
@@ -763,7 +763,7 @@ fn execute_step(step: &CompiledStep, coord: Coord3D) -> Result<Coord3D> {
             direction,
         } => {
             let mut last_coverage_miss = None;
-            for handle in handles {
+            for handle in handles.iter() {
                 match handle.apply(coord.x, coord.y, *direction) {
                     Ok((lon, lat)) => return Ok(Coord3D::new(lon, lat, coord.z)),
                     Err(GridError::OutsideCoverage(detail)) => {
@@ -1022,7 +1022,7 @@ fn compile_grid_shift_list(
     grid_runtime: &GridRuntime,
     steps: &mut SmallVec<[CompiledStep; 8]>,
 ) -> Result<()> {
-    let mut handles = SmallVec::<[GridHandle; 4]>::new();
+    let mut handles = Vec::<GridHandle>::new();
     let mut allow_null = false;
     let mut required_grid_seen = false;
 
@@ -1060,7 +1060,7 @@ fn compile_grid_shift_list(
     }
 
     steps.push(CompiledStep::GridShiftList {
-        handles,
+        handles: handles.into_boxed_slice(),
         allow_null,
         direction,
     });
