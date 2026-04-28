@@ -94,6 +94,9 @@ fn parse_projected_projjson(value: &Value) -> Result<CrsDef> {
         &[
             "centralmeridian",
             "longitudeofcenter",
+            "longitudeofcentre",
+            "longitudeofprojectioncenter",
+            "longitudeofprojectioncentre",
             "longitudeofnaturalorigin",
             "longitudeoffalseorigin",
         ],
@@ -104,6 +107,9 @@ fn parse_projected_projjson(value: &Value) -> Result<CrsDef> {
         &[
             "latitudeoforigin",
             "latitudeofcenter",
+            "latitudeofcentre",
+            "latitudeofprojectioncenter",
+            "latitudeofprojectioncentre",
             "latitudeofnaturalorigin",
             "latitudeoffalseorigin",
         ],
@@ -115,11 +121,29 @@ fn parse_projected_projjson(value: &Value) -> Result<CrsDef> {
             "scalefactor",
             "scalefactoratnaturalorigin",
             "scalefactoratprojectionorigin",
+            "scalefactoratprojectioncenter",
+            "scalefactoratprojectioncentre",
         ],
     )
     .unwrap_or(1.0);
-    let fe = first_param(&params, &["falseeasting"]).unwrap_or(0.0);
-    let fn_ = first_param(&params, &["falsenorthing"]).unwrap_or(0.0);
+    let fe = first_param(
+        &params,
+        &[
+            "falseeasting",
+            "eastingatprojectioncenter",
+            "eastingatprojectioncentre",
+        ],
+    )
+    .unwrap_or(0.0);
+    let fn_ = first_param(
+        &params,
+        &[
+            "falsenorthing",
+            "northingatprojectioncenter",
+            "northingatprojectioncentre",
+        ],
+    )
+    .unwrap_or(0.0);
     let normalized_method = normalize_key(method_name);
 
     let method = match normalized_method.as_str() {
@@ -176,6 +200,74 @@ fn parse_projected_projjson(value: &Value) -> Result<CrsDef> {
                 &["standardparallel2", "latitudeof2ndstandardparallel"],
             )
             .unwrap_or(lat0),
+            false_easting: fe,
+            false_northing: fn_,
+        },
+        "lambertazimuthalequalarea" | "lambertazimuthalequalareaellipsoidal" => {
+            ProjectionMethod::LambertAzimuthalEqualArea {
+                lon0,
+                lat0,
+                false_easting: fe,
+                false_northing: fn_,
+            }
+        }
+        "lambertazimuthalequalareaspherical" => {
+            ProjectionMethod::LambertAzimuthalEqualAreaSpherical {
+                lon0,
+                lat0,
+                false_easting: fe,
+                false_northing: fn_,
+            }
+        }
+        "obliquestereographic" | "doublestereographic" | "stereographic" => {
+            ProjectionMethod::ObliqueStereographic {
+                lon0,
+                lat0,
+                k0,
+                false_easting: fe,
+                false_northing: fn_,
+            }
+        }
+        "hotineobliquemercator"
+        | "hotineobliquemercatorvarianta"
+        | "hotineobliquemercatorvariantb"
+        | "obliquemercator"
+        | "rectifiedskeworthomorphic" => {
+            let variant_b = normalized_method == "hotineobliquemercatorvariantb"
+                || params.contains_key("eastingatprojectioncenter")
+                || params.contains_key("eastingatprojectioncentre")
+                || params.contains_key("northingatprojectioncenter")
+                || params.contains_key("northingatprojectioncentre");
+            let azimuth = first_param(
+                &params,
+                &[
+                    "azimuth",
+                    "azimuthinitialline",
+                    "azimuthofinitialline",
+                    "azimuthatprojectioncenter",
+                    "azimuthatprojectioncentre",
+                ],
+            )
+            .unwrap_or(0.0);
+            let rectified_grid_angle = first_param(
+                &params,
+                &["rectifiedgridangle", "anglefromrectifiedtoskewgrid"],
+            )
+            .unwrap_or(azimuth);
+            ProjectionMethod::HotineObliqueMercator {
+                latc: lat0,
+                lonc: lon0,
+                azimuth,
+                rectified_grid_angle,
+                k0,
+                false_easting: fe,
+                false_northing: fn_,
+                variant_b,
+            }
+        }
+        "cassinisoldner" | "cassini" => ProjectionMethod::CassiniSoldner {
+            lon0,
+            lat0,
             false_easting: fe,
             false_northing: fn_,
         },
@@ -529,25 +621,45 @@ fn parameter_unit_kind(normalized_name: &str) -> ParameterUnitKind {
     match normalized_name {
         "centralmeridian"
         | "longitudeofcenter"
+        | "longitudeofcentre"
+        | "longitudeofprojectioncenter"
+        | "longitudeofprojectioncentre"
         | "longitudeofnaturalorigin"
         | "longitudeoffalseorigin"
         | "longitudeoforigin"
         | "latitudeoforigin"
         | "latitudeofcenter"
+        | "latitudeofcentre"
+        | "latitudeofprojectioncenter"
+        | "latitudeofprojectioncentre"
         | "latitudeofnaturalorigin"
         | "latitudeoffalseorigin"
+        | "azimuth"
+        | "azimuthinitialline"
+        | "azimuthofinitialline"
+        | "azimuthatprojectioncenter"
+        | "azimuthatprojectioncentre"
+        | "rectifiedgridangle"
+        | "anglefromrectifiedtoskewgrid"
         | "standardparallel"
         | "standardparallel1"
         | "standardparallel2"
         | "latitudeofstandardparallel"
         | "latitudeof1ststandardparallel"
         | "latitudeof2ndstandardparallel" => ParameterUnitKind::Angle,
-        "falseeasting" | "falsenorthing" | "eastingatfalseorigin" | "northingatfalseorigin" => {
-            ParameterUnitKind::Length
-        }
-        "scalefactor" | "scalefactoratnaturalorigin" | "scalefactoratprojectionorigin" => {
-            ParameterUnitKind::Scale
-        }
+        "falseeasting"
+        | "falsenorthing"
+        | "eastingatfalseorigin"
+        | "northingatfalseorigin"
+        | "eastingatprojectioncenter"
+        | "eastingatprojectioncentre"
+        | "northingatprojectioncenter"
+        | "northingatprojectioncentre" => ParameterUnitKind::Length,
+        "scalefactor"
+        | "scalefactoratnaturalorigin"
+        | "scalefactoratprojectionorigin"
+        | "scalefactoratprojectioncenter"
+        | "scalefactoratprojectioncentre" => ParameterUnitKind::Scale,
         _ => ParameterUnitKind::Other,
     }
 }

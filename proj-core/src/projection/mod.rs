@@ -1,7 +1,11 @@
 pub(crate) mod albers_equal_area;
+pub(crate) mod cassini_soldner;
 pub(crate) mod equidistant_cylindrical;
+pub(crate) mod hotine_oblique_mercator;
+pub(crate) mod lambert_azimuthal_equal_area;
 pub(crate) mod lambert_conformal_conic;
 pub(crate) mod mercator;
+pub(crate) mod oblique_stereographic;
 pub(crate) mod polar_stereographic;
 pub(crate) mod transverse_mercator;
 pub(crate) mod web_mercator;
@@ -30,6 +34,10 @@ pub(crate) enum Projection {
     PolarStereographic(polar_stereographic::PolarStereographic),
     LambertConformalConic(lambert_conformal_conic::LambertConformalConic),
     AlbersEqualArea(albers_equal_area::AlbersEqualArea),
+    LambertAzimuthalEqualArea(lambert_azimuthal_equal_area::LambertAzimuthalEqualArea),
+    ObliqueStereographic(oblique_stereographic::ObliqueStereographic),
+    HotineObliqueMercator(hotine_oblique_mercator::HotineObliqueMercator),
+    CassiniSoldner(cassini_soldner::CassiniSoldner),
     Mercator(mercator::Mercator),
     EquidistantCylindrical(equidistant_cylindrical::EquidistantCylindrical),
 }
@@ -42,6 +50,10 @@ impl Projection {
             Projection::PolarStereographic(proj) => proj.forward(lon, lat),
             Projection::LambertConformalConic(proj) => proj.forward(lon, lat),
             Projection::AlbersEqualArea(proj) => proj.forward(lon, lat),
+            Projection::LambertAzimuthalEqualArea(proj) => proj.forward(lon, lat),
+            Projection::ObliqueStereographic(proj) => proj.forward(lon, lat),
+            Projection::HotineObliqueMercator(proj) => proj.forward(lon, lat),
+            Projection::CassiniSoldner(proj) => proj.forward(lon, lat),
             Projection::Mercator(proj) => proj.forward(lon, lat),
             Projection::EquidistantCylindrical(proj) => proj.forward(lon, lat),
         }
@@ -54,6 +66,10 @@ impl Projection {
             Projection::PolarStereographic(proj) => proj.inverse(x, y),
             Projection::LambertConformalConic(proj) => proj.inverse(x, y),
             Projection::AlbersEqualArea(proj) => proj.inverse(x, y),
+            Projection::LambertAzimuthalEqualArea(proj) => proj.inverse(x, y),
+            Projection::ObliqueStereographic(proj) => proj.inverse(x, y),
+            Projection::HotineObliqueMercator(proj) => proj.inverse(x, y),
+            Projection::CassiniSoldner(proj) => proj.inverse(x, y),
             Projection::Mercator(proj) => proj.inverse(x, y),
             Projection::EquidistantCylindrical(proj) => proj.inverse(x, y),
         }
@@ -130,6 +146,86 @@ pub(crate) fn make_projection(method: &ProjectionMethod, datum: &Datum) -> Resul
                 lat0.to_radians(),
                 lat1.to_radians(),
                 lat2.to_radians(),
+                *false_easting,
+                *false_northing,
+            )?,
+        )),
+        ProjectionMethod::LambertAzimuthalEqualArea {
+            lon0,
+            lat0,
+            false_easting,
+            false_northing,
+        } => Ok(Projection::LambertAzimuthalEqualArea(
+            lambert_azimuthal_equal_area::LambertAzimuthalEqualArea::new(
+                datum.ellipsoid,
+                lon0.to_radians(),
+                lat0.to_radians(),
+                *false_easting,
+                *false_northing,
+            )?,
+        )),
+        ProjectionMethod::LambertAzimuthalEqualAreaSpherical {
+            lon0,
+            lat0,
+            false_easting,
+            false_northing,
+        } => Ok(Projection::LambertAzimuthalEqualArea(
+            lambert_azimuthal_equal_area::LambertAzimuthalEqualArea::new_spherical(
+                datum.ellipsoid,
+                lon0.to_radians(),
+                lat0.to_radians(),
+                *false_easting,
+                *false_northing,
+            )?,
+        )),
+        ProjectionMethod::ObliqueStereographic {
+            lon0,
+            lat0,
+            k0,
+            false_easting,
+            false_northing,
+        } => Ok(Projection::ObliqueStereographic(
+            oblique_stereographic::ObliqueStereographic::new(
+                datum.ellipsoid,
+                lon0.to_radians(),
+                lat0.to_radians(),
+                *k0,
+                *false_easting,
+                *false_northing,
+            )?,
+        )),
+        ProjectionMethod::HotineObliqueMercator {
+            latc,
+            lonc,
+            azimuth,
+            rectified_grid_angle,
+            k0,
+            false_easting,
+            false_northing,
+            variant_b,
+        } => Ok(Projection::HotineObliqueMercator(
+            hotine_oblique_mercator::HotineObliqueMercator::new(
+                datum.ellipsoid,
+                latc.to_radians(),
+                lonc.to_radians(),
+                azimuth.to_radians(),
+                rectified_grid_angle.to_radians(),
+                *k0,
+                *false_easting,
+                *false_northing,
+                *variant_b,
+            )?,
+        )),
+        ProjectionMethod::CassiniSoldner {
+            lon0,
+            lat0,
+            false_easting,
+            false_northing,
+        } => Ok(Projection::CassiniSoldner(
+            cassini_soldner::CassiniSoldner::new(
+                datum.ellipsoid,
+                lon0.to_radians(),
+                lat0.to_radians(),
                 *false_easting,
                 *false_northing,
             )?,

@@ -263,6 +263,8 @@ fn is_compatible_reversed(
 
 fn requires_no_datum_operation(source: &CrsDef, target: &CrsDef) -> bool {
     (source.epsg() != 0 && source.epsg() == target.epsg())
+        || (source.base_geographic_crs_epsg().is_some()
+            && source.base_geographic_crs_epsg() == target.base_geographic_crs_epsg())
         || source.datum().same_datum(target.datum())
         || (source.datum().is_wgs84_compatible() && target.datum().is_wgs84_compatible())
 }

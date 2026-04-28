@@ -308,6 +308,76 @@ pub enum ProjectionMethod {
         false_northing: f64,
     },
 
+    /// Lambert Azimuthal Equal Area.
+    LambertAzimuthalEqualArea {
+        /// Longitude of natural origin (degrees).
+        lon0: f64,
+        /// Latitude of natural origin (degrees).
+        lat0: f64,
+        /// False easting (meters).
+        false_easting: f64,
+        /// False northing (meters).
+        false_northing: f64,
+    },
+
+    /// Lambert Azimuthal Equal Area (spherical).
+    LambertAzimuthalEqualAreaSpherical {
+        /// Longitude of natural origin (degrees).
+        lon0: f64,
+        /// Latitude of natural origin (degrees).
+        lat0: f64,
+        /// False easting (meters).
+        false_easting: f64,
+        /// False northing (meters).
+        false_northing: f64,
+    },
+
+    /// EPSG Oblique Stereographic (Roussilhe / double stereographic).
+    ObliqueStereographic {
+        /// Longitude of natural origin (degrees).
+        lon0: f64,
+        /// Latitude of natural origin (degrees).
+        lat0: f64,
+        /// Scale factor at natural origin.
+        k0: f64,
+        /// False easting (meters).
+        false_easting: f64,
+        /// False northing (meters).
+        false_northing: f64,
+    },
+
+    /// Hotine Oblique Mercator / Rectified Skew Orthomorphic.
+    HotineObliqueMercator {
+        /// Latitude of projection centre (degrees).
+        latc: f64,
+        /// Longitude of projection centre (degrees).
+        lonc: f64,
+        /// Azimuth of central line at projection centre (degrees clockwise from north).
+        azimuth: f64,
+        /// Angle from rectified to skew grid (degrees).
+        rectified_grid_angle: f64,
+        /// Scale factor at projection centre.
+        k0: f64,
+        /// False easting or easting at projection centre (meters).
+        false_easting: f64,
+        /// False northing or northing at projection centre (meters).
+        false_northing: f64,
+        /// EPSG variant B offsets the natural origin to the projection centre.
+        variant_b: bool,
+    },
+
+    /// Cassini-Soldner.
+    CassiniSoldner {
+        /// Longitude of natural origin (degrees).
+        lon0: f64,
+        /// Latitude of natural origin (degrees).
+        lat0: f64,
+        /// False easting (meters).
+        false_easting: f64,
+        /// False northing (meters).
+        false_northing: f64,
+    },
+
     /// Standard Mercator (ellipsoidal, distinct from Web Mercator).
     Mercator {
         /// Central meridian (degrees).
@@ -429,6 +499,116 @@ fn projection_methods_equivalent(a: &ProjectionMethod, b: &ProjectionMethod) -> 
                 && approx_eq(*a_lat0, *b_lat0)
                 && approx_eq(*a_lat1, *b_lat1)
                 && approx_eq(*a_lat2, *b_lat2)
+                && approx_eq(*a_false_easting, *b_false_easting)
+                && approx_eq(*a_false_northing, *b_false_northing)
+        }
+        (
+            ProjectionMethod::LambertAzimuthalEqualArea {
+                lon0: a_lon0,
+                lat0: a_lat0,
+                false_easting: a_false_easting,
+                false_northing: a_false_northing,
+            },
+            ProjectionMethod::LambertAzimuthalEqualArea {
+                lon0: b_lon0,
+                lat0: b_lat0,
+                false_easting: b_false_easting,
+                false_northing: b_false_northing,
+            },
+        ) => {
+            approx_eq(*a_lon0, *b_lon0)
+                && approx_eq(*a_lat0, *b_lat0)
+                && approx_eq(*a_false_easting, *b_false_easting)
+                && approx_eq(*a_false_northing, *b_false_northing)
+        }
+        (
+            ProjectionMethod::LambertAzimuthalEqualAreaSpherical {
+                lon0: a_lon0,
+                lat0: a_lat0,
+                false_easting: a_false_easting,
+                false_northing: a_false_northing,
+            },
+            ProjectionMethod::LambertAzimuthalEqualAreaSpherical {
+                lon0: b_lon0,
+                lat0: b_lat0,
+                false_easting: b_false_easting,
+                false_northing: b_false_northing,
+            },
+        ) => {
+            approx_eq(*a_lon0, *b_lon0)
+                && approx_eq(*a_lat0, *b_lat0)
+                && approx_eq(*a_false_easting, *b_false_easting)
+                && approx_eq(*a_false_northing, *b_false_northing)
+        }
+        (
+            ProjectionMethod::ObliqueStereographic {
+                lon0: a_lon0,
+                lat0: a_lat0,
+                k0: a_k0,
+                false_easting: a_false_easting,
+                false_northing: a_false_northing,
+            },
+            ProjectionMethod::ObliqueStereographic {
+                lon0: b_lon0,
+                lat0: b_lat0,
+                k0: b_k0,
+                false_easting: b_false_easting,
+                false_northing: b_false_northing,
+            },
+        ) => {
+            approx_eq(*a_lon0, *b_lon0)
+                && approx_eq(*a_lat0, *b_lat0)
+                && approx_eq(*a_k0, *b_k0)
+                && approx_eq(*a_false_easting, *b_false_easting)
+                && approx_eq(*a_false_northing, *b_false_northing)
+        }
+        (
+            ProjectionMethod::HotineObliqueMercator {
+                latc: a_latc,
+                lonc: a_lonc,
+                azimuth: a_azimuth,
+                rectified_grid_angle: a_rectified_grid_angle,
+                k0: a_k0,
+                false_easting: a_false_easting,
+                false_northing: a_false_northing,
+                variant_b: a_variant_b,
+            },
+            ProjectionMethod::HotineObliqueMercator {
+                latc: b_latc,
+                lonc: b_lonc,
+                azimuth: b_azimuth,
+                rectified_grid_angle: b_rectified_grid_angle,
+                k0: b_k0,
+                false_easting: b_false_easting,
+                false_northing: b_false_northing,
+                variant_b: b_variant_b,
+            },
+        ) => {
+            a_variant_b == b_variant_b
+                && approx_eq(*a_latc, *b_latc)
+                && approx_eq(*a_lonc, *b_lonc)
+                && approx_eq(*a_azimuth, *b_azimuth)
+                && approx_eq(*a_rectified_grid_angle, *b_rectified_grid_angle)
+                && approx_eq(*a_k0, *b_k0)
+                && approx_eq(*a_false_easting, *b_false_easting)
+                && approx_eq(*a_false_northing, *b_false_northing)
+        }
+        (
+            ProjectionMethod::CassiniSoldner {
+                lon0: a_lon0,
+                lat0: a_lat0,
+                false_easting: a_false_easting,
+                false_northing: a_false_northing,
+            },
+            ProjectionMethod::CassiniSoldner {
+                lon0: b_lon0,
+                lat0: b_lat0,
+                false_easting: b_false_easting,
+                false_northing: b_false_northing,
+            },
+        ) => {
+            approx_eq(*a_lon0, *b_lon0)
+                && approx_eq(*a_lat0, *b_lat0)
                 && approx_eq(*a_false_easting, *b_false_easting)
                 && approx_eq(*a_false_northing, *b_false_northing)
         }

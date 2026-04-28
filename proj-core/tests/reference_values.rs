@@ -5,7 +5,8 @@
 //! proj-core's output within the specified tolerance.
 //!
 //! The corpus covers:
-//! - All 7 projection types (Web Mercator, UTM, Polar Stereographic, LCC, Albers, Mercator, Equidistant Cylindrical)
+//! - Common projection families (Web Mercator, UTM, Polar Stereographic, LCC, Albers, Mercator,
+//!   Equidistant Cylindrical, LAEA, Oblique Stereographic, Hotine Oblique Mercator, Cassini-Soldner)
 //! - Multiple geographic test points per projection (NYC, Tokyo, London, Paris, poles, dateline, etc.)
 //! - Forward and inverse transforms
 //! - Cross-datum transforms (NAD27→WGS84, OSGB36→WGS84, ED50→WGS84)
@@ -145,6 +146,16 @@ fn corpus_has_adequate_coverage() {
     assert!(epsg_targets.contains(&3395), "missing World Mercator");
     assert!(epsg_targets.contains(&2154), "missing Lambert-93");
     assert!(epsg_targets.contains(&5070), "missing CONUS Albers");
+    assert!(epsg_targets.contains(&3035), "missing LAEA Europe");
+    assert!(epsg_targets.contains(&3408), "missing spherical LAEA north");
+    assert!(
+        epsg_targets.contains(&9311),
+        "missing spherical LAEA ellipsoid CRS"
+    );
+    assert!(epsg_targets.contains(&28992), "missing RD New");
+    assert!(epsg_targets.contains(&3078), "missing Hotine variant A");
+    assert!(epsg_targets.contains(&2056), "missing Hotine variant B");
+    assert!(epsg_targets.contains(&30200), "missing Cassini-Soldner");
     assert!(epsg_targets.contains(&32662), "missing Plate Carree");
 
     // Verify UTM coverage

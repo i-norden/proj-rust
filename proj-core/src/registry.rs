@@ -210,6 +210,14 @@ mod tests {
     }
 
     #[test]
+    fn lookup_new_projection_families() {
+        for epsg in [3035, 3408, 9311, 28992, 3078, 2056, 30200] {
+            let crs = lookup_epsg(epsg).unwrap_or_else(|| panic!("should find EPSG:{epsg}"));
+            assert!(crs.is_projected(), "EPSG:{epsg} should be projected");
+        }
+    }
+
+    #[test]
     fn nc_state_plane() {
         let crs = lookup_epsg(32119).expect("should find NC State Plane");
         assert!(crs.is_projected());

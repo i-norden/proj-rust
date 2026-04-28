@@ -79,6 +79,10 @@ Definitions that require unsupported axis-order, prime-meridian, or geographic a
 | Polar Stereographic | Implemented | 3413, 3031, 3995, 32661, 32761 |
 | Lambert Conformal Conic | Implemented | 2154, 3347 |
 | Albers Equal Area | Implemented | 5070, 3005 |
+| Lambert Azimuthal Equal Area | Implemented | 3035, 3408, 6931, 9311 |
+| Oblique Stereographic | Implemented | 28992, 2953 |
+| Hotine Oblique Mercator / RSO | Implemented | 2056, 3078, 3375 |
+| Cassini-Soldner | Implemented | 30200, 3377 |
 | Mercator | Implemented | 3395 |
 | Equidistant Cylindrical | Implemented | 32662 |
 
