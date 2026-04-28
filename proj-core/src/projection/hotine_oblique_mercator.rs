@@ -7,7 +7,6 @@ use crate::projection::{
 
 const POLE_EPSILON: f64 = 1e-12;
 const ECCENTRICITY_EPSILON: f64 = 1e-15;
-const RIGHT_ANGLE_EPSILON: f64 = 1e-12;
 
 /// Hotine Oblique Mercator / Rectified Skew Orthomorphic projection.
 ///
@@ -74,11 +73,7 @@ impl HotineObliqueMercator {
         let lon0 = lonc - (g * gamma0.tan()).clamp(-1.0, 1.0).asin() / b;
 
         let u_c = if variant_b {
-            if azimuth.cos().abs() < RIGHT_ANGLE_EPSILON {
-                a_const * (lonc - lon0)
-            } else {
-                (a_const / b) * (d_sq - 1.0).sqrt().atan2(azimuth.cos()) * latc.signum()
-            }
+            (a_const / b) * (d_sq - 1.0).sqrt().atan2(azimuth.cos()) * latc.signum()
         } else {
             0.0
         };
