@@ -1,7 +1,9 @@
 use crate::ellipsoid::{self, Ellipsoid};
+use crate::grid::GridDefinition;
+use smallvec::SmallVec;
 
 /// A geodetic datum, defined by a reference ellipsoid and its relationship to WGS84.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct Datum {
     /// The reference ellipsoid.
     pub ellipsoid: Ellipsoid,
@@ -20,15 +22,23 @@ impl Datum {
         !matches!(self.to_wgs84, DatumToWgs84::Unknown)
     }
 
+    /// Returns true if this datum's WGS84 path uses one or more horizontal grids.
+    pub fn uses_grid_shift(&self) -> bool {
+        self.to_wgs84.uses_grid_shift()
+    }
+
     /// Return the Helmert parameters for this datum's path to WGS84, when available.
     pub fn helmert_to_wgs84(&self) -> Option<&HelmertParams> {
         match &self.to_wgs84 {
             DatumToWgs84::Helmert(params) => Some(params),
-            DatumToWgs84::Identity | DatumToWgs84::Unknown => None,
+            DatumToWgs84::Identity | DatumToWgs84::GridShift(_) | DatumToWgs84::Unknown => None,
         }
     }
 
     pub fn approximate_helmert_to(&self, target: &Datum) -> Option<HelmertParams> {
+        if self.uses_grid_shift() || target.uses_grid_shift() {
+            return None;
+        }
         if !self.has_known_wgs84_transform() || !target.has_known_wgs84_transform() {
             return None;
         }
@@ -55,6 +65,7 @@ impl Datum {
             (DatumToWgs84::Helmert(a), DatumToWgs84::Helmert(b)) => {
                 same_ellipsoid && a.approx_eq(b)
             }
+            (DatumToWgs84::GridShift(a), DatumToWgs84::GridShift(b)) => same_ellipsoid && a == b,
             (DatumToWgs84::Unknown, DatumToWgs84::Unknown) => false,
             _ => false,
         }
@@ -62,14 +73,62 @@ impl Datum {
 }
 
 /// Explicit WGS84 relationship for a datum.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum DatumToWgs84 {
     /// The datum can be treated as WGS84-compatible in the current model.
     Identity,
     /// The datum requires the provided Helmert transform to reach WGS84.
     Helmert(HelmertParams),
+    /// The datum requires horizontal grid interpolation to reach WGS84.
+    GridShift(DatumGridShift),
     /// The datum's path to WGS84 is not known.
     Unknown,
+}
+
+impl DatumToWgs84 {
+    pub fn uses_grid_shift(&self) -> bool {
+        matches!(self, DatumToWgs84::GridShift(shift) if shift.uses_grid_shift())
+    }
+}
+
+/// Ordered PROJ-style datum grid list.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DatumGridShift {
+    entries: SmallVec<[DatumGridShiftEntry; 4]>,
+}
+
+impl DatumGridShift {
+    pub fn new(entries: SmallVec<[DatumGridShiftEntry; 4]>) -> Self {
+        Self { entries }
+    }
+
+    pub fn from_vec(entries: Vec<DatumGridShiftEntry>) -> Self {
+        Self {
+            entries: SmallVec::from_vec(entries),
+        }
+    }
+
+    pub fn entries(&self) -> &[DatumGridShiftEntry] {
+        &self.entries
+    }
+
+    pub fn uses_grid_shift(&self) -> bool {
+        self.entries
+            .iter()
+            .any(|entry| matches!(entry, DatumGridShiftEntry::Grid { .. }))
+    }
+}
+
+/// One entry from a datum grid list.
+#[derive(Debug, Clone, PartialEq)]
+pub enum DatumGridShiftEntry {
+    /// Try this horizontal grid. Optional grids may be missing from providers.
+    Grid {
+        definition: GridDefinition,
+        optional: bool,
+    },
+    /// PROJ's `null` grid: stop grid lookup and apply no shift.
+    Null,
 }
 
 /// 7-parameter Helmert (Bursa-Wolf) transformation parameters.

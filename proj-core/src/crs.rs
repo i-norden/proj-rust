@@ -76,7 +76,7 @@ impl LinearUnit {
 }
 
 /// A Coordinate Reference System definition.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub enum CrsDef {
     /// Geographic CRS (lon/lat in degrees).
     Geographic(GeographicCrsDef),
@@ -145,7 +145,7 @@ impl CrsDef {
 }
 
 /// Definition of a geographic CRS (longitude, latitude in degrees).
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct GeographicCrsDef {
     epsg: u32,
     datum: Datum,
@@ -171,7 +171,7 @@ impl GeographicCrsDef {
 }
 
 /// Definition of a projected CRS (easting, northing in the CRS's native linear unit).
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct ProjectedCrsDef {
     epsg: u32,
     base_geographic_crs_epsg: u32,

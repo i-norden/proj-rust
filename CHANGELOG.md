@@ -10,6 +10,7 @@
 - make transform construction operation-aware with typed area-of-interest selection, inverse-aware metadata, and indexed operation lookup instead of registry-wide scans
 - switch projections onto precomputed enum-backed hot paths and compiled transform pipelines, improving construction and execution costs
 - tighten CRS parsing semantics across WKT, PROJJSON, and authority wrappers, rejecting contradictory or unsupported inputs instead of silently normalizing them
+- add PROJ string `+nadgrids` support for NTv2-backed custom datum shifts through the existing `GridProvider` pipeline, including optional grid entries and explicit rejection of conflicting or unsupported grid parameters
 - refresh live bundled C PROJ parity coverage, benchmark coverage, and the published benchmark report for the new operation-selection and 3D paths
 - continue to scope the release as a supported `0.x` line rather than a claim of full PROJ feature parity
 

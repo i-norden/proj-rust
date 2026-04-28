@@ -1,6 +1,6 @@
 use crate::coord::{Bounds, Coord};
 use crate::crs::{LinearUnit, ProjectionMethod};
-use crate::datum::HelmertParams;
+use crate::datum::{DatumToWgs84, HelmertParams};
 use smallvec::SmallVec;
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -180,6 +180,10 @@ pub enum OperationMethod {
         interpolation: GridInterpolation,
         direction: GridShiftDirection,
     },
+    DatumShift {
+        source_to_wgs84: DatumToWgs84,
+        target_to_wgs84: DatumToWgs84,
+    },
     Projection {
         forward: bool,
         method: ProjectionMethod,
@@ -259,6 +263,10 @@ impl CoordinateOperation {
     fn uses_grids_with_visited(&self, visited: &mut HashSet<CoordinateOperationId>) -> bool {
         match &self.method {
             OperationMethod::GridShift { .. } => true,
+            OperationMethod::DatumShift {
+                source_to_wgs84,
+                target_to_wgs84,
+            } => source_to_wgs84.uses_grid_shift() || target_to_wgs84.uses_grid_shift(),
             OperationMethod::Concatenated { steps } => steps.iter().any(|step| {
                 if !visited.insert(step.operation_id) {
                     return false;

@@ -1,9 +1,8 @@
 use crate::coord::{Bounds, Coord, Coord3D, Transformable, Transformable3D};
 use crate::crs::CrsDef;
-use crate::datum::HelmertParams;
+use crate::datum::{DatumGridShift, DatumGridShiftEntry, DatumToWgs84, HelmertParams};
 use crate::ellipsoid::Ellipsoid;
 use crate::error::{Error, Result};
-use crate::geocentric;
 use crate::grid::{GridError, GridHandle, GridRuntime};
 use crate::helmert;
 use crate::operation::{
@@ -14,6 +13,7 @@ use crate::operation::{
 use crate::projection::{make_projection, Projection};
 use crate::registry;
 use crate::selector;
+use crate::{ellipsoid, geocentric};
 use smallvec::SmallVec;
 
 #[cfg(feature = "rayon")]
@@ -60,6 +60,11 @@ enum CompiledStep {
     },
     GridShift {
         handle: GridHandle,
+        direction: GridShiftDirection,
+    },
+    GridShiftList {
+        handles: SmallVec<[GridHandle; 4]>,
+        allow_null: bool,
         direction: GridShiftDirection,
     },
     GeodeticToGeocentric {
@@ -117,7 +122,11 @@ impl Transform {
         Self::from_crs_defs_with_selection_options(from, to, SelectionOptions::default())
     }
 
-    fn from_crs_defs_with_selection_options(
+    /// Create a transform from explicit CRS definitions with operation-selection options.
+    ///
+    /// Use this when a custom CRS references grid resources and the transform
+    /// needs an application-supplied [`crate::grid::GridProvider`].
+    pub fn from_crs_defs_with_selection_options(
         from: &CrsDef,
         to: &CrsDef,
         options: SelectionOptions,
@@ -236,8 +245,8 @@ impl Transform {
                 missing_required_grid,
             };
             return Ok(Self {
-                source: *from,
-                target: *to,
+                source: from.clone(),
+                target: to.clone(),
                 selected_operation_definition: candidate.operation.clone().into_owned(),
                 selected_direction: candidate.direction,
                 selected_operation: metadata,
@@ -357,8 +366,8 @@ impl Transform {
             missing_required_grid: self.diagnostics.missing_required_grid.clone(),
         };
         Ok(Self {
-            source: self.target,
-            target: self.source,
+            source: self.target.clone(),
+            target: self.source.clone(),
             selected_operation_definition: self.selected_operation_definition.clone(),
             selected_direction,
             selected_operation,
@@ -505,7 +514,7 @@ impl Transform {
     }
 
     fn source_projected_native_to_meters(&self, x: f64, y: f64) -> (f64, f64) {
-        match self.source {
+        match &self.source {
             CrsDef::Projected(projected) => (
                 projected.linear_unit().to_meters(x),
                 projected.linear_unit().to_meters(y),
@@ -515,7 +524,7 @@ impl Transform {
     }
 
     fn projected_meters_to_target_native(&self, x: f64, y: f64) -> (f64, f64) {
-        match self.target {
+        match &self.target {
             CrsDef::Projected(projected) => (
                 projected.linear_unit().from_meters(x),
                 projected.linear_unit().from_meters(y),
@@ -748,6 +757,30 @@ fn execute_step(step: &CompiledStep, coord: Coord3D) -> Result<Coord3D> {
             let (lon, lat) = handle.apply(coord.x, coord.y, *direction)?;
             Ok(Coord3D::new(lon, lat, coord.z))
         }
+        CompiledStep::GridShiftList {
+            handles,
+            allow_null,
+            direction,
+        } => {
+            let mut last_coverage_miss = None;
+            for handle in handles {
+                match handle.apply(coord.x, coord.y, *direction) {
+                    Ok((lon, lat)) => return Ok(Coord3D::new(lon, lat, coord.z)),
+                    Err(GridError::OutsideCoverage(detail)) => {
+                        last_coverage_miss = Some(detail);
+                    }
+                    Err(error) => return Err(Error::Grid(error)),
+                }
+            }
+
+            if *allow_null {
+                return Ok(coord);
+            }
+
+            Err(Error::Grid(GridError::OutsideCoverage(
+                last_coverage_miss.unwrap_or_else(|| "no datum grid covered coordinate".into()),
+            )))
+        }
         CompiledStep::GeodeticToGeocentric { ellipsoid } => {
             let (x, y, z) =
                 geocentric::geodetic_to_geocentric(ellipsoid, coord.x, coord.y, coord.z);
@@ -833,6 +866,46 @@ fn compile_operation(
             });
         }
         (
+            OperationMethod::DatumShift {
+                source_to_wgs84,
+                target_to_wgs84,
+            },
+            OperationStepDirection::Forward,
+        ) => {
+            compile_to_wgs84(
+                source_to_wgs84,
+                source_geo.datum().ellipsoid,
+                grid_runtime,
+                steps,
+            )?;
+            compile_from_wgs84(
+                target_to_wgs84,
+                target_geo.datum().ellipsoid,
+                grid_runtime,
+                steps,
+            )?;
+        }
+        (
+            OperationMethod::DatumShift {
+                source_to_wgs84,
+                target_to_wgs84,
+            },
+            OperationStepDirection::Reverse,
+        ) => {
+            compile_to_wgs84(
+                target_to_wgs84,
+                source_geo.datum().ellipsoid,
+                grid_runtime,
+                steps,
+            )?;
+            compile_from_wgs84(
+                source_to_wgs84,
+                target_geo.datum().ellipsoid,
+                grid_runtime,
+                steps,
+            )?;
+        }
+        (
             OperationMethod::GridShift {
                 grid_id,
                 direction: grid_direction,
@@ -883,6 +956,117 @@ fn compile_operation(
     Ok(())
 }
 
+fn compile_to_wgs84(
+    transform: &DatumToWgs84,
+    source_ellipsoid: Ellipsoid,
+    grid_runtime: &GridRuntime,
+    steps: &mut SmallVec<[CompiledStep; 8]>,
+) -> Result<()> {
+    match transform {
+        DatumToWgs84::Identity => Ok(()),
+        DatumToWgs84::Helmert(params) => {
+            steps.push(CompiledStep::GeodeticToGeocentric {
+                ellipsoid: source_ellipsoid,
+            });
+            steps.push(CompiledStep::Helmert {
+                params: *params,
+                inverse: false,
+            });
+            steps.push(CompiledStep::GeocentricToGeodetic {
+                ellipsoid: ellipsoid::WGS84,
+            });
+            Ok(())
+        }
+        DatumToWgs84::GridShift(grids) => {
+            compile_grid_shift_list(grids, GridShiftDirection::Forward, grid_runtime, steps)
+        }
+        DatumToWgs84::Unknown => Err(Error::OperationSelection(
+            "datum has no known path to WGS84".into(),
+        )),
+    }
+}
+
+fn compile_from_wgs84(
+    transform: &DatumToWgs84,
+    target_ellipsoid: Ellipsoid,
+    grid_runtime: &GridRuntime,
+    steps: &mut SmallVec<[CompiledStep; 8]>,
+) -> Result<()> {
+    match transform {
+        DatumToWgs84::Identity => Ok(()),
+        DatumToWgs84::Helmert(params) => {
+            steps.push(CompiledStep::GeodeticToGeocentric {
+                ellipsoid: ellipsoid::WGS84,
+            });
+            steps.push(CompiledStep::Helmert {
+                params: *params,
+                inverse: true,
+            });
+            steps.push(CompiledStep::GeocentricToGeodetic {
+                ellipsoid: target_ellipsoid,
+            });
+            Ok(())
+        }
+        DatumToWgs84::GridShift(grids) => {
+            compile_grid_shift_list(grids, GridShiftDirection::Reverse, grid_runtime, steps)
+        }
+        DatumToWgs84::Unknown => Err(Error::OperationSelection(
+            "datum has no known path from WGS84".into(),
+        )),
+    }
+}
+
+fn compile_grid_shift_list(
+    grids: &DatumGridShift,
+    direction: GridShiftDirection,
+    grid_runtime: &GridRuntime,
+    steps: &mut SmallVec<[CompiledStep; 8]>,
+) -> Result<()> {
+    let mut handles = SmallVec::<[GridHandle; 4]>::new();
+    let mut allow_null = false;
+    let mut required_grid_seen = false;
+
+    for entry in grids.entries() {
+        match entry {
+            DatumGridShiftEntry::Null => {
+                allow_null = true;
+                break;
+            }
+            DatumGridShiftEntry::Grid {
+                definition,
+                optional,
+            } => {
+                if !optional {
+                    required_grid_seen = true;
+                }
+                match grid_runtime.resolve_handle(definition) {
+                    Ok(handle) => handles.push(handle),
+                    Err(GridError::Unavailable(_) | GridError::NotFound(_)) if *optional => {}
+                    Err(error) => return Err(Error::Grid(error)),
+                }
+            }
+        }
+    }
+
+    if handles.is_empty() && !allow_null {
+        if required_grid_seen {
+            return Err(Error::Grid(GridError::Unavailable(
+                "no required datum grid could be loaded".into(),
+            )));
+        }
+        return Err(Error::Grid(GridError::Unavailable(
+            "no optional datum grid could be loaded".into(),
+        )));
+    }
+
+    steps.push(CompiledStep::GridShiftList {
+        handles,
+        allow_null,
+        direction,
+    });
+    Ok(())
+}
+
 fn resolve_operation_geographic_pair(
     operation: &CoordinateOperation,
     direction: OperationStepDirection,
@@ -909,10 +1093,7 @@ fn resolve_operation_geographic_pair(
     }
 
     if let Some((source, target)) = requested_pair {
-        return Ok(match direction {
-            OperationStepDirection::Forward => (*source, *target),
-            OperationStepDirection::Reverse => (*target, *source),
-        });
+        return Ok((source.clone(), target.clone()));
     }
 
     Err(Error::OperationSelection(format!(
@@ -1439,7 +1620,7 @@ mod tests {
         };
         let from = CrsDef::Projected(ProjectedCrsDef::new(
             0,
-            unknown,
+            unknown.clone(),
             ProjectionMethod::WebMercator,
             LinearUnit::metre(),
             "Unknown A",

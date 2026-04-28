@@ -533,7 +533,7 @@ fn read_static_string(data: &[u8], offset: usize, len: usize) -> &'static str {
 }
 
 pub(crate) fn lookup_datum(code: u32) -> Option<Datum> {
-    db().datums.get(&code).copied()
+    db().datums.get(&code).cloned()
 }
 
 pub(crate) fn lookup_geographic(code: u32) -> Option<CrsDef> {
@@ -541,7 +541,7 @@ pub(crate) fn lookup_geographic(code: u32) -> Option<CrsDef> {
     let datum = db().datums.get(&record.datum_code)?;
     Some(CrsDef::Geographic(GeographicCrsDef::new(
         code,
-        *datum,
+        datum.clone(),
         record.name,
     )))
 }
@@ -553,7 +553,7 @@ pub(crate) fn lookup_projected(code: u32) -> Option<CrsDef> {
         ProjectedCrsDef::new_with_base_geographic_crs(
             code,
             record.base_geographic_crs_epsg,
-            *datum,
+            datum.clone(),
             record.method,
             record.linear_unit,
             record.name,

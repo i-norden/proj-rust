@@ -35,7 +35,9 @@ mod projjson;
 mod semantics;
 mod wkt;
 
-use proj_core::{Bounds, Coord, Coord3D, CrsDef, Transform, Transformable, Transformable3D};
+use proj_core::{
+    Bounds, Coord, Coord3D, CrsDef, SelectionOptions, Transform, Transformable, Transformable3D,
+};
 
 /// Parse error.
 #[derive(Debug, thiserror::Error)]
@@ -137,6 +139,23 @@ pub fn transform_from_crs_strings(
     let from_crs = parse_crs(from)?;
     let to_crs = parse_crs(to)?;
     Ok(proj_core::Transform::from_crs_defs(&from_crs, &to_crs)?)
+}
+
+/// Create a [`Transform`] from two CRS strings using explicit selection options.
+///
+/// This is the path for parsed PROJ strings that reference external resources
+/// such as `+nadgrids`, because callers can provide a [`proj_core::GridProvider`]
+/// through [`SelectionOptions::grid_provider`].
+pub fn transform_from_crs_strings_with_selection_options(
+    from: &str,
+    to: &str,
+    options: SelectionOptions,
+) -> std::result::Result<proj_core::Transform, ParseError> {
+    let from_crs = parse_crs(from)?;
+    let to_crs = parse_crs(to)?;
+    Ok(proj_core::Transform::from_crs_defs_with_selection_options(
+        &from_crs, &to_crs, options,
+    )?)
 }
 
 /// Lightweight compatibility facade for downstream code that currently expects
@@ -304,6 +323,18 @@ mod tests {
     #[test]
     fn transform_from_strings() {
         let t = transform_from_crs_strings("EPSG:4326", "EPSG:3857").unwrap();
+        let (x, _y) = t.convert((-74.006, 40.7128)).unwrap();
+        assert!((x - (-8238310.0)).abs() < 100.0);
+    }
+
+    #[test]
+    fn transform_from_strings_with_selection_options() {
+        let t = transform_from_crs_strings_with_selection_options(
+            "EPSG:4326",
+            "EPSG:3857",
+            SelectionOptions::default(),
+        )
+        .unwrap();
         let (x, _y) = t.convert((-74.006, 40.7128)).unwrap();
         assert!((x - (-8238310.0)).abs() < 100.0);
     }

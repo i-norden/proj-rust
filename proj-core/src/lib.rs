@@ -48,7 +48,7 @@ pub mod transform;
 
 pub use coord::{Bounds, Coord, Coord3D, Transformable, Transformable3D};
 pub use crs::{CrsDef, GeographicCrsDef, LinearUnit, ProjectedCrsDef, ProjectionMethod};
-pub use datum::{Datum, DatumToWgs84, HelmertParams};
+pub use datum::{Datum, DatumGridShift, DatumGridShiftEntry, DatumToWgs84, HelmertParams};
 pub use ellipsoid::Ellipsoid;
 pub use error::{Error, Result};
 pub use grid::{

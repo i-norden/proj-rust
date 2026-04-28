@@ -1,16 +1,24 @@
 use std::collections::HashMap;
+use std::path::{Component, Path};
 
 use proj_core::crs::*;
 use proj_core::datum;
 use proj_core::ellipsoid;
 use proj_core::Datum;
+use proj_core::DatumGridShift;
+use proj_core::DatumGridShiftEntry;
 use proj_core::DatumToWgs84;
+use proj_core::GridDefinition;
+use proj_core::GridFormat;
+use proj_core::GridId;
+use proj_core::GridInterpolation;
 
 use crate::semantics::normalize_key;
 use crate::{ParseError, Result};
 
 const COMMON_PROJ_PARAMS: &[&str] = &[
-    "proj", "datum", "ellps", "towgs84", "pm", "axis", "lon_wrap", "over", "no_defs", "type",
+    "proj", "datum", "ellps", "towgs84", "nadgrids", "pm", "axis", "lon_wrap", "over", "no_defs",
+    "type",
 ];
 const LINEAR_UNIT_PARAMS: &[&str] = &["units", "to_meter"];
 const GEOGRAPHIC_UNIT_PARAMS: &[&str] = &["units", "to_meter"];
@@ -98,6 +106,12 @@ fn parse_init_authority(params: &HashMap<String, String>) -> Result<Option<CrsDe
 
 fn resolve_datum(params: &HashMap<String, String>) -> Result<Datum> {
     let towgs84 = parse_towgs84(params)?;
+    let nadgrids = parse_nadgrids(params)?;
+    if towgs84.is_some() && nadgrids.is_some() {
+        return Err(ParseError::UnsupportedSemantics(
+            "PROJ datum definition cannot combine +towgs84 and +nadgrids".into(),
+        ));
+    }
 
     if let Some(d) = params.get("datum") {
         let mut datum = match d.to_uppercase().as_str() {
@@ -116,6 +130,9 @@ fn resolve_datum(params: &HashMap<String, String>) -> Result<Datum> {
         };
         if let Some(to_wgs84) = towgs84 {
             datum.to_wgs84 = to_wgs84;
+        }
+        if let Some(grid_shift) = nadgrids {
+            datum.to_wgs84 = datum_grid_shift_to_wgs84(grid_shift);
         }
         return Ok(datum);
     }
@@ -138,7 +155,9 @@ fn resolve_datum(params: &HashMap<String, String>) -> Result<Datum> {
         return Ok(proj_core::Datum {
             ellipsoid: ellps,
             to_wgs84: towgs84.unwrap_or_else(|| {
-                if (ellps.a - ellipsoid::WGS84.a).abs() < 1e-9
+                if let Some(grid_shift) = nadgrids {
+                    datum_grid_shift_to_wgs84(grid_shift)
+                } else if (ellps.a - ellipsoid::WGS84.a).abs() < 1e-9
                     && (ellps.f - ellipsoid::WGS84.f).abs() < 1e-15
                 {
                     DatumToWgs84::Identity
@@ -146,6 +165,13 @@ fn resolve_datum(params: &HashMap<String, String>) -> Result<Datum> {
                     DatumToWgs84::Unknown
                 }
             }),
+        });
+    }
+
+    if let Some(grid_shift) = nadgrids {
+        return Ok(proj_core::Datum {
+            ellipsoid: ellipsoid::WGS84,
+            to_wgs84: datum_grid_shift_to_wgs84(grid_shift),
         });
     }
 
@@ -157,6 +183,109 @@ fn resolve_datum(params: &HashMap<String, String>) -> Result<Datum> {
     }
 
     Ok(datum::WGS84)
+}
+
+fn datum_grid_shift_to_wgs84(grid_shift: DatumGridShift) -> DatumToWgs84 {
+    if grid_shift.uses_grid_shift() {
+        DatumToWgs84::GridShift(grid_shift)
+    } else {
+        DatumToWgs84::Identity
+    }
+}
+
+fn parse_nadgrids(params: &HashMap<String, String>) -> Result<Option<DatumGridShift>> {
+    let Some(value) = params.get("nadgrids") else {
+        return Ok(None);
+    };
+    if value.trim().is_empty() {
+        return Err(ParseError::Parse(
+            "+nadgrids requires at least one grid name".into(),
+        ));
+    }
+
+    let mut entries = Vec::new();
+    for raw_entry in value.split(',') {
+        let raw_entry = raw_entry.trim();
+        if raw_entry.is_empty() {
+            return Err(ParseError::Parse(
+                "+nadgrids contains an empty grid name".into(),
+            ));
+        }
+
+        let (optional, resource_name) = raw_entry
+            .strip_prefix('@')
+            .map(|name| (true, name))
+            .unwrap_or((false, raw_entry));
+        if resource_name.is_empty() {
+            return Err(ParseError::Parse(
+                "+nadgrids contains an empty grid name".into(),
+            ));
+        }
+        if resource_name.eq_ignore_ascii_case("null") {
+            entries.push(DatumGridShiftEntry::Null);
+            continue;
+        }
+        validate_grid_resource_name(resource_name)?;
+        entries.push(DatumGridShiftEntry::Grid {
+            definition: GridDefinition {
+                id: GridId(synthetic_grid_id(resource_name)),
+                name: resource_name.to_string(),
+                format: infer_grid_format(resource_name),
+                interpolation: GridInterpolation::Bilinear,
+                area_of_use: None,
+                resource_names: smallvec_from_one(resource_name.to_string()),
+            },
+            optional,
+        });
+    }
+
+    if entries.is_empty() {
+        return Err(ParseError::Parse(
+            "+nadgrids requires at least one grid name".into(),
+        ));
+    }
+
+    Ok(Some(DatumGridShift::from_vec(entries)))
+}
+
+fn smallvec_from_one(value: String) -> smallvec::SmallVec<[String; 2]> {
+    smallvec::SmallVec::from_vec(vec![value])
+}
+
+fn validate_grid_resource_name(resource_name: &str) -> Result<()> {
+    let path = Path::new(resource_name);
+    if path.components().any(|component| {
+        matches!(
+            component,
+            Component::Prefix(_) | Component::RootDir | Component::ParentDir
+        )
+    }) {
+        return Err(ParseError::UnsupportedSemantics(format!(
+            "+nadgrids resource `{resource_name}` must be a relative grid resource name"
+        )));
+    }
+    Ok(())
+}
+
+fn infer_grid_format(resource_name: &str) -> GridFormat {
+    let normalized = resource_name.to_ascii_lowercase();
+    if normalized.ends_with(".gsb") || normalized.ends_with(".ntv2") {
+        GridFormat::Ntv2
+    } else {
+        GridFormat::Unsupported
+    }
+}
+
+fn synthetic_grid_id(resource_name: &str) -> u32 {
+    const FNV_OFFSET: u32 = 0x811c9dc5;
+    const FNV_PRIME: u32 = 0x01000193;
+    let hash = resource_name
+        .as_bytes()
+        .iter()
+        .fold(FNV_OFFSET, |hash, byte| {
+            (hash ^ u32::from(*byte)).wrapping_mul(FNV_PRIME)
+        });
+    0x8000_0000 | (hash & 0x7fff_ffff)
 }
 
 fn parse_towgs84(params: &HashMap<String, String>) -> Result<Option<DatumToWgs84>> {
@@ -638,7 +767,7 @@ fn validate_supported_proj_params(
 
 fn unsupported_proj_parameter_error(context: &str, key: &str) -> ParseError {
     let detail = match key {
-        "nadgrids" => "grid-based horizontal datum shifts are not supported in PROJ strings",
+        "nadgrids" => "grid-based horizontal datum shifts are only supported on full PROJ CRS definitions",
         "geoidgrids" => "vertical geoid grid shifts are not supported in PROJ strings",
         "vunits" | "vto_meter" => "vertical coordinate units are not supported in PROJ strings",
         "a" | "b" | "es" | "f" | "rf" | "r" => {
@@ -779,7 +908,7 @@ mod tests {
         ).unwrap();
         assert!(crs.is_projected());
         if let CrsDef::Projected(p) = &crs {
-            assert!(matches!(p.datum().to_wgs84, DatumToWgs84::Helmert(_)));
+            assert!(matches!(&p.datum().to_wgs84, DatumToWgs84::Helmert(_)));
         }
     }
 
@@ -839,17 +968,72 @@ mod tests {
     }
 
     #[test]
-    fn reject_grid_shift_proj_params() {
-        let err = parse_proj_string("+proj=longlat +ellps=WGS84 +nadgrids=conus").unwrap_err();
-        assert!(err
-            .to_string()
-            .contains("unsupported PROJ parameter `+nadgrids`"));
+    fn parse_nadgrids_datum_shift() {
+        let crs =
+            parse_proj_string("+proj=longlat +ellps=clrk66 +nadgrids=@missing.gsb,ntv2_0.gsb")
+                .unwrap();
+        let DatumToWgs84::GridShift(grids) = &crs.datum().to_wgs84 else {
+            panic!("expected grid shift datum");
+        };
+        assert_eq!(grids.entries().len(), 2);
+    }
 
+    #[test]
+    fn parse_nadgrids_null_as_identity_shift() {
+        let crs = parse_proj_string("+proj=longlat +ellps=WGS84 +nadgrids=@null").unwrap();
+        assert!(matches!(&crs.datum().to_wgs84, DatumToWgs84::Identity));
+    }
+
+    #[test]
+    fn nadgrids_transform_uses_grid_provider_path() {
+        let from =
+            parse_proj_string("+proj=longlat +ellps=clrk66 +nadgrids=@missing.gsb,ntv2_0.gsb")
+                .unwrap();
+        let to = parse_proj_string("+proj=longlat +datum=WGS84").unwrap();
+        let transform = proj_core::Transform::from_crs_defs(&from, &to).unwrap();
+
+        let (lon, lat) = transform.convert((-80.5041667, 44.5458333)).unwrap();
+
+        assert!((lon - (-80.50401615833)).abs() < 1e-6, "lon={lon}");
+        assert!((lat - 44.5458827236).abs() < 3e-6, "lat={lat}");
+
+        let inverse = transform.inverse().unwrap();
+        let (back_lon, back_lat) = inverse.convert((lon, lat)).unwrap();
+
+        assert!((back_lon - (-80.5041667)).abs() < 1e-6, "lon={back_lon}");
+        assert!((back_lat - 44.5458333).abs() < 3e-6, "lat={back_lat}");
+    }
+
+    #[test]
+    fn required_nadgrids_resource_must_load() {
+        let from = parse_proj_string("+proj=longlat +ellps=clrk66 +nadgrids=missing.gsb").unwrap();
+        let to = parse_proj_string("+proj=longlat +datum=WGS84").unwrap();
+        let err = match proj_core::Transform::from_crs_defs(&from, &to) {
+            Ok(_) => panic!("expected missing grid to fail"),
+            Err(err) => err,
+        };
+
+        assert!(err.to_string().contains("grid resource unavailable"));
+    }
+
+    #[test]
+    fn reject_unsupported_grid_shift_proj_params() {
         let err =
             parse_proj_string("+proj=longlat +ellps=WGS84 +geoidgrids=egm96_15.gtx").unwrap_err();
         assert!(err
             .to_string()
             .contains("unsupported PROJ parameter `+geoidgrids`"));
+
+        let err =
+            parse_proj_string("+proj=longlat +ellps=clrk66 +nadgrids=../ntv2_0.gsb").unwrap_err();
+        assert!(err.to_string().contains("relative grid resource name"));
+
+        let err =
+            parse_proj_string("+proj=longlat +ellps=clrk66 +towgs84=1,2,3 +nadgrids=ntv2_0.gsb")
+                .unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("cannot combine +towgs84 and +nadgrids"));
     }
 
     #[test]

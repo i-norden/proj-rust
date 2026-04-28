@@ -430,7 +430,7 @@ fn parse_structured_ellipsoid_from_json(value: &Value) -> Option<StructuredEllip
 fn resolve_structured_datum(datum_name: &str, ellipsoid: &StructuredEllipsoid) -> Option<Datum> {
     for (datum_aliases, ellipsoid_aliases, datum, ellipsoid_epsg) in datum_candidates() {
         if datum_aliases.contains(&datum_name)
-            && ellipsoid_matches(ellipsoid, datum, ellipsoid_aliases, ellipsoid_epsg)
+            && ellipsoid_matches(ellipsoid, &datum, ellipsoid_aliases, ellipsoid_epsg)
         {
             return Some(datum);
         }
@@ -442,7 +442,7 @@ fn resolve_structured_datum(datum_name: &str, ellipsoid: &StructuredEllipsoid) -
 fn resolve_named_datum(datum_name: &str) -> Option<Datum> {
     datum_candidates()
         .iter()
-        .find_map(|(aliases, _, datum, _)| aliases.contains(&datum_name).then_some(*datum))
+        .find_map(|(aliases, _, datum, _)| aliases.contains(&datum_name).then_some(datum.clone()))
 }
 
 fn datum_candidates() -> [DatumCandidate; 8] {
@@ -509,7 +509,7 @@ fn datum_candidates() -> [DatumCandidate; 8] {
 
 fn ellipsoid_matches(
     actual: &StructuredEllipsoid,
-    datum: Datum,
+    datum: &Datum,
     aliases: &[&str],
     epsg: Option<u32>,
 ) -> bool {

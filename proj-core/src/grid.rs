@@ -85,8 +85,8 @@ impl GridHandle {
 
 pub(crate) struct GridRuntime {
     providers: Vec<Arc<dyn GridProvider>>,
-    definition_cache: Mutex<HashMap<GridId, GridDefinition>>,
-    handle_cache: Mutex<HashMap<GridId, GridHandle>>,
+    definition_cache: Mutex<HashMap<String, GridDefinition>>,
+    handle_cache: Mutex<HashMap<String, GridHandle>>,
 }
 
 impl GridRuntime {
@@ -107,11 +107,12 @@ impl GridRuntime {
         &self,
         grid: &GridDefinition,
     ) -> std::result::Result<GridDefinition, GridError> {
+        let cache_key = grid_runtime_cache_key(grid);
         if let Some(cached) = self
             .definition_cache
             .lock()
             .expect("grid definition cache poisoned")
-            .get(&grid.id)
+            .get(&cache_key)
             .cloned()
         {
             return Ok(cached);
@@ -122,7 +123,7 @@ impl GridRuntime {
                 self.definition_cache
                     .lock()
                     .expect("grid definition cache poisoned")
-                    .insert(grid.id, definition.clone());
+                    .insert(cache_key, definition.clone());
                 return Ok(definition);
             }
         }
@@ -134,11 +135,12 @@ impl GridRuntime {
         &self,
         grid: &GridDefinition,
     ) -> std::result::Result<GridHandle, GridError> {
+        let cache_key = grid_runtime_cache_key(grid);
         if let Some(cached) = self
             .handle_cache
             .lock()
             .expect("grid handle cache poisoned")
-            .get(&grid.id)
+            .get(&cache_key)
             .cloned()
         {
             return Ok(cached);
@@ -150,13 +152,22 @@ impl GridRuntime {
                 self.handle_cache
                     .lock()
                     .expect("grid handle cache poisoned")
-                    .insert(grid.id, handle.clone());
+                    .insert(cache_key, handle.clone());
                 return Ok(handle);
             }
         }
 
         Err(GridError::Unavailable(definition.name))
     }
+}
+
+fn grid_runtime_cache_key(grid: &GridDefinition) -> String {
+    let mut key = format!("{}|{:?}", grid.id.0, grid.format);
+    for resource in &grid.resource_names {
+        key.push('|');
+        key.push_str(resource);
+    }
+    key
 }
 
 #[derive(Default)]
