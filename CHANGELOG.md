@@ -1,16 +1,24 @@
 # Changelog
 
+## 0.4.0
+
+- add Lambert Azimuthal Equal Area, EPSG Oblique Stereographic, Hotine Oblique Mercator variants A/B, and Cassini-Soldner projection families, extending embedded projected CRS coverage for common European, Swiss, North American, Malaysian, and Caribbean grids
+- add PROJ string `+nadgrids` support for NTv2-backed custom datum shifts through the existing `GridProvider` pipeline, including optional grid entries and explicit rejection of conflicting or unsupported grid parameters
+- expose grid-backed datum shifts in the public CRS model and add CRS-definition transform constructors with selection options for caller-supplied grid providers
+- make public CRS and datum definition values owned rather than `Copy` so grid-backed metadata can be represented without static-only constraints
+- normalize non-metre EPSG ellipsoid axes to metres in the generated registry so historical CRS definitions with foot-based ellipsoids use correct projection radii
+- tighten Swiss Hotine Oblique Mercator variant B parity with C PROJ, including the Swiss right-angle kernel and inverse convergence behavior
+- refresh live bundled C PROJ parity coverage, reference values, and benchmark coverage for the new projection and grid cases
+- continue to scope the release as a supported `0.x` line rather than a claim of full PROJ feature parity
+
 ## 0.3.0
 
 - add embedded coordinate-operation metadata and selection APIs, including explicit operation lookup, `Transform::from_operation`, `Transform::with_selection_options`, selected-operation introspection, and detailed selection diagnostics
 - add NTv2 grid runtime support with embedded and application-provided grid providers, recursive concatenated operation handling, and bundled registry-backed grid resources
 - expand the embedded EPSG registry with explicit datum-shift states, coordinate operations, areas of use, grid definitions, and CRS names
-- add Lambert Azimuthal Equal Area, EPSG Oblique Stereographic, Hotine Oblique Mercator variants A/B, and Cassini-Soldner projection families, extending embedded projected CRS coverage for common European, Swiss, North American, Malaysian, and Caribbean grids
-- normalize non-metre EPSG ellipsoid axes to metres in the generated registry so historical CRS definitions with foot-based ellipsoids use correct projection radii
 - make transform construction operation-aware with typed area-of-interest selection, inverse-aware metadata, and indexed operation lookup instead of registry-wide scans
 - switch projections onto precomputed enum-backed hot paths and compiled transform pipelines, improving construction and execution costs
 - tighten CRS parsing semantics across WKT, PROJJSON, and authority wrappers, rejecting contradictory or unsupported inputs instead of silently normalizing them
-- add PROJ string `+nadgrids` support for NTv2-backed custom datum shifts through the existing `GridProvider` pipeline, including optional grid entries and explicit rejection of conflicting or unsupported grid parameters
 - refresh live bundled C PROJ parity coverage, benchmark coverage, and the published benchmark report for the new operation-selection and 3D paths
 - continue to scope the release as a supported `0.x` line rather than a claim of full PROJ feature parity
 
