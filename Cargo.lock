@@ -647,6 +647,7 @@ version = "0.3.0"
 dependencies = [
  "proj-core",
  "serde_json",
+ "smallvec",
  "thiserror",
 ]
 

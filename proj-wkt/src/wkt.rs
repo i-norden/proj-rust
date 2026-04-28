@@ -610,7 +610,7 @@ fn resolve_structured_datum(
 
     for (datum_aliases, ellipsoid_aliases, datum, ellipsoid_epsg) in candidates {
         if datum_aliases.contains(&datum_name)
-            && ellipsoid_matches(ellipsoid, datum, ellipsoid_aliases, ellipsoid_epsg)
+            && ellipsoid_matches(ellipsoid, &datum, ellipsoid_aliases, ellipsoid_epsg)
         {
             return Some(datum);
         }
@@ -621,7 +621,7 @@ fn resolve_structured_datum(
 
 fn ellipsoid_matches(
     actual: &StructuredEllipsoid,
-    datum: proj_core::Datum,
+    datum: &proj_core::Datum,
     aliases: &[&str],
     epsg: Option<u32>,
 ) -> bool {
