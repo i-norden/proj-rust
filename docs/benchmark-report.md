@@ -1,10 +1,10 @@
 # Benchmark Report
 
-Date: 2026-04-16
+Date: 2026-04-28
 
 This report summarizes the current parity and benchmark suite for `proj-rust`
 against bundled C PROJ. It captures both the current Rust-versus-C performance
-shape and the current transform-construction cost for the `0.3.0` release
+shape and the current transform-construction cost for the `0.4.0` release
 state.
 
 ## System Under Test
@@ -21,7 +21,7 @@ throughput claims.
 
 ## Scope
 
-- Live parity against bundled C PROJ using the checked-in 135-point reference corpus
+- Live parity against bundled C PROJ using the checked-in 161-value reference corpus
 - Transform-construction timing for:
   - `EPSG:4326 -> 3857`
   - `EPSG:4267 -> 4326`
@@ -49,7 +49,7 @@ Notes:
 
 - The parity run passed both live C PROJ tests.
 - The 3D parity run passed the live C PROJ 3D cases.
-- The parity corpus currently contains 135 reference points.
+- The parity corpus currently contains 161 reference values.
 - Criterion is used for all timing.
 - The batch benchmark reports element throughput for 10,000 coordinate pairs.
 - The current 3D API preserves the third ordinate unchanged because the CRS model remains horizontal-only.
@@ -60,7 +60,7 @@ Notes:
 
 - `live_c_proj_parity`: 2 tests passed
 - `live_c_proj_parity_3d`: 1 test passed
-- The 135-point corpus remained in sync with live bundled C PROJ
+- The 161-value corpus remained in sync with live bundled C PROJ
 - `proj-core` matched live bundled C PROJ for all supported corpus cases
 - `proj-core` matched live bundled C PROJ for all covered 3D cases
 
@@ -68,46 +68,46 @@ Notes:
 
 | workload | proj-rust |
 | --- | ---: |
-| `construct 4326 -> 3857` | 687.42 ns |
-| `construct 4267 -> 4326` | 31.24 us |
+| `construct 4326 -> 3857` | 842.26 ns |
+| `construct 4267 -> 4326` | 34.21 us |
 
 ### Single-Point Summary
 
 | workload | proj-rust | C PROJ | result |
 | --- | ---: | ---: | --- |
-| `4326 -> 3857` | 27.25 ns | 72.77 ns | `proj-rust` 2.67x faster |
-| `4326 -> 32618` | 41.18 ns | 130.88 ns | `proj-rust` 3.18x faster |
-| `4326 -> 3413` | 59.30 ns | 92.52 ns | `proj-rust` 1.56x faster |
-| `4267 -> 4326` | 160.37 ns | 276.96 ns | `proj-rust` 1.73x faster |
+| `4326 -> 3857` | 64.91 ns | 75.89 ns | `proj-rust` 1.17x faster |
+| `4326 -> 32618` | 71.48 ns | 142.25 ns | `proj-rust` 1.99x faster |
+| `4326 -> 3413` | 217.21 ns | 111.59 ns | C PROJ 1.95x faster |
+| `4267 -> 4326` | 277.17 ns | 281.69 ns | `proj-rust` 1.02x faster |
 
 ### Single-Point 3D Summary
 
 | workload | proj-rust | C PROJ | result |
 | --- | ---: | ---: | --- |
-| `3D 4326 -> 3857` | 25.70 ns | 82.27 ns | `proj-rust` 3.20x faster |
-| `3D 4267 -> 4326` | 153.14 ns | 281.22 ns | `proj-rust` 1.84x faster |
+| `3D 4326 -> 3857` | 63.07 ns | 80.06 ns | `proj-rust` 1.27x faster |
+| `3D 4267 -> 4326` | 247.88 ns | 295.44 ns | `proj-rust` 1.19x faster |
 
 ### Batch Summary
 
 | workload | proj-rust | C PROJ | result |
 | --- | ---: | ---: | --- |
-| `10K 4326 -> 3857` sequential | 293.75 us | 778.47 us | `proj-rust` 2.65x faster |
-| `10K 4326 -> 3857` throughput | 34.0 Melem/s | 12.8 Melem/s | `proj-rust` 2.65x higher throughput |
-| `10K 4326 -> 3857` parallel | 292.19 us | 778.47 us | `proj-rust` 2.66x faster |
-| `10K 4326 -> 3857` parallel throughput | 34.2 Melem/s | 12.8 Melem/s | `proj-rust` 2.66x higher throughput |
+| `10K 4326 -> 3857` sequential | 711.61 us | 877.78 us | `proj-rust` 1.23x faster |
+| `10K 4326 -> 3857` throughput | 14.1 Melem/s | 11.4 Melem/s | `proj-rust` 1.23x higher throughput |
+| `10K 4326 -> 3857` parallel | 722.06 us | 877.78 us | `proj-rust` 1.22x faster |
+| `10K 4326 -> 3857` parallel throughput | 13.8 Melem/s | 11.4 Melem/s | `proj-rust` 1.22x higher throughput |
 
 ### Batch 3D Summary
 
 | workload | proj-rust | result |
 | --- | ---: | --- |
-| `10K 3D 4326 -> 3857` sequential | 258.73 us | 38.6 Melem/s |
-| `10K 3D 4326 -> 3857` parallel | 259.91 us | 38.5 Melem/s |
+| `10K 3D 4326 -> 3857` sequential | 607.03 us | 16.5 Melem/s |
+| `10K 3D 4326 -> 3857` parallel | 645.65 us | 15.5 Melem/s |
 
 ## Interpretation
 
-- `proj-rust` remains ahead of bundled C PROJ in every measured Rust-versus-C case in this suite.
-- Construction is now sub-microsecond for simple registry-backed projected transforms and roughly 31 microseconds for the covered datum-shifted pair.
-- Simple projected single-point transforms still show the largest relative wins.
+- `proj-rust` remains faster than bundled C PROJ in most measured Rust-versus-C cases in this suite.
+- Construction is now sub-microsecond for simple registry-backed projected transforms and roughly 34 microseconds for the covered datum-shifted pair.
+- UTM single-point transforms show the largest relative win, while the covered Polar Stereographic case is currently faster in C PROJ on this host.
 - On this host and at 10K elements, the adaptive parallel path is essentially flat with the sequential path for the covered workloads, which is the intended crossover behavior.
 - The current 3D path stays close to the 2D fast path because the third ordinate is preserved unchanged.
 - The live parity suite remains the strongest correctness signal because it checks both corpus drift and current Rust-versus-C behavior.

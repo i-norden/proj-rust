@@ -11,7 +11,7 @@ This workspace currently contains:
 
 `proj-rust` is intended for production use within its supported CRS and projection set. It is not a full implementation of all PROJ capabilities.
 
-Current non-goals for the `0.3` release line include:
+Current non-goals for the `0.4` release line include:
 
 - vertical, geoid, or time-dependent CRS operations
 - arbitrary user-defined PROJ pipeline parsing/execution beyond the supported CRS and operation model
@@ -90,7 +90,7 @@ Custom CRS definitions can be constructed and passed to `Transform::from_crs_def
 
 ## Operation Selection And Grids
 
-`proj-core` `0.3` adds embedded coordinate-operation metadata, default operation selection, and explicit operation execution. `Transform::new()` and `Transform::from_crs_defs()` choose the best supported operation for the CRS pair, while `Transform::with_selection_options()` lets callers supply an area of interest or require grid-backed or exact-area matches.
+`proj-core` includes embedded coordinate-operation metadata, default operation selection, and explicit operation execution. `Transform::new()` and `Transform::from_crs_defs()` choose the best supported operation for the CRS pair, while `Transform::with_selection_options()` lets callers supply an area of interest or require grid-backed or exact-area matches.
 
 Use `Transform::selected_operation()`, `Transform::selection_diagnostics()`, `registry::operation_candidates_between()`, and `lookup_operation()` when you need deterministic operation inspection including operation direction. NTv2 grid-backed transforms are supported through the embedded registry, parsed PROJ `+nadgrids` custom CRS definitions, `EmbeddedGridProvider`, `FilesystemGridProvider`, and custom `GridProvider` implementations.
 
