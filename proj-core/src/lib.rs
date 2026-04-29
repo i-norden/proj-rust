@@ -12,6 +12,10 @@
 //! [`Transform::selection_diagnostics`].
 //! The [`registry`], [`operation`], and [`grid`] modules expose the embedded
 //! operation catalog, selection metadata, and NTv2 grid-provider interfaces.
+//! `convert_3d` preserves `z` only when no explicit vertical CRS is present or
+//! when source and target compound CRS definitions have identical vertical
+//! components. Vertical/geoid height transformations are intentionally rejected
+//! until supported vertical operations and grid policy are implemented.
 //!
 //! # Example
 //!
@@ -47,7 +51,10 @@ mod selector;
 pub mod transform;
 
 pub use coord::{Bounds, Coord, Coord3D, Transformable, Transformable3D};
-pub use crs::{CrsDef, GeographicCrsDef, LinearUnit, ProjectedCrsDef, ProjectionMethod};
+pub use crs::{
+    CompoundCrsDef, CrsDef, GeographicCrsDef, HorizontalCrsDef, LinearUnit, ProjectedCrsDef,
+    ProjectionMethod, VerticalCrsDef, VerticalCrsKind,
+};
 pub use datum::{Datum, DatumGridShift, DatumGridShiftEntry, DatumToWgs84, HelmertParams};
 pub use ellipsoid::Ellipsoid;
 pub use error::{Error, Result};

@@ -11,12 +11,16 @@
 //! - **PROJ strings**: `"+proj=utm +zone=18 +datum=WGS84"` — parsed into CrsDef
 //! - **WKT1**: `GEOGCS[...]` / `PROJCS[...]` — extracts AUTHORITY tag when present,
 //!   otherwise parses projection parameters
+//! - **WKT2/PROJJSON compound CRS**: parses explicit vertical CRS components for
+//!   equality-checked z preservation
 //!
 //! Custom CRS definitions are only accepted when their semantics fit the
-//! `proj_core::CrsDef` model: 2D longitude/latitude geographic coordinates in
-//! degrees with a Greenwich prime meridian, and projected coordinates with
-//! easting/northing axis order. Unsupported axis-order, prime-meridian, and
-//! geographic angular-unit semantics are rejected.
+//! `proj_core::CrsDef` model: longitude/latitude geographic coordinates in
+//! degrees with a Greenwich prime meridian, projected coordinates with
+//! easting/northing axis order, and compound vertical components that can be
+//! preserved only when source and target vertical CRS definitions are identical.
+//! Unsupported axis-order, prime-meridian, geographic angular-unit, and vertical
+//! transformation semantics are rejected.
 //!
 //! # Example
 //!
@@ -62,7 +66,7 @@ pub type Result<T> = std::result::Result<T, ParseError>;
 /// - **PROJ strings**: `"+proj=utm +zone=18 +datum=WGS84"`
 /// - **PROJJSON**: `{"type": "ProjectedCRS", ...}`
 /// - **WKT1**: `GEOGCS[...]` / `PROJCS[...]`
-/// - **WKT2**: `GEODCRS[...]` / `PROJCRS[...]`
+/// - **WKT2**: `GEODCRS[...]` / `PROJCRS[...]` / `COMPOUNDCRS[...]`
 pub fn parse_crs(s: &str) -> Result<CrsDef> {
     let s = s.trim();
 
@@ -119,6 +123,11 @@ pub fn parse_crs(s: &str) -> Result<CrsDef> {
         || upper.starts_with("GEODCRS")
         || upper.starts_with("GEOGCRS")
         || upper.starts_with("PROJCRS")
+        || upper.starts_with("COMPD_CS")
+        || upper.starts_with("COMPOUNDCRS")
+        || upper.starts_with("VERT_CS")
+        || upper.starts_with("VERTCRS")
+        || upper.starts_with("VERTICALCRS")
     {
         return wkt::parse_wkt(s);
     }
@@ -313,6 +322,14 @@ mod tests {
     fn epsg_authority_code() {
         let crs = parse_crs("EPSG:3857").unwrap();
         assert!(crs.is_projected());
+    }
+
+    #[test]
+    fn epsg_authority_code_3d_geographic() {
+        let crs = parse_crs("EPSG:4979").unwrap();
+        assert!(crs.is_compound());
+        assert!(crs.is_geographic());
+        assert!(crs.vertical_crs().is_some());
     }
 
     #[test]

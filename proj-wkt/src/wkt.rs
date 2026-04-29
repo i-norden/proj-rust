@@ -1,9 +1,13 @@
 use crate::semantics::{
-    normalize_key, validate_supported_geographic_semantics, validate_supported_projected_semantics,
-    AxisDirection, CoordinateSystemSpec,
+    normalize_key, validate_supported_geographic_or_ellipsoidal_height_semantics,
+    validate_supported_geographic_semantics, validate_supported_projected_semantics, AxisDirection,
+    CoordinateSystemSpec, GeographicCoordinateSystemKind,
 };
 use crate::{ParseError, Result};
-use proj_core::{CrsDef, GeographicCrsDef, LinearUnit, ProjectedCrsDef, ProjectionMethod};
+use proj_core::{
+    CompoundCrsDef, CrsDef, GeographicCrsDef, HorizontalCrsDef, LinearUnit, ProjectedCrsDef,
+    ProjectionMethod, VerticalCrsDef,
+};
 use std::collections::HashMap;
 
 /// Parse a WKT CRS string.
@@ -190,6 +194,19 @@ fn parse_wkt_structure(s: &str) -> Result<CrsDef> {
         return parse_wkt_projected(s);
     }
 
+    if root_name.eq_ignore_ascii_case("COMPD_CS") || root_name.eq_ignore_ascii_case("COMPOUNDCRS") {
+        return parse_wkt_compound(s);
+    }
+
+    if root_name.eq_ignore_ascii_case("VERT_CS")
+        || root_name.eq_ignore_ascii_case("VERTCRS")
+        || root_name.eq_ignore_ascii_case("VERTICALCRS")
+    {
+        return Err(ParseError::UnsupportedSemantics(
+            "standalone vertical CRS definitions are not supported by the horizontal transform API; use a compound CRS with an identical vertical component on both sides".into(),
+        ));
+    }
+
     Err(ParseError::Parse(format!(
         "unrecognized WKT root element: {:.40}",
         s
@@ -203,7 +220,7 @@ fn parse_wkt_geographic(s: &str) -> Result<CrsDef> {
     let prime_meridian_degrees =
         extract_prime_meridian_degrees(root_inner, angle_unit_to_degree.unwrap_or(1.0));
     let coordinate_system = extract_coordinate_system(root_inner);
-    validate_supported_geographic_semantics(
+    let coordinate_system_kind = validate_supported_geographic_or_ellipsoidal_height_semantics(
         "WKT geographic CRS",
         angle_unit_to_degree,
         prime_meridian_degrees,
@@ -211,8 +228,26 @@ fn parse_wkt_geographic(s: &str) -> Result<CrsDef> {
     )?;
 
     let datum = infer_datum_from_geographic_inner(root_inner)?;
+    let horizontal = GeographicCrsDef::new(0, datum.clone(), "");
 
-    Ok(CrsDef::Geographic(GeographicCrsDef::new(0, datum, "")))
+    match coordinate_system_kind {
+        GeographicCoordinateSystemKind::TwoDimensional => Ok(CrsDef::Geographic(horizontal)),
+        GeographicCoordinateSystemKind::ThreeDimensionalEllipsoidalHeight => {
+            let vertical = VerticalCrsDef::ellipsoidal_height(
+                0,
+                datum,
+                extract_ellipsoidal_height_linear_unit(root_inner)
+                    .unwrap_or_else(LinearUnit::metre),
+                "",
+            );
+            Ok(CrsDef::Compound(Box::new(CompoundCrsDef::new(
+                0,
+                HorizontalCrsDef::Geographic(horizontal),
+                vertical,
+                "",
+            ))))
+        }
+    }
 }
 
 fn parse_wkt_projected(s: &str) -> Result<CrsDef> {
@@ -477,6 +512,75 @@ fn parse_wkt_projected(s: &str) -> Result<CrsDef> {
         projected_linear_unit,
         "",
     )))
+}
+
+fn parse_wkt_compound(s: &str) -> Result<CrsDef> {
+    let root_inner = root_inner(s)
+        .ok_or_else(|| ParseError::Parse(format!("unrecognized WKT root element: {:.40}", s)))?;
+    let mut horizontal = None;
+    let mut vertical = None;
+
+    for_each_top_level_element(root_inner, |name, element_inner| {
+        if horizontal.is_none()
+            && (name.eq_ignore_ascii_case("GEOGCS")
+                || name.eq_ignore_ascii_case("GEODCRS")
+                || name.eq_ignore_ascii_case("GEOGCRS")
+                || name.eq_ignore_ascii_case("PROJCS")
+                || name.eq_ignore_ascii_case("PROJCRS"))
+        {
+            horizontal = Some(parse_wkt_structure(&format!("{name}[{element_inner}]")));
+            return;
+        }
+
+        if vertical.is_none()
+            && (name.eq_ignore_ascii_case("VERT_CS")
+                || name.eq_ignore_ascii_case("VERTCRS")
+                || name.eq_ignore_ascii_case("VERTICALCRS"))
+        {
+            vertical = Some(parse_wkt_vertical(element_inner));
+        }
+    });
+
+    let horizontal = horizontal.ok_or_else(|| {
+        ParseError::Parse("WKT compound CRS is missing a horizontal CRS".into())
+    })??;
+    if horizontal.vertical_crs().is_some() {
+        return Err(ParseError::UnsupportedSemantics(
+            "WKT compound CRS cannot use a 3D horizontal CRS as its horizontal component".into(),
+        ));
+    }
+
+    let vertical = vertical
+        .ok_or_else(|| ParseError::Parse("WKT compound CRS is missing a vertical CRS".into()))??;
+    let compound = CompoundCrsDef::from_crs_def(0, horizontal, vertical, "")?;
+    Ok(CrsDef::Compound(Box::new(compound)))
+}
+
+fn parse_wkt_vertical(inner: &str) -> Result<VerticalCrsDef> {
+    validate_supported_vertical_coordinate_system(
+        "WKT vertical CRS",
+        &extract_coordinate_system(inner),
+    )?;
+    let linear_unit = extract_vertical_crs_linear_unit(inner).unwrap_or_else(LinearUnit::metre);
+    let epsg = extract_top_level_epsg_from_inner(inner).unwrap_or(0);
+    let datum_inner =
+        find_top_level_element_inner(inner, &["VERT_DATUM", "VERTICALDATUM", "VDATUM", "VRF"])
+            .ok_or_else(|| {
+                ParseError::Parse("WKT vertical CRS is missing a vertical datum".into())
+            })?;
+
+    let vertical_datum_epsg = extract_top_level_epsg_from_inner(datum_inner).ok_or_else(|| {
+        ParseError::UnsupportedSemantics(
+            "WKT gravity-related vertical CRS requires a vertical datum EPSG identifier".into(),
+        )
+    })?;
+
+    Ok(VerticalCrsDef::gravity_related_height(
+        epsg,
+        vertical_datum_epsg,
+        linear_unit,
+        "",
+    )?)
 }
 
 fn infer_datum_from_geographic_inner(inner: &str) -> Result<proj_core::Datum> {
@@ -882,11 +986,95 @@ fn extract_coordinate_system(inner: &str) -> CoordinateSystemSpec {
     coordinate_system
 }
 
+fn validate_supported_vertical_coordinate_system(
+    context: &str,
+    coordinate_system: &CoordinateSystemSpec,
+) -> Result<()> {
+    if let Some(subtype) = &coordinate_system.subtype {
+        if normalize_key(subtype) != "vertical" {
+            return Err(ParseError::UnsupportedSemantics(format!(
+                "{context} uses unsupported coordinate system subtype `{subtype}`"
+            )));
+        }
+    }
+
+    if let Some(dimension) = coordinate_system.dimension {
+        if dimension != 1 {
+            return Err(ParseError::UnsupportedSemantics(format!(
+                "{context} uses {dimension} axes, but only 1D vertical coordinate systems are supported"
+            )));
+        }
+    }
+
+    if !coordinate_system.axes.is_empty() && coordinate_system.axes != [AxisDirection::Up] {
+        return Err(ParseError::UnsupportedSemantics(format!(
+            "{context} uses unsupported vertical axis direction; expected up"
+        )));
+    }
+
+    Ok(())
+}
+
 fn parse_axis_direction(inner: &str) -> AxisDirection {
     split_top_level_fields(inner)
         .get(1)
         .map(|field| AxisDirection::from_str(trim_wkt_token(field)))
         .unwrap_or(AxisDirection::Other)
+}
+
+fn extract_vertical_axis_linear_unit(inner: &str) -> Option<LinearUnit> {
+    let mut linear_unit = None;
+    for_each_top_level_element(inner, |name, element_inner| {
+        if linear_unit.is_some() || !name.eq_ignore_ascii_case("AXIS") {
+            return;
+        }
+        if parse_axis_direction(element_inner) != AxisDirection::Up {
+            return;
+        }
+        linear_unit = axis_linear_unit(element_inner);
+    });
+    linear_unit
+}
+
+fn extract_ellipsoidal_height_linear_unit(inner: &str) -> Option<LinearUnit> {
+    extract_vertical_axis_linear_unit(inner).or_else(|| extract_top_level_length_unit(inner, false))
+}
+
+fn extract_vertical_crs_linear_unit(inner: &str) -> Option<LinearUnit> {
+    extract_vertical_axis_linear_unit(inner).or_else(|| extract_top_level_length_unit(inner, true))
+}
+
+fn extract_top_level_length_unit(inner: &str, include_legacy_unit: bool) -> Option<LinearUnit> {
+    let mut linear_unit = None;
+    for_each_top_level_element(inner, |name, element_inner| {
+        if linear_unit.is_some() {
+            return;
+        }
+        if name.eq_ignore_ascii_case("LENGTHUNIT")
+            || (include_legacy_unit && name.eq_ignore_ascii_case("UNIT"))
+        {
+            linear_unit = parse_unit_factor(element_inner)
+                .and_then(|factor| LinearUnit::from_meters_per_unit(factor).ok());
+        }
+    });
+    linear_unit
+}
+
+fn axis_linear_unit(axis_inner: &str) -> Option<LinearUnit> {
+    split_top_level_fields(axis_inner)
+        .iter()
+        .skip(2)
+        .find_map(|field| {
+            let (unit_name, unit_inner, _) = parse_wkt_element(field.trim(), 0)?;
+            if unit_name.eq_ignore_ascii_case("LENGTHUNIT")
+                || unit_name.eq_ignore_ascii_case("UNIT")
+            {
+                parse_unit_factor(unit_inner)
+                    .and_then(|factor| LinearUnit::from_meters_per_unit(factor).ok())
+            } else {
+                None
+            }
+        })
 }
 
 fn find_top_level_element_inner<'a>(inner: &'a str, names: &[&str]) -> Option<&'a str> {
@@ -1005,6 +1193,34 @@ mod tests {
         let wkt = r#"GEOGCS["WGS 84",DATUM["WGS_1984",SPHEROID["WGS 84",6378137,298.257223563]]]"#;
         let crs = parse_wkt(wkt).unwrap();
         assert!(crs.is_geographic());
+    }
+
+    #[test]
+    fn parse_wkt2_geographic_3d_as_compound_ellipsoidal_height() {
+        let wkt = r#"GEODCRS["WGS 84 3D",DATUM["World Geodetic System 1984",ELLIPSOID["WGS 84",6378137,298.257223563]],CS[ellipsoidal,3],AXIS["longitude",east,ORDER[1],ANGLEUNIT["degree",0.0174532925199433]],AXIS["latitude",north,ORDER[2],ANGLEUNIT["degree",0.0174532925199433]],AXIS["ellipsoidal height",up,ORDER[3],LENGTHUNIT["metre",1]]]"#;
+        let crs = parse_wkt(wkt).unwrap();
+        assert!(crs.is_compound());
+        assert!(crs.is_geographic());
+        assert!(crs.vertical_crs().is_some());
+    }
+
+    #[test]
+    fn parse_wkt_compound_with_vertical_crs() {
+        let wkt = r#"COMPOUNDCRS["WGS 84 + NAVD88 height",GEODCRS["WGS 84",DATUM["World Geodetic System 1984",ELLIPSOID["WGS 84",6378137,298.257223563]],CS[ellipsoidal,2],AXIS["longitude",east],AXIS["latitude",north],ANGLEUNIT["degree",0.0174532925199433]],VERTCRS["NAVD88 height",VDATUM["North American Vertical Datum 1988",ID["EPSG",5103]],CS[vertical,1],AXIS["gravity-related height",up,LENGTHUNIT["metre",1]],LENGTHUNIT["metre",1]]]"#;
+        let crs = parse_wkt(wkt).unwrap();
+        assert!(crs.is_compound());
+        assert!(crs.is_geographic());
+        assert_eq!(
+            crs.vertical_crs().unwrap().linear_unit_to_meter(),
+            LinearUnit::metre().meters_per_unit()
+        );
+    }
+
+    #[test]
+    fn reject_standalone_vertical_wkt() {
+        let wkt = r#"VERTCRS["NAVD88 height",VDATUM["North American Vertical Datum 1988",ID["EPSG",5103]],CS[vertical,1],AXIS["gravity-related height",up,LENGTHUNIT["metre",1]],LENGTHUNIT["metre",1]]"#;
+        let err = parse_wkt(wkt).unwrap_err();
+        assert!(err.to_string().contains("standalone vertical CRS"));
     }
 
     #[test]

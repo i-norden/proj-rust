@@ -537,6 +537,22 @@ pub(crate) fn lookup_datum(code: u32) -> Option<Datum> {
 }
 
 pub(crate) fn lookup_geographic(code: u32) -> Option<CrsDef> {
+    if code == 4979 {
+        let horizontal = GeographicCrsDef::new(4326, crate::datum::WGS84, "WGS 84");
+        let vertical = VerticalCrsDef::ellipsoidal_height(
+            0,
+            crate::datum::WGS84,
+            LinearUnit::metre(),
+            "WGS 84 ellipsoidal height",
+        );
+        return Some(CrsDef::Compound(Box::new(CompoundCrsDef::new(
+            4979,
+            HorizontalCrsDef::Geographic(horizontal),
+            vertical,
+            "WGS 84",
+        ))));
+    }
+
     let record = db().geographic_crs.get(&code)?;
     let datum = db().datums.get(&record.datum_code)?;
     Some(CrsDef::Geographic(GeographicCrsDef::new(

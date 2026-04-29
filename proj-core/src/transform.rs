@@ -131,6 +131,8 @@ impl Transform {
         to: &CrsDef,
         options: SelectionOptions,
     ) -> Result<Self> {
+        validate_vertical_compatibility(from, to)?;
+
         let grid_runtime = GridRuntime::new(options.grid_provider.clone());
         let candidate_set = selector::rank_operation_candidates(from, to, &options)?;
         if candidate_set.ranked.is_empty() {
@@ -514,22 +516,22 @@ impl Transform {
     }
 
     fn source_projected_native_to_meters(&self, x: f64, y: f64) -> (f64, f64) {
-        match &self.source {
-            CrsDef::Projected(projected) => (
+        match self.source.as_projected() {
+            Some(projected) => (
                 projected.linear_unit().to_meters(x),
                 projected.linear_unit().to_meters(y),
             ),
-            CrsDef::Geographic(_) => (x, y),
+            None => (x, y),
         }
     }
 
     fn projected_meters_to_target_native(&self, x: f64, y: f64) -> (f64, f64) {
-        match &self.target {
-            CrsDef::Projected(projected) => (
+        match self.target.as_projected() {
+            Some(projected) => (
                 projected.linear_unit().from_meters(x),
                 projected.linear_unit().from_meters(y),
             ),
-            CrsDef::Geographic(_) => (x, y),
+            None => (x, y),
         }
     }
 
@@ -657,6 +659,23 @@ fn validate_output_len(input_len: usize, output_len: usize) -> Result<()> {
         )));
     }
     Ok(())
+}
+
+fn validate_vertical_compatibility(source: &CrsDef, target: &CrsDef) -> Result<()> {
+    match (source.vertical_crs(), target.vertical_crs()) {
+        (None, None) => Ok(()),
+        (Some(source_vertical), Some(target_vertical))
+            if source_vertical.semantically_equivalent(target_vertical) =>
+        {
+            Ok(())
+        }
+        (Some(_), Some(_)) => Err(Error::OperationSelection(
+            "vertical CRS transformations are not supported; source and target vertical CRS components must be identical for z preservation".into(),
+        )),
+        (Some(_), None) | (None, Some(_)) => Err(Error::OperationSelection(
+            "cannot transform between an explicit vertical CRS and a horizontal-only CRS; vertical CRS transformations are not supported".into(),
+        )),
+    }
 }
 
 fn selected_reasons_for(
@@ -803,7 +822,7 @@ fn compile_pipeline(
 ) -> Result<CompiledOperationPipeline> {
     let mut steps = SmallVec::<[CompiledStep; 8]>::new();
 
-    if let CrsDef::Projected(projected) = source {
+    if let Some(projected) = source.as_projected() {
         steps.push(CompiledStep::ProjectionInverse {
             projection: make_projection(&projected.method(), projected.datum())?,
         });
@@ -821,7 +840,7 @@ fn compile_pipeline(
         )?;
     }
 
-    if let CrsDef::Projected(projected) = target {
+    if let Some(projected) = target.as_projected() {
         steps.push(CompiledStep::ProjectionForward {
             projection: make_projection(&projected.method(), projected.datum())?,
         });
@@ -1123,7 +1142,10 @@ fn parallel_chunk_size(len: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::crs::{CrsDef, GeographicCrsDef, LinearUnit, ProjectedCrsDef, ProjectionMethod};
+    use crate::crs::{
+        CompoundCrsDef, CrsDef, GeographicCrsDef, HorizontalCrsDef, LinearUnit, ProjectedCrsDef,
+        ProjectionMethod, VerticalCrsDef,
+    };
     use crate::datum::{self, DatumToWgs84};
     use crate::operation::{
         AreaOfInterest, OperationMatchKind, SelectionPolicy, SelectionReason,
@@ -1577,6 +1599,63 @@ mod tests {
         assert!((x - (-8238310.0)).abs() < 100.0);
         assert!((y - 4970072.0).abs() < 100.0);
         assert!((z - 123.45).abs() < 1e-12);
+    }
+
+    #[test]
+    fn equal_compound_vertical_crs_preserves_height() {
+        let source = registry::lookup_epsg(4979).unwrap();
+        let target_horizontal = ProjectedCrsDef::new_with_base_geographic_crs(
+            3857,
+            4326,
+            datum::WGS84,
+            ProjectionMethod::WebMercator,
+            LinearUnit::metre(),
+            "WGS 84 / Pseudo-Mercator",
+        );
+        let target_vertical = VerticalCrsDef::ellipsoidal_height(
+            0,
+            datum::WGS84,
+            LinearUnit::metre(),
+            "WGS 84 ellipsoidal height",
+        );
+        let target = CrsDef::Compound(Box::new(CompoundCrsDef::new(
+            0,
+            HorizontalCrsDef::Projected(target_horizontal),
+            target_vertical,
+            "WGS 84 / Pseudo-Mercator + ellipsoidal height",
+        )));
+
+        let t = Transform::from_crs_defs(&source, &target).unwrap();
+        let (x, y, z) = t.convert_3d((-74.006, 40.7128, 123.45)).unwrap();
+        assert!((x - (-8238310.0)).abs() < 100.0);
+        assert!((y - 4970072.0).abs() < 100.0);
+        assert!((z - 123.45).abs() < 1e-12);
+    }
+
+    #[test]
+    fn explicit_vertical_to_horizontal_only_transform_is_rejected() {
+        let source = registry::lookup_epsg(4979).unwrap();
+        let target = registry::lookup_epsg(4326).unwrap();
+        let err = expect_transform_error(Transform::from_crs_defs(&source, &target));
+        assert!(err.to_string().contains("explicit vertical CRS"));
+    }
+
+    #[test]
+    fn mismatched_compound_vertical_crs_is_rejected() {
+        let source = registry::lookup_epsg(4979).unwrap();
+        let target_horizontal = GeographicCrsDef::new(4326, datum::WGS84, "WGS 84");
+        let target_vertical =
+            VerticalCrsDef::gravity_related_height(5703, 5103, LinearUnit::metre(), "NAVD88")
+                .unwrap();
+        let target = CrsDef::Compound(Box::new(CompoundCrsDef::new(
+            0,
+            HorizontalCrsDef::Geographic(target_horizontal),
+            target_vertical,
+            "WGS 84 + NAVD88 height",
+        )));
+
+        let err = expect_transform_error(Transform::from_crs_defs(&source, &target));
+        assert!(err.to_string().contains("vertical CRS transformations"));
     }
 
     #[test]

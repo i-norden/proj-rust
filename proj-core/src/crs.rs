@@ -82,14 +82,17 @@ pub enum CrsDef {
     Geographic(GeographicCrsDef),
     /// Projected CRS (easting/northing in the CRS's native linear unit).
     Projected(ProjectedCrsDef),
+    /// Compound horizontal + vertical CRS.
+    Compound(Box<CompoundCrsDef>),
 }
 
 impl CrsDef {
-    /// Get the datum for this CRS.
+    /// Get the horizontal datum for this CRS.
     pub fn datum(&self) -> &Datum {
         match self {
             CrsDef::Geographic(g) => g.datum(),
             CrsDef::Projected(p) => p.datum(),
+            CrsDef::Compound(c) => c.horizontal_datum(),
         }
     }
 
@@ -98,6 +101,7 @@ impl CrsDef {
         match self {
             CrsDef::Geographic(g) => g.epsg(),
             CrsDef::Projected(p) => p.epsg(),
+            CrsDef::Compound(c) => c.epsg(),
         }
     }
 
@@ -106,17 +110,49 @@ impl CrsDef {
         match self {
             CrsDef::Geographic(g) => g.name(),
             CrsDef::Projected(p) => p.name(),
+            CrsDef::Compound(c) => c.name(),
         }
     }
 
-    /// Returns true if this is a geographic CRS.
+    /// Returns true if this CRS's horizontal component is geographic.
     pub fn is_geographic(&self) -> bool {
-        matches!(self, CrsDef::Geographic(_))
+        self.as_geographic().is_some()
     }
 
-    /// Returns true if this is a projected CRS.
+    /// Returns true if this CRS's horizontal component is projected.
     pub fn is_projected(&self) -> bool {
-        matches!(self, CrsDef::Projected(_))
+        self.as_projected().is_some()
+    }
+
+    /// Returns true if this is a compound horizontal + vertical CRS.
+    pub fn is_compound(&self) -> bool {
+        matches!(self, CrsDef::Compound(_))
+    }
+
+    /// Return the geographic horizontal component, when present.
+    pub fn as_geographic(&self) -> Option<&GeographicCrsDef> {
+        match self {
+            CrsDef::Geographic(g) => Some(g),
+            CrsDef::Projected(_) => None,
+            CrsDef::Compound(c) => c.as_geographic(),
+        }
+    }
+
+    /// Return the projected horizontal component, when present.
+    pub fn as_projected(&self) -> Option<&ProjectedCrsDef> {
+        match self {
+            CrsDef::Geographic(_) => None,
+            CrsDef::Projected(p) => Some(p),
+            CrsDef::Compound(c) => c.as_projected(),
+        }
+    }
+
+    /// Return the explicit vertical CRS component, when this is compound.
+    pub fn vertical_crs(&self) -> Option<&VerticalCrsDef> {
+        match self {
+            CrsDef::Compound(c) => Some(c.vertical_crs()),
+            CrsDef::Geographic(_) | CrsDef::Projected(_) => None,
+        }
     }
 
     /// Returns the geographic CRS EPSG code used for operation selection, when known.
@@ -126,6 +162,7 @@ impl CrsDef {
             CrsDef::Projected(p) if p.base_geographic_crs_epsg() != 0 => {
                 Some(p.base_geographic_crs_epsg())
             }
+            CrsDef::Compound(c) => c.base_geographic_crs_epsg(),
             _ => None,
         }
     }
@@ -139,6 +176,7 @@ impl CrsDef {
                     && approx_eq(a.linear_unit_to_meter(), b.linear_unit_to_meter())
                     && projection_methods_equivalent(&a.method(), &b.method())
             }
+            (CrsDef::Compound(a), CrsDef::Compound(b)) => a.semantically_equivalent(b),
             _ => false,
         }
     }
@@ -236,6 +274,274 @@ impl ProjectedCrsDef {
 
     pub const fn name(&self) -> &'static str {
         self.name
+    }
+}
+
+/// A compound CRS made from one horizontal CRS and one vertical CRS.
+#[derive(Debug, Clone)]
+pub struct CompoundCrsDef {
+    epsg: u32,
+    horizontal: HorizontalCrsDef,
+    vertical: VerticalCrsDef,
+    name: &'static str,
+}
+
+impl CompoundCrsDef {
+    pub fn new(
+        epsg: u32,
+        horizontal: HorizontalCrsDef,
+        vertical: VerticalCrsDef,
+        name: &'static str,
+    ) -> Self {
+        Self {
+            epsg,
+            horizontal,
+            vertical,
+            name,
+        }
+    }
+
+    pub fn from_crs_def(
+        epsg: u32,
+        horizontal: CrsDef,
+        vertical: VerticalCrsDef,
+        name: &'static str,
+    ) -> Result<Self> {
+        let horizontal = HorizontalCrsDef::try_from(horizontal)?;
+        Ok(Self::new(epsg, horizontal, vertical, name))
+    }
+
+    pub const fn epsg(&self) -> u32 {
+        self.epsg
+    }
+
+    pub const fn horizontal(&self) -> &HorizontalCrsDef {
+        &self.horizontal
+    }
+
+    pub const fn vertical_crs(&self) -> &VerticalCrsDef {
+        &self.vertical
+    }
+
+    pub const fn name(&self) -> &'static str {
+        self.name
+    }
+
+    pub fn as_geographic(&self) -> Option<&GeographicCrsDef> {
+        self.horizontal.as_geographic()
+    }
+
+    pub fn as_projected(&self) -> Option<&ProjectedCrsDef> {
+        self.horizontal.as_projected()
+    }
+
+    pub fn horizontal_datum(&self) -> &Datum {
+        self.horizontal.datum()
+    }
+
+    pub fn base_geographic_crs_epsg(&self) -> Option<u32> {
+        self.horizontal.base_geographic_crs_epsg()
+    }
+
+    pub fn semantically_equivalent(&self, other: &Self) -> bool {
+        self.horizontal.semantically_equivalent(&other.horizontal)
+            && self.vertical.semantically_equivalent(&other.vertical)
+    }
+}
+
+/// Horizontal component of a compound CRS.
+#[derive(Debug, Clone)]
+pub enum HorizontalCrsDef {
+    Geographic(GeographicCrsDef),
+    Projected(ProjectedCrsDef),
+}
+
+impl HorizontalCrsDef {
+    pub fn datum(&self) -> &Datum {
+        match self {
+            Self::Geographic(g) => g.datum(),
+            Self::Projected(p) => p.datum(),
+        }
+    }
+
+    pub fn epsg(&self) -> u32 {
+        match self {
+            Self::Geographic(g) => g.epsg(),
+            Self::Projected(p) => p.epsg(),
+        }
+    }
+
+    pub fn name(&self) -> &str {
+        match self {
+            Self::Geographic(g) => g.name(),
+            Self::Projected(p) => p.name(),
+        }
+    }
+
+    pub fn as_geographic(&self) -> Option<&GeographicCrsDef> {
+        match self {
+            Self::Geographic(g) => Some(g),
+            Self::Projected(_) => None,
+        }
+    }
+
+    pub fn as_projected(&self) -> Option<&ProjectedCrsDef> {
+        match self {
+            Self::Geographic(_) => None,
+            Self::Projected(p) => Some(p),
+        }
+    }
+
+    pub fn base_geographic_crs_epsg(&self) -> Option<u32> {
+        match self {
+            Self::Geographic(g) if g.epsg() != 0 => Some(g.epsg()),
+            Self::Projected(p) if p.base_geographic_crs_epsg() != 0 => {
+                Some(p.base_geographic_crs_epsg())
+            }
+            _ => None,
+        }
+    }
+
+    pub fn semantically_equivalent(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Geographic(a), Self::Geographic(b)) => a.datum().same_datum(b.datum()),
+            (Self::Projected(a), Self::Projected(b)) => {
+                a.datum().same_datum(b.datum())
+                    && approx_eq(a.linear_unit_to_meter(), b.linear_unit_to_meter())
+                    && projection_methods_equivalent(&a.method(), &b.method())
+            }
+            _ => false,
+        }
+    }
+}
+
+impl TryFrom<CrsDef> for HorizontalCrsDef {
+    type Error = Error;
+
+    fn try_from(value: CrsDef) -> Result<Self> {
+        match value {
+            CrsDef::Geographic(g) => Ok(Self::Geographic(g)),
+            CrsDef::Projected(p) => Ok(Self::Projected(p)),
+            CrsDef::Compound(_) => Err(Error::InvalidDefinition(
+                "compound CRS horizontal component cannot itself be compound".into(),
+            )),
+        }
+    }
+}
+
+impl From<GeographicCrsDef> for HorizontalCrsDef {
+    fn from(value: GeographicCrsDef) -> Self {
+        Self::Geographic(value)
+    }
+}
+
+impl From<ProjectedCrsDef> for HorizontalCrsDef {
+    fn from(value: ProjectedCrsDef) -> Self {
+        Self::Projected(value)
+    }
+}
+
+/// Definition of an explicit vertical CRS component.
+#[derive(Debug, Clone)]
+pub struct VerticalCrsDef {
+    epsg: u32,
+    kind: VerticalCrsKind,
+    linear_unit: LinearUnit,
+    name: &'static str,
+}
+
+impl VerticalCrsDef {
+    /// Construct an ellipsoidal-height vertical CRS tied to a geodetic datum.
+    pub fn ellipsoidal_height(
+        epsg: u32,
+        datum: Datum,
+        linear_unit: LinearUnit,
+        name: &'static str,
+    ) -> Self {
+        Self {
+            epsg,
+            kind: VerticalCrsKind::EllipsoidalHeight {
+                datum: Box::new(datum),
+            },
+            linear_unit,
+            name,
+        }
+    }
+
+    /// Construct a gravity-related vertical CRS by vertical datum EPSG code.
+    pub fn gravity_related_height(
+        epsg: u32,
+        vertical_datum_epsg: u32,
+        linear_unit: LinearUnit,
+        name: &'static str,
+    ) -> Result<Self> {
+        if vertical_datum_epsg == 0 {
+            return Err(Error::InvalidDefinition(
+                "gravity-related vertical CRS requires a vertical datum EPSG code".into(),
+            ));
+        }
+
+        Ok(Self {
+            epsg,
+            kind: VerticalCrsKind::GravityRelatedHeight {
+                vertical_datum_epsg,
+            },
+            linear_unit,
+            name,
+        })
+    }
+
+    pub const fn epsg(&self) -> u32 {
+        self.epsg
+    }
+
+    pub const fn kind(&self) -> &VerticalCrsKind {
+        &self.kind
+    }
+
+    pub const fn linear_unit(&self) -> LinearUnit {
+        self.linear_unit
+    }
+
+    pub const fn linear_unit_to_meter(&self) -> f64 {
+        self.linear_unit.meters_per_unit()
+    }
+
+    pub const fn name(&self) -> &'static str {
+        self.name
+    }
+
+    pub fn semantically_equivalent(&self, other: &Self) -> bool {
+        approx_eq(self.linear_unit_to_meter(), other.linear_unit_to_meter())
+            && self.kind.semantically_equivalent(&other.kind)
+    }
+}
+
+/// Supported vertical CRS kinds.
+#[derive(Debug, Clone)]
+pub enum VerticalCrsKind {
+    /// Height above the ellipsoid of the referenced geodetic datum.
+    EllipsoidalHeight { datum: Box<Datum> },
+    /// Height relative to a gravity-related vertical datum.
+    GravityRelatedHeight { vertical_datum_epsg: u32 },
+}
+
+impl VerticalCrsKind {
+    pub fn semantically_equivalent(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::EllipsoidalHeight { datum: a }, Self::EllipsoidalHeight { datum: b }) => {
+                a.same_datum(b)
+            }
+            (
+                Self::GravityRelatedHeight {
+                    vertical_datum_epsg: a,
+                },
+                Self::GravityRelatedHeight {
+                    vertical_datum_epsg: b,
+                },
+            ) => a == b,
+            _ => false,
+        }
     }
 }
 
@@ -686,6 +992,30 @@ mod tests {
         assert!(crs.is_projected());
         assert!(!crs.is_geographic());
         assert_eq!(crs.epsg(), 3857);
+    }
+
+    #[test]
+    fn compound_crs_exposes_horizontal_and_vertical_components() {
+        let horizontal = GeographicCrsDef::new(4326, datum::WGS84, "WGS 84");
+        let vertical = VerticalCrsDef::ellipsoidal_height(
+            0,
+            datum::WGS84,
+            LinearUnit::metre(),
+            "WGS 84 ellipsoidal height",
+        );
+        let crs = CrsDef::Compound(Box::new(CompoundCrsDef::new(
+            4979,
+            HorizontalCrsDef::Geographic(horizontal),
+            vertical,
+            "WGS 84",
+        )));
+
+        assert!(crs.is_compound());
+        assert!(crs.is_geographic());
+        assert!(!crs.is_projected());
+        assert_eq!(crs.epsg(), 4979);
+        assert_eq!(crs.base_geographic_crs_epsg(), Some(4326));
+        assert!(crs.vertical_crs().is_some());
     }
 
     #[test]

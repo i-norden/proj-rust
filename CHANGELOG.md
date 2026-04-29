@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- add explicit `VerticalCrsDef`, `VerticalCrsKind`, `HorizontalCrsDef`, and `CompoundCrsDef` CRS model types for ellipsoidal-height and gravity-related vertical components
+- add EPSG:4979 and WKT/PROJJSON 3D geographic and compound CRS parsing paths while preserving `z` only when vertical CRS components are identical
+- reject explicit vertical CRS mismatches, standalone vertical CRS transform requests, and vertical/geoid transformation semantics instead of silently preserving ambiguous heights
+
 ## 0.4.0
 
 - add Lambert Azimuthal Equal Area, EPSG Oblique Stereographic, Hotine Oblique Mercator variants A/B, and Cassini-Soldner projection families, extending embedded projected CRS coverage for common European, Swiss, North American, Malaysian, and Caribbean grids

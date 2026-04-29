@@ -132,6 +132,16 @@ mod tests {
     }
 
     #[test]
+    fn lookup_wgs84_3d() {
+        let crs = lookup_epsg(4979).expect("should find 4979");
+        assert!(crs.is_compound());
+        assert!(crs.is_geographic());
+        assert_eq!(crs.epsg(), 4979);
+        assert_eq!(crs.base_geographic_crs_epsg(), Some(4326));
+        assert!(crs.vertical_crs().is_some());
+    }
+
+    #[test]
     fn lookup_web_mercator() {
         let crs = lookup_epsg(3857).expect("should find 3857");
         assert!(crs.is_projected());
