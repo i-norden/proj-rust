@@ -1,5 +1,5 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "generator": "gen-reference gen-registry",
   "registry_format": {
     "magic": "0x45505347",
@@ -8,7 +8,7 @@
   "source_database": {
     "kind": "PROJ proj.db",
     "file_name": "proj.db",
-    "sha256": "sha256:8e4298cd5abd876d689e43b9ff8ef8d167a10011b1792d1f30459782af411a44",
+    "normalized_content_sha256": "sha256:910dded405b766e7fb8d80be9bfe942ff83c52ea022068bc96db0f5e1f57fa28",
     "metadata": {
       "DATABASE.LAYOUT.VERSION.MAJOR": "1",
       "DATABASE.LAYOUT.VERSION.MINOR": "5",
@@ -29,7 +29,7 @@
   "output": {
     "file_name": "epsg.bin",
     "byte_len": 883655,
-    "sha256": "sha256:33d5f1158c04f8bf77e6fcb9bcc049d5353de2d5a78c1ab33f849a67596c24f0"
+    "sha256": "sha256:fc8d5d2cd618937794546ae6b692f974f69b599ce344f6d9b306d1244e919d0d"
   },
   "counts": {
     "ellipsoids": 44,

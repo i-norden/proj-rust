@@ -5,7 +5,7 @@
 //!
 //! Outputs: proj-core/data/epsg.bin and proj-core/data/epsg.provenance.json
 
-use rusqlite::{params, Connection};
+use rusqlite::{params, types::ValueRef, Connection};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
@@ -99,11 +99,8 @@ fn find_proj_db() -> Result<PathBuf, String> {
 
     let mut checksums = BTreeMap::<String, PathBuf>::new();
     for candidate in &candidates {
-        let bytes = fs::read(candidate)
-            .map_err(|err| format!("failed to read {}: {err}", candidate.display()))?;
-        checksums
-            .entry(sha256_hex(&bytes))
-            .or_insert_with(|| candidate.clone());
+        let digest = normalized_proj_db_sha256_for_path(candidate)?;
+        checksums.entry(digest).or_insert_with(|| candidate.clone());
     }
     if checksums.len() > 1 {
         let entries = checksums
@@ -136,8 +133,9 @@ fn walkdir(dir: &Path, name: &str) -> Vec<PathBuf> {
 
 const MAGIC: u32 = 0x4550_5347;
 const VERSION: u16 = 6;
-const PROVENANCE_SCHEMA_VERSION: u16 = 1;
+const PROVENANCE_SCHEMA_VERSION: u16 = 2;
 const CANONICAL_NAN_BITS: u64 = 0x7ff8_0000_0000_0000;
+const CANONICAL_FLOAT_DECIMAL_PLACES: usize = 13;
 
 const ELLIPSOID_RECORD_SIZE: usize = 20;
 const DATUM_RECORD_SIZE: usize = 72;
@@ -198,7 +196,7 @@ struct RegistryFormatProvenance {
 struct SourceDatabaseProvenance {
     kind: &'static str,
     file_name: &'static str,
-    sha256: String,
+    normalized_content_sha256: String,
     metadata: BTreeMap<String, String>,
 }
 
@@ -545,6 +543,108 @@ fn read_proj_db_metadata(conn: &Connection) -> BTreeMap<String, String> {
     .collect()
 }
 
+fn normalized_proj_db_sha256_for_path(path: &Path) -> Result<String, String> {
+    let conn = Connection::open(path)
+        .map_err(|err| format!("failed to open {}: {err}", path.display()))?;
+    normalized_proj_db_sha256(&conn)
+}
+
+fn normalized_proj_db_sha256(conn: &Connection) -> Result<String, String> {
+    let mut payload = Vec::new();
+    let tables = query_strings(
+        conn,
+        "SELECT name
+         FROM sqlite_schema
+         WHERE type='table' AND name NOT LIKE 'sqlite_%'
+         ORDER BY name",
+    )?;
+
+    for table in tables {
+        append_bytes(&mut payload, b't', table.as_bytes());
+        let columns = table_columns(conn, &table)?;
+        for column in &columns {
+            append_bytes(&mut payload, b'c', column.as_bytes());
+        }
+
+        let quoted_columns = columns
+            .iter()
+            .map(|column| quote_identifier(column))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT {quoted_columns} FROM {} ORDER BY {quoted_columns}",
+            quote_identifier(&table)
+        );
+        let mut stmt = conn.prepare(&sql).map_err(|err| {
+            format!("failed to prepare normalized digest query for {table}: {err}")
+        })?;
+        let mut rows = stmt
+            .query([])
+            .map_err(|err| format!("failed to query {table} for normalized digest: {err}"))?;
+        while let Some(row) = rows
+            .next()
+            .map_err(|err| format!("failed to read {table} row for normalized digest: {err}"))?
+        {
+            payload.push(b'r');
+            for (index, column) in columns.iter().enumerate() {
+                match row
+                    .get_ref(index)
+                    .map_err(|err| format!("failed to read {table}.{column}: {err}"))?
+                {
+                    ValueRef::Null => payload.push(b'n'),
+                    ValueRef::Integer(value) => {
+                        payload.push(b'i');
+                        payload.extend_from_slice(&value.to_le_bytes());
+                    }
+                    ValueRef::Real(value) => {
+                        payload.push(b'f');
+                        payload.extend_from_slice(&canonical_f64(value).to_le_bytes());
+                    }
+                    ValueRef::Text(value) => append_bytes(&mut payload, b's', value),
+                    ValueRef::Blob(value) => append_bytes(&mut payload, b'b', value),
+                }
+            }
+        }
+    }
+
+    Ok(sha256_hex(&payload))
+}
+
+fn query_strings(conn: &Connection, sql: &str) -> Result<Vec<String>, String> {
+    let mut stmt = conn
+        .prepare(sql)
+        .map_err(|err| format!("failed to prepare query `{sql}`: {err}"))?;
+    let rows = stmt
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(|err| format!("failed to run query `{sql}`: {err}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|err| format!("failed to read query `{sql}`: {err}"))?;
+    Ok(rows)
+}
+
+fn table_columns(conn: &Connection, table: &str) -> Result<Vec<String>, String> {
+    let sql = format!("PRAGMA table_info({})", quote_identifier(table));
+    let mut stmt = conn
+        .prepare(&sql)
+        .map_err(|err| format!("failed to prepare column query for {table}: {err}"))?;
+    let columns = stmt
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(|err| format!("failed to query columns for {table}: {err}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|err| format!("failed to read columns for {table}: {err}"))?;
+    Ok(columns)
+}
+
+fn quote_identifier(value: &str) -> String {
+    format!("\"{}\"", value.replace('"', "\"\""))
+}
+
+fn append_bytes(payload: &mut Vec<u8>, marker: u8, bytes: &[u8]) {
+    payload.push(marker);
+    payload.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+    payload.extend_from_slice(bytes);
+}
+
 fn named_codes(items: &[(&str, u8)]) -> BTreeMap<String, u8> {
     items
         .iter()
@@ -600,12 +700,11 @@ fn main() {
         .proj_db
         .clone()
         .unwrap_or_else(|| find_proj_db().unwrap_or_else(|message| fatal(message)));
-    let db_bytes = fs::read(&db_path)
-        .unwrap_or_else(|err| fatal(format!("failed to read {}: {err}", db_path.display())));
-    let db_sha256 = sha256_hex(&db_bytes);
     eprintln!("Using proj.db: {}", db_path.display());
     let conn = Connection::open(&db_path)
         .unwrap_or_else(|err| fatal(format!("failed to open {}: {err}", db_path.display())));
+    let db_sha256 = normalized_proj_db_sha256(&conn)
+        .unwrap_or_else(|err| fatal(format!("failed to digest proj.db content: {err}")));
     let proj_db_metadata = read_proj_db_metadata(&conn);
 
     let mut ellipsoids: BTreeMap<u32, (f64, f64)> = BTreeMap::new();
@@ -1451,8 +1550,8 @@ fn main() {
     for (code, a, inv_f) in &used_ellipsoids {
         let mut rec = [0u8; ELLIPSOID_RECORD_SIZE];
         rec[0..4].copy_from_slice(&code.to_le_bytes());
-        rec[4..12].copy_from_slice(&a.to_le_bytes());
-        rec[12..20].copy_from_slice(&inv_f.to_le_bytes());
+        rec[4..12].copy_from_slice(&canonical_f64(*a).to_le_bytes());
+        rec[12..20].copy_from_slice(&canonical_f64(*inv_f).to_le_bytes());
         buf.extend_from_slice(&rec);
     }
 
@@ -1467,7 +1566,7 @@ fn main() {
         };
         for (index, value) in datum.helmert.iter().enumerate() {
             let offset = 16 + index * 8;
-            rec[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+            rec[offset..offset + 8].copy_from_slice(&canonical_f64(*value).to_le_bytes());
         }
         buf.extend_from_slice(&rec);
     }
@@ -1486,10 +1585,10 @@ fn main() {
         rec[4..8].copy_from_slice(&crs.base_geographic_crs_code.to_le_bytes());
         rec[8..12].copy_from_slice(&crs.datum_code.to_le_bytes());
         rec[12] = crs.method_id;
-        rec[16..24].copy_from_slice(&crs.linear_unit_to_meter.to_le_bytes());
+        rec[16..24].copy_from_slice(&canonical_f64(crs.linear_unit_to_meter).to_le_bytes());
         for (index, value) in crs.params.iter().enumerate() {
             let offset = 24 + index * 8;
-            rec[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+            rec[offset..offset + 8].copy_from_slice(&canonical_f64(*value).to_le_bytes());
         }
         buf.extend_from_slice(&rec);
         write_string_u16(&mut buf, &crs.name);
@@ -1497,10 +1596,10 @@ fn main() {
 
     for extent in &extent_list {
         buf.extend_from_slice(&extent.code.to_le_bytes());
-        buf.extend_from_slice(&extent.west.to_le_bytes());
-        buf.extend_from_slice(&extent.south.to_le_bytes());
-        buf.extend_from_slice(&extent.east.to_le_bytes());
-        buf.extend_from_slice(&extent.north.to_le_bytes());
+        write_f64(&mut buf, extent.west);
+        write_f64(&mut buf, extent.south);
+        write_f64(&mut buf, extent.east);
+        write_f64(&mut buf, extent.north);
         write_string_u16(&mut buf, &extent.name);
     }
 
@@ -1539,10 +1638,7 @@ fn main() {
         buf.extend_from_slice(&operation.target_crs_code.to_le_bytes());
         buf.extend_from_slice(&operation.source_datum_code.to_le_bytes());
         buf.extend_from_slice(&operation.target_datum_code.to_le_bytes());
-        match operation.accuracy {
-            Some(accuracy) => buf.extend_from_slice(&accuracy.to_le_bytes()),
-            None => buf.extend_from_slice(&CANONICAL_NAN_BITS.to_le_bytes()),
-        }
+        write_optional_f64(&mut buf, operation.accuracy);
         write_string_u16(&mut buf, &operation.name);
         for area_code in &operation.area_codes {
             buf.extend_from_slice(&area_code.to_le_bytes());
@@ -1550,7 +1646,7 @@ fn main() {
         match &operation.payload {
             OperationPayload::Helmert(params) => {
                 for value in params {
-                    buf.extend_from_slice(&value.to_le_bytes());
+                    write_f64(&mut buf, *value);
                 }
             }
             OperationPayload::GridShift {
@@ -1585,7 +1681,7 @@ fn main() {
         source_database: SourceDatabaseProvenance {
             kind: "PROJ proj.db",
             file_name: "proj.db",
-            sha256: db_sha256,
+            normalized_content_sha256: db_sha256,
             metadata: proj_db_metadata,
         },
         output: RegistryOutputProvenance {
@@ -1646,6 +1742,27 @@ fn write_string_u16(buf: &mut Vec<u8>, value: &str) {
     let len = u16::try_from(bytes.len()).expect("string too long for embedded registry");
     buf.extend_from_slice(&len.to_le_bytes());
     buf.extend_from_slice(bytes);
+}
+
+fn write_f64(buf: &mut Vec<u8>, value: f64) {
+    buf.extend_from_slice(&canonical_f64(value).to_le_bytes());
+}
+
+fn write_optional_f64(buf: &mut Vec<u8>, value: Option<f64>) {
+    match value {
+        Some(value) => write_f64(buf, value),
+        None => buf.extend_from_slice(&CANONICAL_NAN_BITS.to_le_bytes()),
+    }
+}
+
+fn canonical_f64(value: f64) -> f64 {
+    assert!(value.is_finite(), "registry value must be finite");
+    if value == 0.0 {
+        return 0.0;
+    }
+    format!("{value:.CANONICAL_FLOAT_DECIMAL_PLACES$e}")
+        .parse()
+        .expect("formatted finite f64 should parse")
 }
 
 fn assert_reproducible(path: &Path, expected: &[u8], label: &str) {
@@ -1787,6 +1904,16 @@ mod tests {
         assert_eq!(
             CANONICAL_NAN_BITS.to_le_bytes(),
             [0, 0, 0, 0, 0, 0, 248, 127]
+        );
+    }
+
+    #[test]
+    fn canonical_f64_rounds_to_stable_decimal_precision() {
+        assert_eq!(canonical_f64(-0.0).to_bits(), 0.0f64.to_bits());
+        assert_eq!(canonical_f64(6378137.0000000001), 6378137.0);
+        assert_eq!(
+            canonical_f64(1.2345678901234567).to_bits(),
+            1.2345678901235f64.to_bits()
         );
     }
 
