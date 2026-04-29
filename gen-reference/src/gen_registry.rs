@@ -137,6 +137,7 @@ fn walkdir(dir: &Path, name: &str) -> Vec<PathBuf> {
 const MAGIC: u32 = 0x4550_5347;
 const VERSION: u16 = 6;
 const PROVENANCE_SCHEMA_VERSION: u16 = 1;
+const CANONICAL_NAN_BITS: u64 = 0x7ff8_0000_0000_0000;
 
 const ELLIPSOID_RECORD_SIZE: usize = 20;
 const DATUM_RECORD_SIZE: usize = 72;
@@ -620,7 +621,8 @@ fn main() {
                  JOIN unit_of_measure u
                    ON u.auth_name = e.uom_auth_name
                   AND u.code = e.uom_code
-                 WHERE e.auth_name='EPSG'",
+                 WHERE e.auth_name='EPSG'
+                 ORDER BY CAST(e.code AS INTEGER)",
             )
             .unwrap();
         for row in stmt
@@ -653,7 +655,12 @@ fn main() {
     let mut datums: BTreeMap<u32, DatumInfo> = BTreeMap::new();
     {
         let mut stmt = conn
-            .prepare("SELECT code, ellipsoid_code FROM geodetic_datum WHERE auth_name='EPSG'")
+            .prepare(
+                "SELECT code, ellipsoid_code
+                 FROM geodetic_datum
+                 WHERE auth_name='EPSG'
+                 ORDER BY CAST(code AS INTEGER)",
+            )
             .unwrap();
         for (code, ellipsoid_code) in stmt
             .query_map([], |row| Ok((row.get::<_, u32>(0)?, row.get::<_, u32>(1)?)))
@@ -686,7 +693,8 @@ fn main() {
             .prepare(
                 "SELECT code, conv_factor
                  FROM unit_of_measure
-                 WHERE auth_name='EPSG' AND type='length'",
+                 WHERE auth_name='EPSG' AND type='length'
+                 ORDER BY CAST(code AS INTEGER)",
             )
             .unwrap();
         stmt.query_map([], |row| {
@@ -702,7 +710,8 @@ fn main() {
             .prepare(
                 "SELECT code, conv_factor
                  FROM unit_of_measure
-                 WHERE auth_name='EPSG' AND type='angle'",
+                 WHERE auth_name='EPSG' AND type='angle'
+                 ORDER BY CAST(code AS INTEGER)",
             )
             .unwrap();
         stmt.query_map([], |row| {
@@ -718,7 +727,8 @@ fn main() {
             .prepare(
                 "SELECT code, conv_factor
                  FROM unit_of_measure
-                 WHERE auth_name='EPSG' AND type='scale'",
+                 WHERE auth_name='EPSG' AND type='scale'
+                 ORDER BY CAST(code AS INTEGER)",
             )
             .unwrap();
         stmt.query_map([], |row| {
@@ -748,7 +758,8 @@ fn main() {
                    AND deprecated=0
                  ORDER BY CAST(source_crs_code AS INTEGER),
                           (CASE WHEN rx IS NOT NULL AND rx != 0 THEN 0 ELSE 1 END),
-                          COALESCE(accuracy, 999.0)",
+                          COALESCE(accuracy, 999.0),
+                          CAST(code AS INTEGER)",
             )
             .unwrap();
         let mut datum_accuracy: BTreeMap<u32, f64> = BTreeMap::new();
@@ -871,7 +882,7 @@ fn main() {
                    ON u.auth_name = a.uom_auth_name
                   AND u.code = a.uom_code
                  WHERE pc.auth_name='EPSG' AND pc.deprecated=0
-                 ORDER BY pc.code",
+                 ORDER BY CAST(pc.code AS INTEGER)",
             )
             .unwrap();
         let rows: Vec<ProjectedCrsRow> = stmt
@@ -1345,7 +1356,10 @@ fn main() {
                    ON extent.auth_name = usage.extent_auth_name
                   AND extent.code = usage.extent_code
                  WHERE object_auth_name='EPSG'
-                   AND object_table_name IN ('grid_transformation','helmert_transformation','concatenated_operation')",
+                   AND object_table_name IN ('grid_transformation','helmert_transformation','concatenated_operation')
+                 ORDER BY object_table_name,
+                          CAST(object_code AS INTEGER),
+                          CAST(extent.code AS INTEGER)",
             )
             .unwrap();
         for row in stmt
@@ -1384,6 +1398,10 @@ fn main() {
                 north: row.7,
             });
         }
+    }
+    for operation in &mut operations {
+        operation.area_codes.sort_unstable();
+        operation.area_codes.dedup();
     }
 
     let mut grid_area_by_id: BTreeMap<u32, u32> = BTreeMap::new();
@@ -1521,7 +1539,10 @@ fn main() {
         buf.extend_from_slice(&operation.target_crs_code.to_le_bytes());
         buf.extend_from_slice(&operation.source_datum_code.to_le_bytes());
         buf.extend_from_slice(&operation.target_datum_code.to_le_bytes());
-        buf.extend_from_slice(&operation.accuracy.unwrap_or(f64::NAN).to_le_bytes());
+        match operation.accuracy {
+            Some(accuracy) => buf.extend_from_slice(&accuracy.to_le_bytes()),
+            None => buf.extend_from_slice(&CANONICAL_NAN_BITS.to_le_bytes()),
+        }
         write_string_u16(&mut buf, &operation.name);
         for area_code in &operation.area_codes {
             buf.extend_from_slice(&area_code.to_le_bytes());
@@ -1758,6 +1779,14 @@ mod tests {
         assert_eq!(
             sha256_hex(b"abc"),
             "sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
+
+    #[test]
+    fn canonical_nan_encoding_is_fixed() {
+        assert_eq!(
+            CANONICAL_NAN_BITS.to_le_bytes(),
+            [0, 0, 0, 0, 0, 0, 248, 127]
         );
     }
 
