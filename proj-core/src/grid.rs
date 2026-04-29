@@ -8,7 +8,10 @@ use thiserror::Error;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum GridFormat {
+    /// NTv2 horizontal datum-shift grid (`.gsb`).
     Ntv2,
+    /// NOAA/VDatum binary GTX vertical offset grid (`.gtx`).
+    Gtx,
     Unsupported,
 }
 
@@ -26,6 +29,12 @@ pub struct GridDefinition {
 pub struct GridSample {
     pub lon_shift_radians: f64,
     pub lat_shift_radians: f64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct VerticalGridSample {
+    /// Vertical offset in meters at the sampled horizontal position.
+    pub offset_meters: f64,
 }
 
 #[derive(Debug, Error, Clone)]
@@ -68,6 +77,24 @@ impl GridHandle {
     ) -> std::result::Result<GridSample, GridError> {
         match self.data.as_ref() {
             GridData::Ntv2(set) => set.sample(lon_radians, lat_radians),
+            GridData::Gtx(_) => Err(GridError::UnsupportedFormat(format!(
+                "{} is a vertical grid",
+                self.definition.name
+            ))),
+        }
+    }
+
+    pub fn sample_vertical_offset_meters(
+        &self,
+        lon_radians: f64,
+        lat_radians: f64,
+    ) -> std::result::Result<VerticalGridSample, GridError> {
+        match self.data.as_ref() {
+            GridData::Gtx(grid) => grid.sample(lon_radians, lat_radians),
+            GridData::Ntv2(_) => Err(GridError::UnsupportedFormat(format!(
+                "{} is a horizontal grid",
+                self.definition.name
+            ))),
         }
     }
 
@@ -79,6 +106,10 @@ impl GridHandle {
     ) -> std::result::Result<(f64, f64), GridError> {
         match self.data.as_ref() {
             GridData::Ntv2(set) => set.apply(lon_radians, lat_radians, direction),
+            GridData::Gtx(_) => Err(GridError::UnsupportedFormat(format!(
+                "{} is a vertical grid",
+                self.definition.name
+            ))),
         }
     }
 }
@@ -263,6 +294,7 @@ impl GridProvider for FilesystemGridProvider {
 
 enum GridData {
     Ntv2(Ntv2GridSet),
+    Gtx(GtxGrid),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -312,6 +344,7 @@ fn parse_grid_data(
 ) -> std::result::Result<GridData, GridError> {
     match format {
         GridFormat::Ntv2 => Ok(GridData::Ntv2(Ntv2GridSet::parse(bytes)?)),
+        GridFormat::Gtx => Ok(GridData::Gtx(GtxGrid::parse(bytes)?)),
         GridFormat::Unsupported => Err(GridError::UnsupportedFormat(name.into())),
     }
 }
@@ -653,6 +686,177 @@ fn interpolate(
     Ok((lon, lat))
 }
 
+#[derive(Clone)]
+struct GtxGrid {
+    west_degrees: f64,
+    south_degrees: f64,
+    east_degrees: f64,
+    north_degrees: f64,
+    delta_lon_degrees: f64,
+    delta_lat_degrees: f64,
+    width: usize,
+    height: usize,
+    offsets_meters: Vec<f64>,
+}
+
+impl GtxGrid {
+    fn parse(bytes: &[u8]) -> std::result::Result<Self, GridError> {
+        const HEADER_LEN: usize = 40;
+
+        if bytes.len() < HEADER_LEN {
+            return Err(GridError::Parse("GTX file too small".into()));
+        }
+
+        let south_degrees = read_f64(bytes, 0, Endian::Big)?;
+        let west_degrees = read_f64(bytes, 8, Endian::Big)?;
+        let delta_lat_degrees = read_f64(bytes, 16, Endian::Big)?;
+        let delta_lon_degrees = read_f64(bytes, 24, Endian::Big)?;
+        let height_i32 = read_i32(bytes, 32, Endian::Big)?;
+        let width_i32 = read_i32(bytes, 36, Endian::Big)?;
+
+        if !(west_degrees.is_finite()
+            && south_degrees.is_finite()
+            && delta_lon_degrees.is_finite()
+            && delta_lat_degrees.is_finite()
+            && delta_lon_degrees > 0.0
+            && delta_lat_degrees > 0.0
+            && width_i32 >= 2
+            && height_i32 >= 2)
+        {
+            return Err(GridError::Parse("invalid GTX georeferencing".into()));
+        }
+        let height = height_i32 as usize;
+        let width = width_i32 as usize;
+
+        let count = width
+            .checked_mul(height)
+            .ok_or_else(|| GridError::Parse("GTX data size overflow".into()))?;
+        let expected_len = HEADER_LEN
+            + count
+                .checked_mul(4)
+                .ok_or_else(|| GridError::Parse("GTX data size overflow".into()))?;
+        if bytes.len() < expected_len {
+            return Err(GridError::Parse("truncated GTX data".into()));
+        }
+
+        let mut offsets_meters = Vec::with_capacity(count);
+        for index in 0..count {
+            let value = read_f32(bytes, HEADER_LEN + index * 4, Endian::Big)? as f64;
+            if (value + 88.8888).abs() <= 1e-4 {
+                offsets_meters.push(f64::NAN);
+            } else {
+                offsets_meters.push(value);
+            }
+        }
+
+        let east_degrees = west_degrees + delta_lon_degrees * (width - 1) as f64;
+        let north_degrees = south_degrees + delta_lat_degrees * (height - 1) as f64;
+
+        Ok(Self {
+            west_degrees,
+            south_degrees,
+            east_degrees,
+            north_degrees,
+            delta_lon_degrees,
+            delta_lat_degrees,
+            width,
+            height,
+            offsets_meters,
+        })
+    }
+
+    fn sample(
+        &self,
+        lon_radians: f64,
+        lat_radians: f64,
+    ) -> std::result::Result<VerticalGridSample, GridError> {
+        let lon_degrees = self.normalize_lon_degrees(lon_radians.to_degrees());
+        let lat_degrees = lat_radians.to_degrees();
+
+        if !self.contains(lon_degrees, lat_degrees) {
+            return Err(GridError::OutsideCoverage(format!(
+                "longitude {:.8} latitude {:.8}",
+                lon_radians.to_degrees(),
+                lat_degrees
+            )));
+        }
+
+        let lam = (lon_degrees - self.west_degrees) / self.delta_lon_degrees;
+        let phi = (lat_degrees - self.south_degrees) / self.delta_lat_degrees;
+        let mut x = lam.floor() as isize;
+        let mut y = phi.floor() as isize;
+        let mut fx = lam - x as f64;
+        let mut fy = phi - y as f64;
+
+        if x as usize + 1 >= self.width {
+            if x as usize + 1 == self.width && fx < 1e-9 {
+                x -= 1;
+                fx = 1.0;
+            } else {
+                return Err(GridError::OutsideCoverage("GTX longitude edge".into()));
+            }
+        }
+        if y as usize + 1 >= self.height {
+            if y as usize + 1 == self.height && fy < 1e-9 {
+                y -= 1;
+                fy = 1.0;
+            } else {
+                return Err(GridError::OutsideCoverage("GTX latitude edge".into()));
+            }
+        }
+        if x < 0 || y < 0 {
+            return Err(GridError::OutsideCoverage("GTX negative grid index".into()));
+        }
+
+        let x0 = x as usize;
+        let y0 = y as usize;
+        let x1 = x0 + 1;
+        let y1 = y0 + 1;
+        let idx = |xx: usize, yy: usize| yy * self.width + xx;
+        let z00 = self.offsets_meters[idx(x0, y0)];
+        let z10 = self.offsets_meters[idx(x1, y0)];
+        let z01 = self.offsets_meters[idx(x0, y1)];
+        let z11 = self.offsets_meters[idx(x1, y1)];
+
+        if !(z00.is_finite() && z10.is_finite() && z01.is_finite() && z11.is_finite()) {
+            return Err(GridError::OutsideCoverage(
+                "GTX interpolation touches a null cell".into(),
+            ));
+        }
+
+        let m00 = (1.0 - fx) * (1.0 - fy);
+        let m10 = fx * (1.0 - fy);
+        let m01 = (1.0 - fx) * fy;
+        let m11 = fx * fy;
+        Ok(VerticalGridSample {
+            offset_meters: m00 * z00 + m10 * z10 + m01 * z01 + m11 * z11,
+        })
+    }
+
+    fn contains(&self, lon_degrees: f64, lat_degrees: f64) -> bool {
+        let epsilon = (self.delta_lon_degrees + self.delta_lat_degrees) * 1e-10;
+        lon_degrees >= self.west_degrees - epsilon
+            && lon_degrees <= self.east_degrees + epsilon
+            && lat_degrees >= self.south_degrees - epsilon
+            && lat_degrees <= self.north_degrees + epsilon
+    }
+
+    fn normalize_lon_degrees(&self, lon_degrees: f64) -> f64 {
+        if self.contains(lon_degrees, self.south_degrees) {
+            return lon_degrees;
+        }
+
+        let mut lon = lon_degrees;
+        while lon < self.west_degrees {
+            lon += 360.0;
+        }
+        while lon > self.east_degrees {
+            lon -= 360.0;
+        }
+        lon
+    }
+}
+
 #[derive(Clone, Copy)]
 enum Endian {
     Little,
@@ -674,6 +878,16 @@ fn read_u32(bytes: &[u8], offset: usize, endian: Endian) -> std::result::Result<
     Ok(match endian {
         Endian::Little => u32::from_le_bytes(slice.try_into().expect("slice length checked")),
         Endian::Big => u32::from_be_bytes(slice.try_into().expect("slice length checked")),
+    })
+}
+
+fn read_i32(bytes: &[u8], offset: usize, endian: Endian) -> std::result::Result<i32, GridError> {
+    let slice = bytes
+        .get(offset..offset + 4)
+        .ok_or_else(|| GridError::Parse("truncated integer".into()))?;
+    Ok(match endian {
+        Endian::Little => i32::from_le_bytes(slice.try_into().expect("slice length checked")),
+        Endian::Big => i32::from_be_bytes(slice.try_into().expect("slice length checked")),
     })
 }
 
@@ -781,6 +995,53 @@ mod tests {
             area_of_use: None,
             resource_names: SmallVec::from_vec(vec!["ntv2_0.gsb".into()]),
         }
+    }
+
+    fn test_gtx_bytes(values: &[f32]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&10.0f64.to_be_bytes());
+        bytes.extend_from_slice(&20.0f64.to_be_bytes());
+        bytes.extend_from_slice(&1.0f64.to_be_bytes());
+        bytes.extend_from_slice(&1.0f64.to_be_bytes());
+        bytes.extend_from_slice(&3i32.to_be_bytes());
+        bytes.extend_from_slice(&3i32.to_be_bytes());
+        for value in values {
+            bytes.extend_from_slice(&value.to_be_bytes());
+        }
+        bytes
+    }
+
+    #[test]
+    fn gtx_grid_samples_bilinear_offsets() {
+        let bytes = test_gtx_bytes(&[0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]);
+        let data = parse_grid_data(GridFormat::Gtx, "test.gtx", &bytes).unwrap();
+        let GridData::Gtx(grid) = data else {
+            panic!("expected GTX grid");
+        };
+
+        let sample = grid
+            .sample(20.5f64.to_radians(), 10.5f64.to_radians())
+            .unwrap();
+        assert!((sample.offset_meters - 2.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn gtx_grid_rejects_outside_or_null_cells() {
+        let bytes = test_gtx_bytes(&[0.0, 1.0, 2.0, 3.0, -88.8888, 5.0, 6.0, 7.0, 8.0]);
+        let data = parse_grid_data(GridFormat::Gtx, "test.gtx", &bytes).unwrap();
+        let GridData::Gtx(grid) = data else {
+            panic!("expected GTX grid");
+        };
+
+        let null_err = grid
+            .sample(20.5f64.to_radians(), 10.5f64.to_radians())
+            .unwrap_err();
+        assert!(matches!(null_err, GridError::OutsideCoverage(_)));
+
+        let outside_err = grid
+            .sample(30.0f64.to_radians(), 10.5f64.to_radians())
+            .unwrap_err();
+        assert!(matches!(outside_err, GridError::OutsideCoverage(_)));
     }
 
     #[test]

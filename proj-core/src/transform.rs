@@ -9,6 +9,7 @@ use crate::operation::{
     CoordinateOperation, CoordinateOperationId, CoordinateOperationMetadata, GridCoverageMiss,
     GridShiftDirection, OperationMethod, OperationSelectionDiagnostics, OperationStepDirection,
     SelectionOptions, SelectionPolicy, SkippedOperation, SkippedOperationReason, TransformOutcome,
+    VerticalGridOffsetConvention, VerticalGridOperation, VerticalGridProvenance,
     VerticalTransformAction, VerticalTransformDiagnostics,
 };
 use crate::projection::{make_projection, Projection};
@@ -16,6 +17,7 @@ use crate::registry;
 use crate::selector;
 use crate::{ellipsoid, geocentric};
 use smallvec::SmallVec;
+use std::sync::Arc;
 
 #[cfg(feature = "rayon")]
 const PARALLEL_MIN_TOTAL_ITEMS: usize = 16_384;
@@ -90,17 +92,86 @@ enum VerticalTransform {
         target_unit: LinearUnit,
         diagnostics: VerticalTransformDiagnostics,
     },
+    GridShift {
+        handle: GridHandle,
+        direction: VerticalGridShiftDirection,
+        source_unit: LinearUnit,
+        target_unit: LinearUnit,
+        sample_horizontal: VerticalSampleHorizontal,
+        diagnostics: VerticalTransformDiagnostics,
+    },
+}
+
+#[derive(Clone, Copy)]
+enum VerticalGridShiftDirection {
+    EllipsoidToGravity,
+    GravityToEllipsoid,
+}
+
+#[derive(Clone)]
+enum VerticalSampleHorizontal {
+    Geographic,
+    Projected {
+        projection: Arc<Projection>,
+        linear_unit: LinearUnit,
+    },
+}
+
+impl VerticalSampleHorizontal {
+    fn compile(source: &CrsDef) -> Result<Self> {
+        if let Some(projected) = source.as_projected() {
+            return Ok(Self::Projected {
+                projection: Arc::new(make_projection(&projected.method(), projected.datum())?),
+                linear_unit: projected.linear_unit(),
+            });
+        }
+        if source.as_geographic().is_some() {
+            return Ok(Self::Geographic);
+        }
+        Err(Error::InvalidDefinition(
+            "vertical grid transforms require a horizontal CRS component".into(),
+        ))
+    }
+
+    fn lon_lat_radians(&self, x: f64, y: f64) -> Result<(f64, f64)> {
+        match self {
+            Self::Geographic => Ok((x.to_radians(), y.to_radians())),
+            Self::Projected {
+                projection,
+                linear_unit,
+            } => projection.inverse(linear_unit.to_meters(x), linear_unit.to_meters(y)),
+        }
+    }
 }
 
 impl VerticalTransform {
-    fn apply(&self, z: f64) -> f64 {
+    fn apply(&self, coord: Coord3D) -> Result<f64> {
         match self {
-            Self::None { .. } | Self::Preserve { .. } => z,
+            Self::None { .. } | Self::Preserve { .. } => Ok(coord.z),
             Self::UnitConvert {
                 source_unit,
                 target_unit,
                 ..
-            } => target_unit.from_meters(source_unit.to_meters(z)),
+            } => Ok(target_unit.from_meters(source_unit.to_meters(coord.z))),
+            Self::GridShift {
+                handle,
+                direction,
+                source_unit,
+                target_unit,
+                sample_horizontal,
+                ..
+            } => {
+                let (lon, lat) = sample_horizontal.lon_lat_radians(coord.x, coord.y)?;
+                let offset_meters = handle
+                    .sample_vertical_offset_meters(lon, lat)?
+                    .offset_meters;
+                let source_meters = source_unit.to_meters(coord.z);
+                let target_meters = match direction {
+                    VerticalGridShiftDirection::EllipsoidToGravity => source_meters - offset_meters,
+                    VerticalGridShiftDirection::GravityToEllipsoid => source_meters + offset_meters,
+                };
+                Ok(target_unit.from_meters(target_meters))
+            }
         }
     }
 
@@ -108,27 +179,8 @@ impl VerticalTransform {
         match self {
             Self::None { diagnostics }
             | Self::Preserve { diagnostics }
-            | Self::UnitConvert { diagnostics, .. } => diagnostics,
-        }
-    }
-
-    fn inverse(&self) -> Self {
-        match self {
-            Self::None { diagnostics } => Self::None {
-                diagnostics: inverse_vertical_diagnostics(diagnostics),
-            },
-            Self::Preserve { diagnostics } => Self::Preserve {
-                diagnostics: inverse_vertical_diagnostics(diagnostics),
-            },
-            Self::UnitConvert {
-                source_unit,
-                target_unit,
-                diagnostics,
-            } => Self::UnitConvert {
-                source_unit: *target_unit,
-                target_unit: *source_unit,
-                diagnostics: inverse_vertical_diagnostics(diagnostics),
-            },
+            | Self::UnitConvert { diagnostics, .. }
+            | Self::GridShift { diagnostics, .. } => diagnostics,
         }
     }
 }
@@ -218,9 +270,8 @@ impl Transform {
         to: &CrsDef,
         options: SelectionOptions,
     ) -> Result<Self> {
-        let vertical_transform = compile_vertical_transform(from, to)?;
-
         let grid_runtime = GridRuntime::new(options.grid_provider.clone());
+        let vertical_transform = compile_vertical_transform(from, to, &options, &grid_runtime)?;
         let candidate_set = selector::rank_operation_candidates(from, to, &options)?;
         if candidate_set.ranked.is_empty() {
             return Err(match options.policy {
@@ -440,6 +491,13 @@ impl Transform {
     /// Build the inverse transform by swapping the source and target CRS.
     pub fn inverse(&self) -> Result<Self> {
         let grid_runtime = GridRuntime::new(self.selection_options.grid_provider.clone());
+        let inverse_options = self.selection_options.inverse();
+        let vertical_transform = compile_vertical_transform(
+            &self.target,
+            &self.source,
+            &inverse_options,
+            &grid_runtime,
+        )?;
         let selected_direction = self.selected_direction.inverse();
         let pipeline = compile_pipeline(
             &self.target,
@@ -469,8 +527,8 @@ impl Transform {
             selected_direction,
             selected_operation,
             diagnostics,
-            vertical_transform: self.vertical_transform.inverse(),
-            selection_options: self.selection_options.inverse(),
+            vertical_transform,
+            selection_options: inverse_options,
             pipeline,
             fallback_pipelines: Vec::new(),
         })
@@ -591,7 +649,7 @@ impl Transform {
         c: Coord3D,
     ) -> Result<Coord3D> {
         if pipeline.steps.is_empty() {
-            return Ok(Coord3D::new(c.x, c.y, self.vertical_transform.apply(c.z)));
+            return Ok(Coord3D::new(c.x, c.y, self.vertical_transform.apply(c)?));
         }
         let mut state = if self.source.is_projected() {
             let (x_m, y_m) = self.source_projected_native_to_meters(c.x, c.y);
@@ -610,7 +668,7 @@ impl Transform {
             (state.x.to_degrees(), state.y.to_degrees())
         };
 
-        Ok(Coord3D::new(x, y, self.vertical_transform.apply(c.z)))
+        Ok(Coord3D::new(x, y, self.vertical_transform.apply(c)?))
     }
 
     fn source_projected_native_to_meters(&self, x: f64, y: f64) -> (f64, f64) {
@@ -759,7 +817,12 @@ fn validate_output_len(input_len: usize, output_len: usize) -> Result<()> {
     Ok(())
 }
 
-fn compile_vertical_transform(source: &CrsDef, target: &CrsDef) -> Result<VerticalTransform> {
+fn compile_vertical_transform(
+    source: &CrsDef,
+    target: &CrsDef,
+    options: &SelectionOptions,
+    grid_runtime: &GridRuntime,
+) -> Result<VerticalTransform> {
     match (source.vertical_crs(), target.vertical_crs()) {
         (None, None) => Ok(VerticalTransform::None {
             diagnostics: vertical_diagnostics(
@@ -800,6 +863,28 @@ fn compile_vertical_transform(source: &CrsDef, target: &CrsDef) -> Result<Vertic
         (Some(source_vertical), Some(target_vertical))
             if is_ellipsoidal_gravity_pair(source_vertical, target_vertical) =>
         {
+            if let Some(operation) =
+                matching_vertical_grid_operation(source_vertical, target_vertical, options)
+            {
+                match operation.offset_convention {
+                    VerticalGridOffsetConvention::GeoidHeightMeters => {}
+                }
+                let handle = grid_runtime.resolve_handle(&operation.grid)?;
+                let direction = vertical_grid_shift_direction(source_vertical, target_vertical)?;
+                return Ok(VerticalTransform::GridShift {
+                    handle,
+                    direction,
+                    source_unit: source_vertical.linear_unit(),
+                    target_unit: target_vertical.linear_unit(),
+                    sample_horizontal: VerticalSampleHorizontal::compile(source)?,
+                    diagnostics: vertical_grid_diagnostics(
+                        operation,
+                        source_vertical,
+                        target_vertical,
+                    ),
+                });
+            }
+
             Err(Error::OperationSelection(format!(
                 "vertical CRS transformations between ellipsoidal and gravity-related heights require a supported geoid grid operation; no supported vertical grid operation is available for source {} target {}",
                 vertical_label(source_vertical),
@@ -815,6 +900,77 @@ fn compile_vertical_transform(source: &CrsDef, target: &CrsDef) -> Result<Vertic
             "cannot transform between an explicit vertical CRS and a horizontal-only CRS; vertical CRS transformations are not supported".into(),
         )),
     }
+}
+
+fn matching_vertical_grid_operation<'a>(
+    source: &VerticalCrsDef,
+    target: &VerticalCrsDef,
+    options: &'a SelectionOptions,
+) -> Option<&'a VerticalGridOperation> {
+    options
+        .vertical_grid_operations
+        .iter()
+        .find(|operation| vertical_grid_operation_matches(operation, source, target))
+}
+
+fn vertical_grid_operation_matches(
+    operation: &VerticalGridOperation,
+    source: &VerticalCrsDef,
+    target: &VerticalCrsDef,
+) -> bool {
+    vertical_crs_filter_matches(operation.source_vertical_crs_epsg, source)
+        && vertical_crs_filter_matches(operation.target_vertical_crs_epsg, target)
+        && vertical_datum_filter_matches(operation.source_vertical_datum_epsg, source)
+        && vertical_datum_filter_matches(operation.target_vertical_datum_epsg, target)
+}
+
+fn vertical_crs_filter_matches(filter: Option<u32>, vertical: &VerticalCrsDef) -> bool {
+    filter.is_none_or(|epsg| nonzero_vertical_epsg(vertical) == Some(epsg))
+}
+
+fn vertical_datum_filter_matches(filter: Option<u32>, vertical: &VerticalCrsDef) -> bool {
+    filter.is_none_or(|epsg| vertical.vertical_datum_epsg() == Some(epsg))
+}
+
+fn vertical_grid_shift_direction(
+    source: &VerticalCrsDef,
+    target: &VerticalCrsDef,
+) -> Result<VerticalGridShiftDirection> {
+    if source.kind().is_ellipsoidal_height() && target.kind().is_gravity_related_height() {
+        return Ok(VerticalGridShiftDirection::EllipsoidToGravity);
+    }
+    if source.kind().is_gravity_related_height() && target.kind().is_ellipsoidal_height() {
+        return Ok(VerticalGridShiftDirection::GravityToEllipsoid);
+    }
+    Err(Error::OperationSelection(
+        "vertical grid operations currently support ellipsoidal height to/from gravity-related height".into(),
+    ))
+}
+
+fn vertical_grid_diagnostics(
+    operation: &VerticalGridOperation,
+    source: &VerticalCrsDef,
+    target: &VerticalCrsDef,
+) -> VerticalTransformDiagnostics {
+    let mut diagnostics = vertical_diagnostics(
+        VerticalTransformAction::Transformed,
+        Some(operation.name.clone()),
+        Some(source),
+        Some(target),
+    );
+    diagnostics.accuracy = operation.accuracy;
+    diagnostics.area_of_use = operation
+        .area_of_use
+        .clone()
+        .or_else(|| operation.grid.area_of_use.clone());
+    diagnostics.grids.push(VerticalGridProvenance {
+        name: operation.grid.name.clone(),
+        checksum: None,
+        accuracy: operation.accuracy,
+        area_of_use: operation.grid.area_of_use.clone(),
+        area_of_use_match: None,
+    });
+    diagnostics
 }
 
 fn vertical_diagnostics(
@@ -837,25 +993,6 @@ fn vertical_diagnostics(
         area_of_use_match: None,
         grids: Vec::new(),
     }
-}
-
-fn inverse_vertical_diagnostics(
-    diagnostics: &VerticalTransformDiagnostics,
-) -> VerticalTransformDiagnostics {
-    let mut inverse = diagnostics.clone();
-    std::mem::swap(
-        &mut inverse.source_vertical_crs_epsg,
-        &mut inverse.target_vertical_crs_epsg,
-    );
-    std::mem::swap(
-        &mut inverse.source_vertical_datum_epsg,
-        &mut inverse.target_vertical_datum_epsg,
-    );
-    std::mem::swap(
-        &mut inverse.source_unit_to_meter,
-        &mut inverse.target_unit_to_meter,
-    );
-    inverse
 }
 
 fn nonzero_vertical_epsg(vertical: &VerticalCrsDef) -> Option<u32> {
@@ -1351,17 +1488,72 @@ mod tests {
         ProjectionMethod, VerticalCrsDef,
     };
     use crate::datum::{self, DatumToWgs84};
+    use crate::grid::{FilesystemGridProvider, GridDefinition, GridFormat};
     use crate::operation::{
-        AreaOfInterest, OperationMatchKind, SelectionPolicy, SelectionReason,
-        SkippedOperationReason, VerticalTransformAction,
+        AreaOfInterest, GridId, GridInterpolation, OperationMatchKind, SelectionPolicy,
+        SelectionReason, SkippedOperationReason, VerticalGridOffsetConvention,
+        VerticalGridOperation, VerticalTransformAction,
     };
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
 
     const US_FOOT_TO_METER: f64 = 0.3048006096012192;
+    static TEMP_GRID_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
     fn expect_transform_error(result: Result<Transform>) -> Error {
         match result {
             Ok(_) => panic!("expected transform construction to fail"),
             Err(err) => err,
+        }
+    }
+
+    fn write_test_gtx(values: &[f32]) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "proj-core-vertical-grid-{}-{}",
+            std::process::id(),
+            TEMP_GRID_COUNTER.fetch_add(1, Ordering::SeqCst)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&40.0f64.to_be_bytes());
+        bytes.extend_from_slice(&(-75.0f64).to_be_bytes());
+        bytes.extend_from_slice(&1.0f64.to_be_bytes());
+        bytes.extend_from_slice(&1.0f64.to_be_bytes());
+        bytes.extend_from_slice(&2i32.to_be_bytes());
+        bytes.extend_from_slice(&2i32.to_be_bytes());
+        for value in values {
+            bytes.extend_from_slice(&value.to_be_bytes());
+        }
+        std::fs::write(dir.join("test.gtx"), bytes).unwrap();
+        dir
+    }
+
+    fn test_vertical_grid_operation() -> VerticalGridOperation {
+        VerticalGridOperation {
+            name: "Test geoid height to NAVD88".into(),
+            grid: GridDefinition {
+                id: GridId(900_001),
+                name: "test.gtx".into(),
+                format: GridFormat::Gtx,
+                interpolation: GridInterpolation::Bilinear,
+                area_of_use: Some(crate::operation::AreaOfUse {
+                    west: -75.0,
+                    south: 40.0,
+                    east: -74.0,
+                    north: 41.0,
+                    name: "test grid".into(),
+                }),
+                resource_names: SmallVec::from_vec(vec!["test.gtx".into()]),
+            },
+            grid_horizontal_crs_epsg: Some(4326),
+            source_vertical_crs_epsg: None,
+            target_vertical_crs_epsg: Some(5703),
+            source_vertical_datum_epsg: None,
+            target_vertical_datum_epsg: Some(5103),
+            accuracy: Some(crate::operation::OperationAccuracy { meters: 0.01 }),
+            area_of_use: None,
+            offset_convention: VerticalGridOffsetConvention::GeoidHeightMeters,
         }
     }
 
@@ -1895,6 +2087,80 @@ mod tests {
         assert_eq!(outcome.vertical.source_vertical_crs_epsg, Some(5703));
         assert_eq!(outcome.vertical.source_vertical_datum_epsg, Some(5103));
         assert_eq!(outcome.vertical.target_vertical_datum_epsg, Some(5103));
+    }
+
+    #[test]
+    fn vertical_geoid_grid_transforms_ellipsoidal_to_gravity_height() {
+        let grid_root = write_test_gtx(&[-30.0, -30.0, -30.0, -30.0]);
+        let source = registry::lookup_epsg(4979).unwrap();
+        let target_horizontal = ProjectedCrsDef::new_with_base_geographic_crs(
+            3857,
+            4326,
+            datum::WGS84,
+            ProjectionMethod::WebMercator,
+            LinearUnit::metre(),
+            "WGS 84 / Pseudo-Mercator",
+        );
+        let target_vertical = registry::lookup_vertical_epsg(5703).unwrap();
+        let target = CrsDef::Compound(Box::new(CompoundCrsDef::new(
+            0,
+            HorizontalCrsDef::Projected(target_horizontal),
+            target_vertical,
+            "WGS 84 / Pseudo-Mercator + NAVD88 height",
+        )));
+
+        let t = Transform::from_crs_defs_with_selection_options(
+            &source,
+            &target,
+            SelectionOptions {
+                grid_provider: Some(Arc::new(FilesystemGridProvider::new(vec![grid_root]))),
+                vertical_grid_operations: vec![test_vertical_grid_operation()],
+                ..SelectionOptions::default()
+            },
+        )
+        .unwrap();
+
+        let outcome = t.convert_3d_with_diagnostics((-74.5, 40.5, 100.0)).unwrap();
+        assert!((outcome.coord.2 - 130.0).abs() < 1e-9);
+        assert_eq!(
+            outcome.vertical.action,
+            VerticalTransformAction::Transformed
+        );
+        assert_eq!(outcome.vertical.target_vertical_crs_epsg, Some(5703));
+        assert_eq!(outcome.vertical.grids[0].name, "test.gtx");
+
+        let inverse = t.inverse().unwrap();
+        let roundtrip = inverse.convert_3d(outcome.coord).unwrap();
+        assert!((roundtrip.0 - -74.5).abs() < 1e-6);
+        assert!((roundtrip.1 - 40.5).abs() < 1e-6);
+        assert!((roundtrip.2 - 100.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn vertical_geoid_grid_rejects_outside_coverage() {
+        let grid_root = write_test_gtx(&[-30.0, -30.0, -30.0, -30.0]);
+        let horizontal =
+            HorizontalCrsDef::Geographic(GeographicCrsDef::new(4326, datum::WGS84, "WGS 84"));
+        let target = CrsDef::Compound(Box::new(CompoundCrsDef::new(
+            0,
+            horizontal,
+            registry::lookup_vertical_epsg(5703).unwrap(),
+            "WGS 84 + NAVD88 height",
+        )));
+        let source = registry::lookup_epsg(4979).unwrap();
+        let t = Transform::from_crs_defs_with_selection_options(
+            &source,
+            &target,
+            SelectionOptions {
+                grid_provider: Some(Arc::new(FilesystemGridProvider::new(vec![grid_root]))),
+                vertical_grid_operations: vec![test_vertical_grid_operation()],
+                ..SelectionOptions::default()
+            },
+        )
+        .unwrap();
+
+        let err = t.convert_3d((-80.0, 40.5, 100.0)).unwrap_err();
+        assert!(matches!(err, Error::Grid(GridError::OutsideCoverage(_))));
     }
 
     #[test]

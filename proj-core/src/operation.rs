@@ -308,11 +308,57 @@ pub enum SelectionPolicy {
     Operation(CoordinateOperationId),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VerticalGridOffsetConvention {
+    /// Grid values are geoid heights in meters (`N`), applied as
+    /// gravity height `H = h - N` and ellipsoidal height `h = H + N`.
+    GeoidHeightMeters,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct VerticalGridOperation {
+    /// Human-readable operation name used in diagnostics.
+    pub name: String,
+    /// Grid resource definition resolved through the configured grid provider.
+    pub grid: crate::grid::GridDefinition,
+    /// Horizontal CRS EPSG code in which the grid is sampled, when known.
+    pub grid_horizontal_crs_epsg: Option<u32>,
+    /// Optional source vertical CRS EPSG filter.
+    pub source_vertical_crs_epsg: Option<u32>,
+    /// Optional target vertical CRS EPSG filter.
+    pub target_vertical_crs_epsg: Option<u32>,
+    /// Optional source gravity-related vertical datum EPSG filter.
+    pub source_vertical_datum_epsg: Option<u32>,
+    /// Optional target gravity-related vertical datum EPSG filter.
+    pub target_vertical_datum_epsg: Option<u32>,
+    /// Expected operation accuracy in meters, when known.
+    pub accuracy: Option<OperationAccuracy>,
+    /// Operation area of use, when distinct from the grid's area.
+    pub area_of_use: Option<AreaOfUse>,
+    pub offset_convention: VerticalGridOffsetConvention,
+}
+
+impl VerticalGridOperation {
+    pub fn inverse(&self) -> Self {
+        let mut inverse = self.clone();
+        std::mem::swap(
+            &mut inverse.source_vertical_crs_epsg,
+            &mut inverse.target_vertical_crs_epsg,
+        );
+        std::mem::swap(
+            &mut inverse.source_vertical_datum_epsg,
+            &mut inverse.target_vertical_datum_epsg,
+        );
+        inverse
+    }
+}
+
 #[derive(Clone)]
 pub struct SelectionOptions {
     pub area_of_interest: Option<AreaOfInterest>,
     pub policy: SelectionPolicy,
     pub grid_provider: Option<Arc<dyn crate::grid::GridProvider>>,
+    pub vertical_grid_operations: Vec<VerticalGridOperation>,
 }
 
 impl Default for SelectionOptions {
@@ -321,6 +367,7 @@ impl Default for SelectionOptions {
             area_of_interest: None,
             policy: SelectionPolicy::BestAvailable,
             grid_provider: None,
+            vertical_grid_operations: Vec::new(),
         }
     }
 }
@@ -331,6 +378,11 @@ impl SelectionOptions {
             area_of_interest: self.area_of_interest.map(AreaOfInterest::inverse),
             policy: self.policy.clone(),
             grid_provider: self.grid_provider.clone(),
+            vertical_grid_operations: self
+                .vertical_grid_operations
+                .iter()
+                .map(VerticalGridOperation::inverse)
+                .collect(),
         }
     }
 }

@@ -16,8 +16,8 @@
 //! source and target compound CRS definitions have identical vertical
 //! components. It converts `z` units when both vertical components use the same
 //! vertical reference frame with different linear units. Grid/geoid height
-//! transformations are intentionally rejected until supported vertical
-//! operations and grid policy are implemented.
+//! transformations require explicit vertical grid operations and caller-supplied
+//! grid resources; otherwise they are rejected.
 //!
 //! # Example
 //!
@@ -62,15 +62,16 @@ pub use ellipsoid::Ellipsoid;
 pub use error::{Error, Result};
 pub use grid::{
     EmbeddedGridProvider, FilesystemGridProvider, GridDefinition, GridError, GridFormat,
-    GridHandle, GridProvider, GridSample,
+    GridHandle, GridProvider, GridSample, VerticalGridSample,
 };
 pub use operation::{
     AreaOfInterest, AreaOfInterestCrs, AreaOfUse, CoordinateOperation, CoordinateOperationId,
     CoordinateOperationMetadata, GridCoverageMiss, GridId, GridInterpolation, GridShiftDirection,
     OperationAccuracy, OperationMatchKind, OperationMethod, OperationSelectionDiagnostics,
     OperationStep, OperationStepDirection, SelectionOptions, SelectionPolicy, SelectionReason,
-    SkippedOperation, SkippedOperationReason, TransformOutcome, VerticalGridProvenance,
-    VerticalTransformAction, VerticalTransformDiagnostics,
+    SkippedOperation, SkippedOperationReason, TransformOutcome, VerticalGridOffsetConvention,
+    VerticalGridOperation, VerticalGridProvenance, VerticalTransformAction,
+    VerticalTransformDiagnostics,
 };
 pub use registry::{
     lookup_authority_code, lookup_datum_epsg, lookup_epsg, lookup_operation, lookup_vertical_epsg,
