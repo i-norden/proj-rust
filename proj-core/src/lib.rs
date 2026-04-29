@@ -12,10 +12,12 @@
 //! [`Transform::selection_diagnostics`].
 //! The [`registry`], [`operation`], and [`grid`] modules expose the embedded
 //! operation catalog, selection metadata, and NTv2 grid-provider interfaces.
-//! `convert_3d` preserves `z` only when no explicit vertical CRS is present or
-//! when source and target compound CRS definitions have identical vertical
-//! components. Vertical/geoid height transformations are intentionally rejected
-//! until supported vertical operations and grid policy are implemented.
+//! `convert_3d` preserves `z` when no explicit vertical CRS is present or when
+//! source and target compound CRS definitions have identical vertical
+//! components. It converts `z` units when both vertical components use the same
+//! vertical reference frame with different linear units. Grid/geoid height
+//! transformations are intentionally rejected until supported vertical
+//! operations and grid policy are implemented.
 //!
 //! # Example
 //!
@@ -67,10 +69,11 @@ pub use operation::{
     CoordinateOperationMetadata, GridCoverageMiss, GridId, GridInterpolation, GridShiftDirection,
     OperationAccuracy, OperationMatchKind, OperationMethod, OperationSelectionDiagnostics,
     OperationStep, OperationStepDirection, SelectionOptions, SelectionPolicy, SelectionReason,
-    SkippedOperation, SkippedOperationReason, TransformOutcome,
+    SkippedOperation, SkippedOperationReason, TransformOutcome, VerticalGridProvenance,
+    VerticalTransformAction, VerticalTransformDiagnostics,
 };
 pub use registry::{
-    lookup_authority_code, lookup_datum_epsg, lookup_epsg, lookup_operation,
+    lookup_authority_code, lookup_datum_epsg, lookup_epsg, lookup_operation, lookup_vertical_epsg,
     operation_candidates_between, operation_candidates_between_with_selection_options,
     operations_between,
 };

@@ -155,6 +155,18 @@ impl CrsDef {
         }
     }
 
+    /// Return this CRS's horizontal component as a standalone CRS definition.
+    ///
+    /// This intentionally drops an explicit vertical component. Use it only for
+    /// horizontal-only workflows such as AOI filtering, footprint reprojection,
+    /// and 2D previews where `z` is outside the operation contract.
+    pub fn horizontal_crs(&self) -> Option<CrsDef> {
+        match self {
+            CrsDef::Geographic(_) | CrsDef::Projected(_) => Some(self.clone()),
+            CrsDef::Compound(c) => Some(c.horizontal().to_crs_def()),
+        }
+    }
+
     /// Returns the geographic CRS EPSG code used for operation selection, when known.
     pub fn base_geographic_crs_epsg(&self) -> Option<u32> {
         match self {
@@ -413,6 +425,13 @@ impl HorizontalCrsDef {
             _ => false,
         }
     }
+
+    pub fn to_crs_def(&self) -> CrsDef {
+        match self {
+            Self::Geographic(g) => CrsDef::Geographic(g.clone()),
+            Self::Projected(p) => CrsDef::Projected(p.clone()),
+        }
+    }
 }
 
 impl TryFrom<CrsDef> for HorizontalCrsDef {
@@ -515,6 +534,16 @@ impl VerticalCrsDef {
         approx_eq(self.linear_unit_to_meter(), other.linear_unit_to_meter())
             && self.kind.semantically_equivalent(&other.kind)
     }
+
+    /// Returns true when two vertical CRS definitions use the same vertical
+    /// reference frame, ignoring the coordinate unit.
+    pub fn same_vertical_reference(&self, other: &Self) -> bool {
+        self.kind.semantically_equivalent(&other.kind)
+    }
+
+    pub fn vertical_datum_epsg(&self) -> Option<u32> {
+        self.kind.vertical_datum_epsg()
+    }
 }
 
 /// Supported vertical CRS kinds.
@@ -542,6 +571,23 @@ impl VerticalCrsKind {
             ) => a == b,
             _ => false,
         }
+    }
+
+    pub const fn vertical_datum_epsg(&self) -> Option<u32> {
+        match self {
+            Self::EllipsoidalHeight { .. } => None,
+            Self::GravityRelatedHeight {
+                vertical_datum_epsg,
+            } => Some(*vertical_datum_epsg),
+        }
+    }
+
+    pub const fn is_ellipsoidal_height(&self) -> bool {
+        matches!(self, Self::EllipsoidalHeight { .. })
+    }
+
+    pub const fn is_gravity_related_height(&self) -> bool {
+        matches!(self, Self::GravityRelatedHeight { .. })
     }
 }
 

@@ -577,6 +577,21 @@ pub(crate) fn lookup_projected(code: u32) -> Option<CrsDef> {
     ))
 }
 
+pub(crate) fn lookup_vertical(code: u32) -> Option<VerticalCrsDef> {
+    match code {
+        5703 => Some(
+            VerticalCrsDef::gravity_related_height(
+                5703,
+                5103,
+                LinearUnit::metre(),
+                "NAVD88 height",
+            )
+            .expect("hard-coded vertical CRS definition is valid"),
+        ),
+        _ => None,
+    }
+}
+
 pub(crate) fn lookup(code: u32) -> Option<CrsDef> {
     lookup_geographic(code).or_else(|| lookup_projected(code))
 }

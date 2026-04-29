@@ -1,4 +1,4 @@
-use crate::crs::CrsDef;
+use crate::crs::{CrsDef, VerticalCrsDef};
 use crate::datum::Datum;
 use crate::epsg_db;
 use crate::error::{Error, Result};
@@ -21,6 +21,15 @@ pub fn lookup_epsg(code: u32) -> Option<CrsDef> {
 /// Look up a datum definition by EPSG code.
 pub fn lookup_datum_epsg(code: u32) -> Option<Datum> {
     epsg_db::lookup_datum(code)
+}
+
+/// Look up a supported vertical CRS definition by EPSG code.
+///
+/// Standalone vertical CRS values are not valid horizontal transform inputs,
+/// but parsers use this registry to canonicalize vertical components inside
+/// compound CRS definitions.
+pub fn lookup_vertical_epsg(code: u32) -> Option<VerticalCrsDef> {
+    epsg_db::lookup_vertical(code)
 }
 
 /// Look up a coordinate operation by its identifier.
@@ -139,6 +148,13 @@ mod tests {
         assert_eq!(crs.epsg(), 4979);
         assert_eq!(crs.base_geographic_crs_epsg(), Some(4326));
         assert!(crs.vertical_crs().is_some());
+    }
+
+    #[test]
+    fn lookup_navd88_vertical_crs() {
+        let crs = lookup_vertical_epsg(5703).expect("should find NAVD88 height");
+        assert_eq!(crs.epsg(), 5703);
+        assert_eq!(crs.vertical_datum_epsg(), Some(5103));
     }
 
     #[test]

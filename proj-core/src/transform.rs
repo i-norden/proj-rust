@@ -1,5 +1,5 @@
 use crate::coord::{Bounds, Coord, Coord3D, Transformable, Transformable3D};
-use crate::crs::CrsDef;
+use crate::crs::{CrsDef, LinearUnit, VerticalCrsDef};
 use crate::datum::{DatumGridShift, DatumGridShiftEntry, DatumToWgs84, HelmertParams};
 use crate::ellipsoid::Ellipsoid;
 use crate::error::{Error, Result};
@@ -9,6 +9,7 @@ use crate::operation::{
     CoordinateOperation, CoordinateOperationId, CoordinateOperationMetadata, GridCoverageMiss,
     GridShiftDirection, OperationMethod, OperationSelectionDiagnostics, OperationStepDirection,
     SelectionOptions, SelectionPolicy, SkippedOperation, SkippedOperationReason, TransformOutcome,
+    VerticalTransformAction, VerticalTransformDiagnostics,
 };
 use crate::projection::{make_projection, Projection};
 use crate::registry;
@@ -33,6 +34,7 @@ pub struct Transform {
     selected_direction: OperationStepDirection,
     selected_operation: CoordinateOperationMetadata,
     diagnostics: OperationSelectionDiagnostics,
+    vertical_transform: VerticalTransform,
     selection_options: SelectionOptions,
     pipeline: CompiledOperationPipeline,
     fallback_pipelines: Vec<CompiledOperationFallback>,
@@ -73,6 +75,62 @@ enum CompiledStep {
     GeocentricToGeodetic {
         ellipsoid: Ellipsoid,
     },
+}
+
+#[derive(Clone)]
+enum VerticalTransform {
+    None {
+        diagnostics: VerticalTransformDiagnostics,
+    },
+    Preserve {
+        diagnostics: VerticalTransformDiagnostics,
+    },
+    UnitConvert {
+        source_unit: LinearUnit,
+        target_unit: LinearUnit,
+        diagnostics: VerticalTransformDiagnostics,
+    },
+}
+
+impl VerticalTransform {
+    fn apply(&self, z: f64) -> f64 {
+        match self {
+            Self::None { .. } | Self::Preserve { .. } => z,
+            Self::UnitConvert {
+                source_unit,
+                target_unit,
+                ..
+            } => target_unit.from_meters(source_unit.to_meters(z)),
+        }
+    }
+
+    fn diagnostics(&self) -> &VerticalTransformDiagnostics {
+        match self {
+            Self::None { diagnostics }
+            | Self::Preserve { diagnostics }
+            | Self::UnitConvert { diagnostics, .. } => diagnostics,
+        }
+    }
+
+    fn inverse(&self) -> Self {
+        match self {
+            Self::None { diagnostics } => Self::None {
+                diagnostics: inverse_vertical_diagnostics(diagnostics),
+            },
+            Self::Preserve { diagnostics } => Self::Preserve {
+                diagnostics: inverse_vertical_diagnostics(diagnostics),
+            },
+            Self::UnitConvert {
+                source_unit,
+                target_unit,
+                diagnostics,
+            } => Self::UnitConvert {
+                source_unit: *target_unit,
+                target_unit: *source_unit,
+                diagnostics: inverse_vertical_diagnostics(diagnostics),
+            },
+        }
+    }
 }
 
 impl Transform {
@@ -122,6 +180,35 @@ impl Transform {
         Self::from_crs_defs_with_selection_options(from, to, SelectionOptions::default())
     }
 
+    /// Create a horizontal-only transform from explicit CRS definitions.
+    ///
+    /// Compound CRS inputs are reduced to their horizontal component before
+    /// operation selection. This is intended for XY-only workflows where
+    /// vertical transformation is deliberately out of scope.
+    pub fn from_horizontal_components(from: &CrsDef, to: &CrsDef) -> Result<Self> {
+        Self::from_horizontal_components_with_selection_options(
+            from,
+            to,
+            SelectionOptions::default(),
+        )
+    }
+
+    /// Create a horizontal-only transform from explicit CRS definitions with
+    /// operation-selection options.
+    pub fn from_horizontal_components_with_selection_options(
+        from: &CrsDef,
+        to: &CrsDef,
+        options: SelectionOptions,
+    ) -> Result<Self> {
+        let source = from.horizontal_crs().ok_or_else(|| {
+            Error::InvalidDefinition("source CRS does not contain a horizontal component".into())
+        })?;
+        let target = to.horizontal_crs().ok_or_else(|| {
+            Error::InvalidDefinition("target CRS does not contain a horizontal component".into())
+        })?;
+        Self::from_crs_defs_with_selection_options(&source, &target, options)
+    }
+
     /// Create a transform from explicit CRS definitions with operation-selection options.
     ///
     /// Use this when a custom CRS references grid resources and the transform
@@ -131,7 +218,7 @@ impl Transform {
         to: &CrsDef,
         options: SelectionOptions,
     ) -> Result<Self> {
-        validate_vertical_compatibility(from, to)?;
+        let vertical_transform = compile_vertical_transform(from, to)?;
 
         let grid_runtime = GridRuntime::new(options.grid_provider.clone());
         let candidate_set = selector::rank_operation_candidates(from, to, &options)?;
@@ -253,6 +340,7 @@ impl Transform {
                 selected_direction: candidate.direction,
                 selected_operation: metadata,
                 diagnostics,
+                vertical_transform,
                 selection_options: options,
                 pipeline,
                 fallback_pipelines,
@@ -300,6 +388,7 @@ impl Transform {
         Ok(TransformOutcome {
             coord: T::from_coord(outcome.coord),
             operation: outcome.operation,
+            vertical: outcome.vertical,
             grid_coverage_misses: outcome.grid_coverage_misses,
         })
     }
@@ -318,6 +407,7 @@ impl Transform {
         Ok(TransformOutcome {
             coord: T::from_coord3d(outcome.coord),
             operation: outcome.operation,
+            vertical: outcome.vertical,
             grid_coverage_misses: outcome.grid_coverage_misses,
         })
     }
@@ -340,6 +430,11 @@ impl Transform {
     /// Return selection diagnostics for this transform.
     pub fn selection_diagnostics(&self) -> &OperationSelectionDiagnostics {
         &self.diagnostics
+    }
+
+    /// Return diagnostics for the vertical component of this transform.
+    pub fn vertical_diagnostics(&self) -> &VerticalTransformDiagnostics {
+        self.vertical_transform.diagnostics()
     }
 
     /// Build the inverse transform by swapping the source and target CRS.
@@ -374,6 +469,7 @@ impl Transform {
             selected_direction,
             selected_operation,
             diagnostics,
+            vertical_transform: self.vertical_transform.inverse(),
             selection_options: self.selection_options.inverse(),
             pipeline,
             fallback_pipelines: Vec::new(),
@@ -430,6 +526,7 @@ impl Transform {
         Ok(TransformOutcome {
             coord: Coord::new(outcome.coord.x, outcome.coord.y),
             operation: outcome.operation,
+            vertical: outcome.vertical,
             grid_coverage_misses: outcome.grid_coverage_misses,
         })
     }
@@ -441,6 +538,7 @@ impl Transform {
                 return Ok(TransformOutcome {
                     coord,
                     operation: self.selected_operation.clone(),
+                    vertical: self.vertical_transform.diagnostics().clone(),
                     grid_coverage_misses,
                 });
             }
@@ -462,6 +560,7 @@ impl Transform {
                     return Ok(TransformOutcome {
                         coord,
                         operation: fallback.metadata.clone(),
+                        vertical: self.vertical_transform.diagnostics().clone(),
                         grid_coverage_misses,
                     });
                 }
@@ -492,9 +591,8 @@ impl Transform {
         c: Coord3D,
     ) -> Result<Coord3D> {
         if pipeline.steps.is_empty() {
-            return Ok(c);
+            return Ok(Coord3D::new(c.x, c.y, self.vertical_transform.apply(c.z)));
         }
-        let preserved_z = c.z;
         let mut state = if self.source.is_projected() {
             let (x_m, y_m) = self.source_projected_native_to_meters(c.x, c.y);
             Coord3D::new(x_m, y_m, 0.0)
@@ -512,7 +610,7 @@ impl Transform {
             (state.x.to_degrees(), state.y.to_degrees())
         };
 
-        Ok(Coord3D::new(x, y, preserved_z))
+        Ok(Coord3D::new(x, y, self.vertical_transform.apply(c.z)))
     }
 
     fn source_projected_native_to_meters(&self, x: f64, y: f64) -> (f64, f64) {
@@ -661,20 +759,126 @@ fn validate_output_len(input_len: usize, output_len: usize) -> Result<()> {
     Ok(())
 }
 
-fn validate_vertical_compatibility(source: &CrsDef, target: &CrsDef) -> Result<()> {
+fn compile_vertical_transform(source: &CrsDef, target: &CrsDef) -> Result<VerticalTransform> {
     match (source.vertical_crs(), target.vertical_crs()) {
-        (None, None) => Ok(()),
+        (None, None) => Ok(VerticalTransform::None {
+            diagnostics: vertical_diagnostics(
+                VerticalTransformAction::None,
+                None,
+                None,
+                None,
+            ),
+        }),
         (Some(source_vertical), Some(target_vertical))
-            if source_vertical.semantically_equivalent(target_vertical) =>
+            if source_vertical.same_vertical_reference(target_vertical) =>
         {
-            Ok(())
+            if unit_factors_match(
+                source_vertical.linear_unit_to_meter(),
+                target_vertical.linear_unit_to_meter(),
+            ) {
+                Ok(VerticalTransform::Preserve {
+                    diagnostics: vertical_diagnostics(
+                        VerticalTransformAction::Preserved,
+                        Some("Vertical ordinate preservation".into()),
+                        Some(source_vertical),
+                        Some(target_vertical),
+                    ),
+                })
+            } else {
+                Ok(VerticalTransform::UnitConvert {
+                    source_unit: source_vertical.linear_unit(),
+                    target_unit: target_vertical.linear_unit(),
+                    diagnostics: vertical_diagnostics(
+                        VerticalTransformAction::UnitConverted,
+                        Some("Vertical unit conversion".into()),
+                        Some(source_vertical),
+                        Some(target_vertical),
+                    ),
+                })
+            }
         }
-        (Some(_), Some(_)) => Err(Error::OperationSelection(
-            "vertical CRS transformations are not supported; source and target vertical CRS components must be identical for z preservation".into(),
-        )),
+        (Some(source_vertical), Some(target_vertical))
+            if is_ellipsoidal_gravity_pair(source_vertical, target_vertical) =>
+        {
+            Err(Error::OperationSelection(format!(
+                "vertical CRS transformations between ellipsoidal and gravity-related heights require a supported geoid grid operation; no supported vertical grid operation is available for source {} target {}",
+                vertical_label(source_vertical),
+                vertical_label(target_vertical)
+            )))
+        }
+        (Some(source_vertical), Some(target_vertical)) => Err(Error::OperationSelection(format!(
+            "vertical CRS transformations between different vertical reference frames require a supported vertical operation/grid; no supported operation is available for source {} target {}",
+            vertical_label(source_vertical),
+            vertical_label(target_vertical)
+        ))),
         (Some(_), None) | (None, Some(_)) => Err(Error::OperationSelection(
             "cannot transform between an explicit vertical CRS and a horizontal-only CRS; vertical CRS transformations are not supported".into(),
         )),
+    }
+}
+
+fn vertical_diagnostics(
+    action: VerticalTransformAction,
+    operation_name: Option<String>,
+    source: Option<&VerticalCrsDef>,
+    target: Option<&VerticalCrsDef>,
+) -> VerticalTransformDiagnostics {
+    VerticalTransformDiagnostics {
+        action,
+        operation_name,
+        source_vertical_crs_epsg: source.and_then(nonzero_vertical_epsg),
+        target_vertical_crs_epsg: target.and_then(nonzero_vertical_epsg),
+        source_vertical_datum_epsg: source.and_then(VerticalCrsDef::vertical_datum_epsg),
+        target_vertical_datum_epsg: target.and_then(VerticalCrsDef::vertical_datum_epsg),
+        source_unit_to_meter: source.map(VerticalCrsDef::linear_unit_to_meter),
+        target_unit_to_meter: target.map(VerticalCrsDef::linear_unit_to_meter),
+        accuracy: None,
+        area_of_use: None,
+        area_of_use_match: None,
+        grids: Vec::new(),
+    }
+}
+
+fn inverse_vertical_diagnostics(
+    diagnostics: &VerticalTransformDiagnostics,
+) -> VerticalTransformDiagnostics {
+    let mut inverse = diagnostics.clone();
+    std::mem::swap(
+        &mut inverse.source_vertical_crs_epsg,
+        &mut inverse.target_vertical_crs_epsg,
+    );
+    std::mem::swap(
+        &mut inverse.source_vertical_datum_epsg,
+        &mut inverse.target_vertical_datum_epsg,
+    );
+    std::mem::swap(
+        &mut inverse.source_unit_to_meter,
+        &mut inverse.target_unit_to_meter,
+    );
+    inverse
+}
+
+fn nonzero_vertical_epsg(vertical: &VerticalCrsDef) -> Option<u32> {
+    match vertical.epsg() {
+        0 => None,
+        epsg => Some(epsg),
+    }
+}
+
+fn unit_factors_match(a: f64, b: f64) -> bool {
+    (a - b).abs() <= 1e-12 * a.abs().max(b.abs()).max(1.0)
+}
+
+fn is_ellipsoidal_gravity_pair(source: &VerticalCrsDef, target: &VerticalCrsDef) -> bool {
+    (source.kind().is_ellipsoidal_height() && target.kind().is_gravity_related_height())
+        || (source.kind().is_gravity_related_height() && target.kind().is_ellipsoidal_height())
+}
+
+fn vertical_label(vertical: &VerticalCrsDef) -> String {
+    match nonzero_vertical_epsg(vertical) {
+        Some(epsg) => format!("EPSG:{epsg}"),
+        None if vertical.name().is_empty() => "unnamed vertical CRS".into(),
+        None => vertical.name().into(),
     }
 }
 
@@ -1149,7 +1353,7 @@ mod tests {
     use crate::datum::{self, DatumToWgs84};
     use crate::operation::{
         AreaOfInterest, OperationMatchKind, SelectionPolicy, SelectionReason,
-        SkippedOperationReason,
+        SkippedOperationReason, VerticalTransformAction,
     };
 
     const US_FOOT_TO_METER: f64 = 0.3048006096012192;
@@ -1630,6 +1834,67 @@ mod tests {
         assert!((x - (-8238310.0)).abs() < 100.0);
         assert!((y - 4970072.0).abs() < 100.0);
         assert!((z - 123.45).abs() < 1e-12);
+        assert_eq!(
+            t.vertical_diagnostics().action,
+            VerticalTransformAction::Preserved
+        );
+    }
+
+    #[test]
+    fn horizontal_components_allow_compound_xy_preview() {
+        let source = registry::lookup_epsg(4979).unwrap();
+        let target = registry::lookup_epsg(3857).unwrap();
+        let err = expect_transform_error(Transform::from_crs_defs(&source, &target));
+        assert!(err.to_string().contains("explicit vertical CRS"));
+
+        let t = Transform::from_horizontal_components(&source, &target).unwrap();
+        assert!(t.source_crs().vertical_crs().is_none());
+        assert!(t.target_crs().vertical_crs().is_none());
+        assert_eq!(
+            t.vertical_diagnostics().action,
+            VerticalTransformAction::None
+        );
+        let (x, y, z) = t.convert_3d((-74.006, 40.7128, 123.45)).unwrap();
+        assert!((x - (-8238310.0)).abs() < 100.0);
+        assert!((y - 4970072.0).abs() < 100.0);
+        assert!((z - 123.45).abs() < 1e-12);
+    }
+
+    #[test]
+    fn same_vertical_reference_converts_z_units() {
+        let horizontal =
+            HorizontalCrsDef::Geographic(GeographicCrsDef::new(4326, datum::WGS84, "WGS 84"));
+        let source_vertical =
+            VerticalCrsDef::gravity_related_height(5703, 5103, LinearUnit::metre(), "NAVD88")
+                .unwrap();
+        let target_vertical =
+            VerticalCrsDef::gravity_related_height(0, 5103, LinearUnit::foot(), "NAVD88 foot")
+                .unwrap();
+        let source = CrsDef::Compound(Box::new(CompoundCrsDef::new(
+            0,
+            horizontal.clone(),
+            source_vertical,
+            "WGS 84 + NAVD88 height",
+        )));
+        let target = CrsDef::Compound(Box::new(CompoundCrsDef::new(
+            0,
+            horizontal,
+            target_vertical,
+            "WGS 84 + NAVD88 height (ft)",
+        )));
+
+        let t = Transform::from_crs_defs(&source, &target).unwrap();
+        let outcome = t
+            .convert_3d_with_diagnostics((-74.006, 40.7128, 1.0))
+            .unwrap();
+        assert!((outcome.coord.2 - 3.280839895013123).abs() < 1e-12);
+        assert_eq!(
+            outcome.vertical.action,
+            VerticalTransformAction::UnitConverted
+        );
+        assert_eq!(outcome.vertical.source_vertical_crs_epsg, Some(5703));
+        assert_eq!(outcome.vertical.source_vertical_datum_epsg, Some(5103));
+        assert_eq!(outcome.vertical.target_vertical_datum_epsg, Some(5103));
     }
 
     #[test]
@@ -1656,6 +1921,7 @@ mod tests {
 
         let err = expect_transform_error(Transform::from_crs_defs(&source, &target));
         assert!(err.to_string().contains("vertical CRS transformations"));
+        assert!(err.to_string().contains("geoid grid"));
     }
 
     #[test]

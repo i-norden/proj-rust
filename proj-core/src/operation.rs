@@ -363,6 +363,43 @@ pub struct SkippedOperation {
     pub detail: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VerticalTransformAction {
+    /// No explicit vertical CRS participates in the transform.
+    None,
+    /// `z` is preserved because the vertical CRS semantics and units match.
+    Preserved,
+    /// `z` is converted between units of the same vertical reference frame.
+    UnitConverted,
+    /// `z` is transformed by an explicit vertical operation.
+    Transformed,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct VerticalGridProvenance {
+    pub name: String,
+    pub checksum: Option<String>,
+    pub accuracy: Option<OperationAccuracy>,
+    pub area_of_use: Option<AreaOfUse>,
+    pub area_of_use_match: Option<bool>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct VerticalTransformDiagnostics {
+    pub action: VerticalTransformAction,
+    pub operation_name: Option<String>,
+    pub source_vertical_crs_epsg: Option<u32>,
+    pub target_vertical_crs_epsg: Option<u32>,
+    pub source_vertical_datum_epsg: Option<u32>,
+    pub target_vertical_datum_epsg: Option<u32>,
+    pub source_unit_to_meter: Option<f64>,
+    pub target_unit_to_meter: Option<f64>,
+    pub accuracy: Option<OperationAccuracy>,
+    pub area_of_use: Option<AreaOfUse>,
+    pub area_of_use_match: Option<bool>,
+    pub grids: Vec<VerticalGridProvenance>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct OperationSelectionDiagnostics {
     pub selected_operation: CoordinateOperationMetadata,
@@ -384,5 +421,6 @@ pub struct GridCoverageMiss {
 pub struct TransformOutcome<T> {
     pub coord: T,
     pub operation: CoordinateOperationMetadata,
+    pub vertical: VerticalTransformDiagnostics,
     pub grid_coverage_misses: Vec<GridCoverageMiss>,
 }

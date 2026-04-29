@@ -395,6 +395,12 @@ fn parse_vertical_projjson(value: &Value) -> Result<VerticalCrsDef> {
         &coordinate_system_from_json(value),
     )?;
     let epsg = top_level_epsg_id(value).unwrap_or(0);
+    let linear_unit = vertical_axis_linear_unit_from_json(value).unwrap_or_else(LinearUnit::metre);
+    if let Some(canonical) = proj_core::lookup_vertical_epsg(epsg) {
+        validate_vertical_unit_matches_authority("PROJJSON vertical CRS", linear_unit, &canonical)?;
+        return Ok(canonical);
+    }
+
     let datum = value
         .get("datum")
         .ok_or_else(|| ParseError::Parse("PROJJSON vertical CRS is missing a datum".into()))?;
@@ -407,9 +413,26 @@ fn parse_vertical_projjson(value: &Value) -> Result<VerticalCrsDef> {
     Ok(VerticalCrsDef::gravity_related_height(
         epsg,
         vertical_datum_epsg,
-        vertical_axis_linear_unit_from_json(value).unwrap_or_else(LinearUnit::metre),
+        linear_unit,
         "",
     )?)
+}
+
+fn validate_vertical_unit_matches_authority(
+    context: &str,
+    declared_unit: LinearUnit,
+    canonical: &VerticalCrsDef,
+) -> Result<()> {
+    let declared = declared_unit.meters_per_unit();
+    let expected = canonical.linear_unit_to_meter();
+    if (declared - expected).abs() <= 1e-12 * declared.abs().max(expected.abs()).max(1.0) {
+        return Ok(());
+    }
+
+    Err(ParseError::UnsupportedSemantics(format!(
+        "{context} declares a vertical unit that conflicts with EPSG:{}",
+        canonical.epsg()
+    )))
 }
 
 fn top_level_epsg_id(value: &Value) -> Option<u32> {
@@ -1119,6 +1142,58 @@ mod tests {
             crs.vertical_crs().unwrap().linear_unit_to_meter(),
             LinearUnit::metre().meters_per_unit()
         );
+    }
+
+    #[test]
+    fn parses_projjson_vertical_crs_canonicalized_from_crs_epsg() {
+        let crs = parse_projjson(
+            r#"{
+                "type": "CompoundCRS",
+                "name": "WGS 84 + NAVD88 height",
+                "components": [
+                    {
+                        "type": "GeographicCRS",
+                        "name": "WGS 84",
+                        "datum": {
+                            "type": "GeodeticReferenceFrame",
+                            "name": "World Geodetic System 1984",
+                            "ellipsoid": {
+                                "name": "WGS 84",
+                                "semi_major_axis": 6378137,
+                                "inverse_flattening": 298.257223563
+                            }
+                        },
+                        "coordinate_system": {
+                            "subtype": "ellipsoidal",
+                            "axis": [
+                                { "name": "Longitude", "abbreviation": "Lon", "direction": "east", "unit": "degree" },
+                                { "name": "Latitude", "abbreviation": "Lat", "direction": "north", "unit": "degree" }
+                            ]
+                        }
+                    },
+                    {
+                        "type": "VerticalCRS",
+                        "name": "NAVD88 height",
+                        "datum": {
+                            "type": "VerticalReferenceFrame",
+                            "name": "North American Vertical Datum 1988"
+                        },
+                        "coordinate_system": {
+                            "subtype": "vertical",
+                            "axis": [
+                                { "name": "Gravity-related height", "abbreviation": "H", "direction": "up", "unit": "metre" }
+                            ]
+                        },
+                        "id": { "authority": "EPSG", "code": 5703 }
+                    }
+                ]
+            }"#,
+        )
+        .unwrap();
+
+        let vertical = crs.vertical_crs().unwrap();
+        assert_eq!(vertical.epsg(), 5703);
+        assert_eq!(vertical.vertical_datum_epsg(), Some(5103));
     }
 
     #[test]

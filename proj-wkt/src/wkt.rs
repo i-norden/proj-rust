@@ -563,6 +563,11 @@ fn parse_wkt_vertical(inner: &str) -> Result<VerticalCrsDef> {
     )?;
     let linear_unit = extract_vertical_crs_linear_unit(inner).unwrap_or_else(LinearUnit::metre);
     let epsg = extract_top_level_epsg_from_inner(inner).unwrap_or(0);
+    if let Some(canonical) = proj_core::lookup_vertical_epsg(epsg) {
+        validate_vertical_unit_matches_authority("WKT vertical CRS", linear_unit, &canonical)?;
+        return Ok(canonical);
+    }
+
     let datum_inner =
         find_top_level_element_inner(inner, &["VERT_DATUM", "VERTICALDATUM", "VDATUM", "VRF"])
             .ok_or_else(|| {
@@ -581,6 +586,23 @@ fn parse_wkt_vertical(inner: &str) -> Result<VerticalCrsDef> {
         linear_unit,
         "",
     )?)
+}
+
+fn validate_vertical_unit_matches_authority(
+    context: &str,
+    declared_unit: LinearUnit,
+    canonical: &VerticalCrsDef,
+) -> Result<()> {
+    let declared = declared_unit.meters_per_unit();
+    let expected = canonical.linear_unit_to_meter();
+    if (declared - expected).abs() <= 1e-12 * declared.abs().max(expected.abs()).max(1.0) {
+        return Ok(());
+    }
+
+    Err(ParseError::UnsupportedSemantics(format!(
+        "{context} declares a vertical unit that conflicts with EPSG:{}",
+        canonical.epsg()
+    )))
 }
 
 fn infer_datum_from_geographic_inner(inner: &str) -> Result<proj_core::Datum> {
@@ -1214,6 +1236,15 @@ mod tests {
             crs.vertical_crs().unwrap().linear_unit_to_meter(),
             LinearUnit::metre().meters_per_unit()
         );
+    }
+
+    #[test]
+    fn parse_wkt_vertical_crs_canonicalized_from_crs_epsg() {
+        let wkt = r#"COMPOUNDCRS["WGS 84 + NAVD88 height",GEODCRS["WGS 84",DATUM["World Geodetic System 1984",ELLIPSOID["WGS 84",6378137,298.257223563]],CS[ellipsoidal,2],AXIS["longitude",east],AXIS["latitude",north],ANGLEUNIT["degree",0.0174532925199433]],VERTCRS["NAVD88 height",VDATUM["North American Vertical Datum 1988"],CS[vertical,1],AXIS["gravity-related height",up,LENGTHUNIT["metre",1]],LENGTHUNIT["metre",1],ID["EPSG",5703]]]"#;
+        let crs = parse_wkt(wkt).unwrap();
+        let vertical = crs.vertical_crs().unwrap();
+        assert_eq!(vertical.epsg(), 5703);
+        assert_eq!(vertical.vertical_datum_epsg(), Some(5103));
     }
 
     #[test]

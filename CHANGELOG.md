@@ -5,6 +5,9 @@
 - add explicit `VerticalCrsDef`, `VerticalCrsKind`, `HorizontalCrsDef`, and `CompoundCrsDef` CRS model types for ellipsoidal-height and gravity-related vertical components
 - add EPSG:4979 and WKT/PROJJSON 3D geographic and compound CRS parsing paths while preserving `z` only when vertical CRS components are identical
 - reject explicit vertical CRS mismatches, standalone vertical CRS transform requests, and vertical/geoid transformation semantics instead of silently preserving ambiguous heights
+- add horizontal-only transform constructors for compound CRS inputs, covering XY AOI/preview workflows without weakening default vertical fail-closed behavior
+- add vertical transform diagnostics and same-reference vertical unit conversion for compound CRS definitions
+- add supported vertical CRS lookup for EPSG:5703 NAVD88 height and canonicalize WKT/PROJJSON vertical components from vertical CRS EPSG identifiers when datum identifiers are absent
 
 ## 0.4.0
 
