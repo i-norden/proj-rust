@@ -579,12 +579,43 @@ pub(crate) fn lookup_projected(code: u32) -> Option<CrsDef> {
 
 pub(crate) fn lookup_vertical(code: u32) -> Option<VerticalCrsDef> {
     match code {
+        3855 => Some(
+            VerticalCrsDef::gravity_related_height(
+                3855,
+                1027,
+                LinearUnit::metre(),
+                "EGM2008 height",
+            )
+            .expect("hard-coded vertical CRS definition is valid"),
+        ),
+        5702 => Some(
+            VerticalCrsDef::gravity_related_height(
+                5702,
+                5102,
+                LinearUnit::us_survey_foot(),
+                "NGVD29 height (ftUS)",
+            )
+            .expect("hard-coded vertical CRS definition is valid"),
+        ),
         5703 => Some(
             VerticalCrsDef::gravity_related_height(
                 5703,
                 5103,
                 LinearUnit::metre(),
                 "NAVD88 height",
+            )
+            .expect("hard-coded vertical CRS definition is valid"),
+        ),
+        5773 => Some(
+            VerticalCrsDef::gravity_related_height(5773, 5171, LinearUnit::metre(), "EGM96 height")
+                .expect("hard-coded vertical CRS definition is valid"),
+        ),
+        6360 => Some(
+            VerticalCrsDef::gravity_related_height(
+                6360,
+                5103,
+                LinearUnit::us_survey_foot(),
+                "NAVD88 height (ftUS)",
             )
             .expect("hard-coded vertical CRS definition is valid"),
         ),

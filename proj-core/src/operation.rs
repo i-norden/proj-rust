@@ -430,6 +430,7 @@ pub enum VerticalTransformAction {
 #[derive(Debug, Clone, PartialEq)]
 pub struct VerticalGridProvenance {
     pub name: String,
+    /// Content checksum of the resolved grid resource, formatted as `sha256:<hex>`.
     pub checksum: Option<String>,
     pub accuracy: Option<OperationAccuracy>,
     pub area_of_use: Option<AreaOfUse>,

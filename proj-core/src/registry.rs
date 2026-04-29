@@ -158,6 +158,30 @@ mod tests {
     }
 
     #[test]
+    fn lookup_common_vertical_crs_codes() {
+        let egm2008 = lookup_vertical_epsg(3855).expect("should find EGM2008 height");
+        assert_eq!(egm2008.vertical_datum_epsg(), Some(1027));
+        assert_eq!(egm2008.linear_unit_to_meter(), 1.0);
+
+        let ngvd29_ft = lookup_vertical_epsg(5702).expect("should find NGVD29 ftUS height");
+        assert_eq!(ngvd29_ft.vertical_datum_epsg(), Some(5102));
+        assert_eq!(
+            ngvd29_ft.linear_unit_to_meter(),
+            crate::crs::LinearUnit::us_survey_foot().meters_per_unit()
+        );
+
+        let egm96 = lookup_vertical_epsg(5773).expect("should find EGM96 height");
+        assert_eq!(egm96.vertical_datum_epsg(), Some(5171));
+
+        let navd88_ft = lookup_vertical_epsg(6360).expect("should find NAVD88 ftUS height");
+        assert_eq!(navd88_ft.vertical_datum_epsg(), Some(5103));
+        assert_eq!(
+            navd88_ft.linear_unit_to_meter(),
+            crate::crs::LinearUnit::us_survey_foot().meters_per_unit()
+        );
+    }
+
+    #[test]
     fn lookup_web_mercator() {
         let crs = lookup_epsg(3857).expect("should find 3857");
         assert!(crs.is_projected());

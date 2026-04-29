@@ -75,6 +75,7 @@ Definitions that require unsupported axis-order, prime-meridian, or geographic a
 |---|---|---|
 | Geographic (WGS84, NAD83, NAD27, ETRS89, etc.) | Implemented | 4326, 4269, 4267, 4258, ... |
 | 3D geographic / compound CRS with compatible vertical component | Modelled for z preservation and same-reference unit conversion | 4979, custom WKT/PROJJSON |
+| Vertical CRS metadata | Implemented for common height CRS lookup and compound parsing | 3855, 5702, 5703, 5773, 6360 |
 | Web Mercator | Implemented | 3857 |
 | Transverse Mercator / UTM | Implemented | 32601-32660, 32701-32760 |
 | Polar Stereographic | Implemented | 3413, 3031, 3995, 32661, 32761 |
@@ -93,7 +94,7 @@ Custom CRS definitions can be constructed and passed to `Transform::from_crs_def
 
 `proj-core` includes embedded coordinate-operation metadata, default operation selection, and explicit operation execution. `Transform::new()` and `Transform::from_crs_defs()` choose the best supported operation for the CRS pair, while `Transform::with_selection_options()` lets callers supply an area of interest or require grid-backed or exact-area matches.
 
-Use `Transform::selected_operation()`, `Transform::selection_diagnostics()`, `Transform::vertical_diagnostics()`, `registry::operation_candidates_between()`, and `lookup_operation()` when you need deterministic operation inspection including operation direction. NTv2 horizontal grid-backed transforms are supported through the embedded registry, parsed PROJ `+nadgrids` custom CRS definitions, `EmbeddedGridProvider`, `FilesystemGridProvider`, and custom `GridProvider` implementations. Vertical same-reference unit conversion is supported. NOAA/VDatum binary GTX vertical grids are supported through `FilesystemGridProvider` or a custom `GridProvider` when the caller supplies an explicit `VerticalGridOperation`; packaged geoid grid assets and broad vertical operation selection remain outside the default registry.
+Use `Transform::selected_operation()`, `Transform::selection_diagnostics()`, `Transform::vertical_diagnostics()`, `registry::operation_candidates_between()`, and `lookup_operation()` when you need deterministic operation inspection including operation direction. NTv2 horizontal grid-backed transforms are supported through the embedded registry, parsed PROJ `+nadgrids` custom CRS definitions, `EmbeddedGridProvider`, `FilesystemGridProvider`, and custom `GridProvider` implementations. Vertical same-reference unit conversion is supported. NOAA/VDatum binary GTX vertical grids are supported through `FilesystemGridProvider` or a custom `GridProvider` when the caller supplies an explicit `VerticalGridOperation`; vertical grid selection honors the operation area of use, falls back across candidate grids after coverage misses, and reports resolved grid SHA-256 checksums in diagnostics. Packaged geoid grid assets and broad vertical operation selection remain outside the default registry.
 
 ## Compatibility Surface
 
