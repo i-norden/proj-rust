@@ -1,0 +1,67 @@
+{
+  "schema_version": 2,
+  "generator": "gen-reference gen-registry",
+  "registry_format": {
+    "magic": "0x45505347",
+    "version": 6
+  },
+  "source_database": {
+    "kind": "PROJ proj.db",
+    "file_name": "proj.db",
+    "normalized_content_sha256": "sha256:910dded405b766e7fb8d80be9bfe942ff83c52ea022068bc96db0f5e1f57fa28",
+    "metadata": {
+      "DATABASE.LAYOUT.VERSION.MAJOR": "1",
+      "DATABASE.LAYOUT.VERSION.MINOR": "5",
+      "EPSG.DATE": "2025-05-26",
+      "EPSG.VERSION": "v12.013",
+      "ESRI.DATE": "2025-05-11",
+      "ESRI.VERSION": "ArcGIS Pro 3.5",
+      "IGNF.DATE": "2019-05-24",
+      "IGNF.SOURCE": "https://raw.githubusercontent.com/rouault/proj-resources/master/IGNF.v3.1.0.xml",
+      "IGNF.VERSION": "3.1.0",
+      "NKG.DATE": "2025-02-13",
+      "NKG.SOURCE": "https://github.com/NordicGeodesy/NordicTransformations",
+      "NKG.VERSION": "1.0.w",
+      "PROJ.VERSION": "9.6.2",
+      "PROJ_DATA.VERSION": "1.22"
+    }
+  },
+  "output": {
+    "file_name": "epsg.bin",
+    "byte_len": 883655,
+    "sha256": "sha256:fc8d5d2cd618937794546ae6b692f974f69b599ce344f6d9b306d1244e919d0d"
+  },
+  "counts": {
+    "ellipsoids": 44,
+    "datums": 585,
+    "geographic_crs": 598,
+    "projected_crs": 5169,
+    "extents": 748,
+    "grid_resources": 228,
+    "operations": 1825
+  },
+  "supported_projection_methods": {
+    "Albers Equal Area": 5,
+    "Cassini-Soldner": 12,
+    "Equidistant Cylindrical": 7,
+    "Hotine Oblique Mercator A": 10,
+    "Hotine Oblique Mercator B": 11,
+    "Lambert Azimuthal Equal Area": 8,
+    "Lambert Azimuthal Equal Area (Spherical)": 13,
+    "Lambert Conformal Conic": 4,
+    "Mercator": 3,
+    "Oblique Stereographic": 9,
+    "Polar Stereographic": 6,
+    "Transverse Mercator": 2,
+    "Web Mercator": 1
+  },
+  "supported_grid_formats": {
+    "NTv2": 1,
+    "Unsupported": 255
+  },
+  "supported_operation_payloads": {
+    "Concatenated": 3,
+    "GridShift": 2,
+    "Helmert": 1
+  }
+}

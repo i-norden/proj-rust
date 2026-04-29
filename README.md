@@ -117,10 +117,19 @@ cargo test --workspace
 cargo test -p proj-core --no-default-features  # core crate without rayon/geo-types
 cargo test -p proj-core --features c-proj-compat
 ./scripts/run-reference-parity.sh
+./scripts/check-registry-generation.sh
 ./scripts/verify-release-packaging.sh --offline
 cargo clippy --workspace --all-targets -- -D warnings
 ./scripts/run-reference-benchmarks.sh
 ```
+
+The embedded EPSG registry is generated from the pinned bundled PROJ `proj.db` with:
+
+```sh
+cargo run --manifest-path gen-reference/Cargo.toml --bin gen-registry
+```
+
+That command writes `proj-core/data/epsg.bin` and deterministic provenance in `proj-core/data/epsg.provenance.json`, also exposed at runtime through `proj_core::registry::embedded_registry_provenance_json()`. CI runs `./scripts/check-registry-generation.sh` to rebuild in memory and fail if either artifact no longer matches the pinned PROJ database.
 
 Prefer `convert_batch()` for small and medium batch sizes.
 `convert_batch_parallel()` uses Rayon for larger batches and falls back to the sequential path when that is likely to be faster.

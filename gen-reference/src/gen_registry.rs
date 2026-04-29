@@ -1,27 +1,122 @@
 //! Generate compact binary EPSG registry from proj.db.
 //!
-//! Run: cd gen-reference && cargo run --bin gen-registry
+//! Run: cargo run --manifest-path gen-reference/Cargo.toml --bin gen-registry
+//! Check: cargo run --manifest-path gen-reference/Cargo.toml --bin gen-registry -- --check
 //!
-//! Outputs: ../proj-core/data/epsg.bin
+//! Outputs: proj-core/data/epsg.bin and proj-core/data/epsg.provenance.json
 
-use rusqlite::{params, Connection};
+use rusqlite::{params, types::ValueRef, Connection};
+use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
+use std::env;
 use std::f64::consts::PI;
-use std::path::PathBuf;
+use std::fs;
+use std::path::{Path, PathBuf};
 
 type ProjectedCrsRow = (u32, u32, u32, String, String, i64, Option<i64>, Option<f64>);
 
-fn find_proj_db() -> PathBuf {
-    let target_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target");
-    for entry in walkdir(&target_dir, "proj.db") {
-        if !entry.to_string_lossy().contains("for_tests") {
-            return entry;
-        }
-    }
-    panic!("proj.db not found. Run `cargo build` first.");
+const EPSG_BIN_FILE: &str = "epsg.bin";
+const PROVENANCE_FILE: &str = "epsg.provenance.json";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RegistryMode {
+    Write,
+    Check,
 }
 
-fn walkdir(dir: &std::path::Path, name: &str) -> Vec<PathBuf> {
+#[derive(Debug)]
+struct RegistryArgs {
+    mode: RegistryMode,
+    proj_db: Option<PathBuf>,
+    out_dir: PathBuf,
+}
+
+impl RegistryArgs {
+    fn parse() -> Self {
+        Self::parse_from(env::args().skip(1)).unwrap_or_else(|message| {
+            eprintln!("{message}");
+            std::process::exit(2);
+        })
+    }
+
+    fn parse_from<I>(args: I) -> Result<Self, String>
+    where
+        I: IntoIterator,
+        I::Item: Into<String>,
+    {
+        let mut mode = RegistryMode::Write;
+        let mut proj_db = None;
+        let mut out_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../proj-core/data");
+
+        let mut iter = args.into_iter().map(Into::into);
+        while let Some(arg) = iter.next() {
+            match arg.as_str() {
+                "--check" => mode = RegistryMode::Check,
+                "--write" => mode = RegistryMode::Write,
+                "--proj-db" => {
+                    let path = iter
+                        .next()
+                        .ok_or_else(|| "--proj-db requires a path".to_string())?;
+                    proj_db = Some(PathBuf::from(path));
+                }
+                "--out-dir" => {
+                    let path = iter
+                        .next()
+                        .ok_or_else(|| "--out-dir requires a path".to_string())?;
+                    out_dir = PathBuf::from(path);
+                }
+                "--help" | "-h" => {
+                    return Err(format!(
+                        "usage: gen-registry [--write|--check] [--proj-db PATH] [--out-dir DIR]\n\
+                         default: write {EPSG_BIN_FILE} and {PROVENANCE_FILE}"
+                    ));
+                }
+                _ => return Err(format!("unknown argument: {arg}")),
+            }
+        }
+
+        Ok(Self {
+            mode,
+            proj_db,
+            out_dir,
+        })
+    }
+}
+
+fn find_proj_db() -> Result<PathBuf, String> {
+    let target_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target");
+    let mut candidates: Vec<PathBuf> = walkdir(&target_dir, "proj.db")
+        .into_iter()
+        .filter(|entry| !entry.to_string_lossy().contains("for_tests"))
+        .collect();
+    candidates.sort();
+    if candidates.is_empty() {
+        return Err(format!(
+            "proj.db not found below {}. Run `cargo build --manifest-path gen-reference/Cargo.toml --bin gen-registry` first.",
+            target_dir.display()
+        ));
+    }
+
+    let mut checksums = BTreeMap::<String, PathBuf>::new();
+    for candidate in &candidates {
+        let digest = normalized_proj_db_sha256_for_path(candidate)?;
+        checksums.entry(digest).or_insert_with(|| candidate.clone());
+    }
+    if checksums.len() > 1 {
+        let entries = checksums
+            .into_iter()
+            .map(|(checksum, path)| format!("{checksum} {}", path.display()))
+            .collect::<Vec<_>>()
+            .join("\n");
+        return Err(format!(
+            "multiple distinct proj.db files were found; pass --proj-db explicitly:\n{entries}"
+        ));
+    }
+
+    Ok(candidates[0].clone())
+}
+
+fn walkdir(dir: &Path, name: &str) -> Vec<PathBuf> {
     let mut results = Vec::new();
     if let Ok(entries) = std::fs::read_dir(dir) {
         for entry in entries.flatten() {
@@ -38,6 +133,9 @@ fn walkdir(dir: &std::path::Path, name: &str) -> Vec<PathBuf> {
 
 const MAGIC: u32 = 0x4550_5347;
 const VERSION: u16 = 6;
+const PROVENANCE_SCHEMA_VERSION: u16 = 2;
+const CANONICAL_NAN_BITS: u64 = 0x7ff8_0000_0000_0000;
+const CANONICAL_FLOAT_DECIMAL_PLACES: usize = 13;
 
 const ELLIPSOID_RECORD_SIZE: usize = 20;
 const DATUM_RECORD_SIZE: usize = 72;
@@ -74,6 +172,51 @@ const GRID_FORMAT_NTV2: u8 = 1;
 const GRID_FORMAT_UNSUPPORTED: u8 = 255;
 
 const GRID_INTERPOLATION_BILINEAR: u8 = 1;
+
+#[derive(Serialize)]
+struct RegistryProvenance {
+    schema_version: u16,
+    generator: &'static str,
+    registry_format: RegistryFormatProvenance,
+    source_database: SourceDatabaseProvenance,
+    output: RegistryOutputProvenance,
+    counts: RegistryCounts,
+    supported_projection_methods: BTreeMap<String, u8>,
+    supported_grid_formats: BTreeMap<String, u8>,
+    supported_operation_payloads: BTreeMap<String, u8>,
+}
+
+#[derive(Serialize)]
+struct RegistryFormatProvenance {
+    magic: String,
+    version: u16,
+}
+
+#[derive(Serialize)]
+struct SourceDatabaseProvenance {
+    kind: &'static str,
+    file_name: &'static str,
+    normalized_content_sha256: String,
+    metadata: BTreeMap<String, String>,
+}
+
+#[derive(Serialize)]
+struct RegistryOutputProvenance {
+    file_name: &'static str,
+    byte_len: usize,
+    sha256: String,
+}
+
+#[derive(Clone, Copy, Serialize)]
+struct RegistryCounts {
+    ellipsoids: usize,
+    datums: usize,
+    geographic_crs: usize,
+    projected_crs: usize,
+    extents: usize,
+    grid_resources: usize,
+    operations: usize,
+}
 
 const LAT_ORIGIN: i64 = 8801;
 const LON_ORIGIN: i64 = 8802;
@@ -388,10 +531,181 @@ fn grid_format_from_method(method_name: &str) -> u8 {
     }
 }
 
+fn read_proj_db_metadata(conn: &Connection) -> BTreeMap<String, String> {
+    let mut stmt = conn
+        .prepare("SELECT key, value FROM metadata ORDER BY key")
+        .unwrap_or_else(|err| fatal(format!("failed to read proj.db metadata schema: {err}")));
+    stmt.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })
+    .unwrap_or_else(|err| fatal(format!("failed to query proj.db metadata: {err}")))
+    .filter_map(|row| row.ok())
+    .collect()
+}
+
+fn normalized_proj_db_sha256_for_path(path: &Path) -> Result<String, String> {
+    let conn = Connection::open(path)
+        .map_err(|err| format!("failed to open {}: {err}", path.display()))?;
+    normalized_proj_db_sha256(&conn)
+}
+
+fn normalized_proj_db_sha256(conn: &Connection) -> Result<String, String> {
+    let mut payload = Vec::new();
+    let tables = query_strings(
+        conn,
+        "SELECT name
+         FROM sqlite_schema
+         WHERE type='table' AND name NOT LIKE 'sqlite_%'
+         ORDER BY name",
+    )?;
+
+    for table in tables {
+        append_bytes(&mut payload, b't', table.as_bytes());
+        let columns = table_columns(conn, &table)?;
+        for column in &columns {
+            append_bytes(&mut payload, b'c', column.as_bytes());
+        }
+
+        let quoted_columns = columns
+            .iter()
+            .map(|column| quote_identifier(column))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT {quoted_columns} FROM {} ORDER BY {quoted_columns}",
+            quote_identifier(&table)
+        );
+        let mut stmt = conn.prepare(&sql).map_err(|err| {
+            format!("failed to prepare normalized digest query for {table}: {err}")
+        })?;
+        let mut rows = stmt
+            .query([])
+            .map_err(|err| format!("failed to query {table} for normalized digest: {err}"))?;
+        while let Some(row) = rows
+            .next()
+            .map_err(|err| format!("failed to read {table} row for normalized digest: {err}"))?
+        {
+            payload.push(b'r');
+            for (index, column) in columns.iter().enumerate() {
+                match row
+                    .get_ref(index)
+                    .map_err(|err| format!("failed to read {table}.{column}: {err}"))?
+                {
+                    ValueRef::Null => payload.push(b'n'),
+                    ValueRef::Integer(value) => {
+                        payload.push(b'i');
+                        payload.extend_from_slice(&value.to_le_bytes());
+                    }
+                    ValueRef::Real(value) => {
+                        payload.push(b'f');
+                        payload.extend_from_slice(&canonical_f64(value).to_le_bytes());
+                    }
+                    ValueRef::Text(value) => append_bytes(&mut payload, b's', value),
+                    ValueRef::Blob(value) => append_bytes(&mut payload, b'b', value),
+                }
+            }
+        }
+    }
+
+    Ok(sha256_hex(&payload))
+}
+
+fn query_strings(conn: &Connection, sql: &str) -> Result<Vec<String>, String> {
+    let mut stmt = conn
+        .prepare(sql)
+        .map_err(|err| format!("failed to prepare query `{sql}`: {err}"))?;
+    let rows = stmt
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(|err| format!("failed to run query `{sql}`: {err}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|err| format!("failed to read query `{sql}`: {err}"))?;
+    Ok(rows)
+}
+
+fn table_columns(conn: &Connection, table: &str) -> Result<Vec<String>, String> {
+    let sql = format!("PRAGMA table_info({})", quote_identifier(table));
+    let mut stmt = conn
+        .prepare(&sql)
+        .map_err(|err| format!("failed to prepare column query for {table}: {err}"))?;
+    let columns = stmt
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(|err| format!("failed to query columns for {table}: {err}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|err| format!("failed to read columns for {table}: {err}"))?;
+    Ok(columns)
+}
+
+fn quote_identifier(value: &str) -> String {
+    format!("\"{}\"", value.replace('"', "\"\""))
+}
+
+fn append_bytes(payload: &mut Vec<u8>, marker: u8, bytes: &[u8]) {
+    payload.push(marker);
+    payload.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+    payload.extend_from_slice(bytes);
+}
+
+fn named_codes(items: &[(&str, u8)]) -> BTreeMap<String, u8> {
+    items
+        .iter()
+        .map(|(name, code)| ((*name).to_string(), *code))
+        .collect()
+}
+
+fn supported_projection_methods() -> BTreeMap<String, u8> {
+    named_codes(&[
+        ("Albers Equal Area", METHOD_ALBERS),
+        ("Cassini-Soldner", METHOD_CASSINI_SOLDNER),
+        ("Equidistant Cylindrical", METHOD_EQUIDISTANT_CYL),
+        (
+            "Hotine Oblique Mercator A",
+            METHOD_HOTINE_OBLIQUE_MERCATOR_A,
+        ),
+        (
+            "Hotine Oblique Mercator B",
+            METHOD_HOTINE_OBLIQUE_MERCATOR_B,
+        ),
+        ("Lambert Azimuthal Equal Area", METHOD_LAEA),
+        (
+            "Lambert Azimuthal Equal Area (Spherical)",
+            METHOD_LAEA_SPHERICAL,
+        ),
+        ("Lambert Conformal Conic", METHOD_LCC),
+        ("Mercator", METHOD_MERCATOR),
+        ("Oblique Stereographic", METHOD_OBLIQUE_STEREO),
+        ("Polar Stereographic", METHOD_POLAR_STEREO),
+        ("Transverse Mercator", METHOD_TRANSVERSE_MERCATOR),
+        ("Web Mercator", METHOD_WEB_MERCATOR),
+    ])
+}
+
+fn supported_grid_formats() -> BTreeMap<String, u8> {
+    named_codes(&[
+        ("NTv2", GRID_FORMAT_NTV2),
+        ("Unsupported", GRID_FORMAT_UNSUPPORTED),
+    ])
+}
+
+fn supported_operation_payloads() -> BTreeMap<String, u8> {
+    named_codes(&[
+        ("Concatenated", OP_CONCATENATED),
+        ("GridShift", OP_GRID_SHIFT),
+        ("Helmert", OP_HELMERT),
+    ])
+}
+
 fn main() {
-    let db_path = find_proj_db();
+    let args = RegistryArgs::parse();
+    let db_path = args
+        .proj_db
+        .clone()
+        .unwrap_or_else(|| find_proj_db().unwrap_or_else(|message| fatal(message)));
     eprintln!("Using proj.db: {}", db_path.display());
-    let conn = Connection::open(&db_path).unwrap();
+    let conn = Connection::open(&db_path)
+        .unwrap_or_else(|err| fatal(format!("failed to open {}: {err}", db_path.display())));
+    let db_sha256 = normalized_proj_db_sha256(&conn)
+        .unwrap_or_else(|err| fatal(format!("failed to digest proj.db content: {err}")));
+    let proj_db_metadata = read_proj_db_metadata(&conn);
 
     let mut ellipsoids: BTreeMap<u32, (f64, f64)> = BTreeMap::new();
     {
@@ -406,7 +720,8 @@ fn main() {
                  JOIN unit_of_measure u
                    ON u.auth_name = e.uom_auth_name
                   AND u.code = e.uom_code
-                 WHERE e.auth_name='EPSG'",
+                 WHERE e.auth_name='EPSG'
+                 ORDER BY CAST(e.code AS INTEGER)",
             )
             .unwrap();
         for row in stmt
@@ -439,7 +754,12 @@ fn main() {
     let mut datums: BTreeMap<u32, DatumInfo> = BTreeMap::new();
     {
         let mut stmt = conn
-            .prepare("SELECT code, ellipsoid_code FROM geodetic_datum WHERE auth_name='EPSG'")
+            .prepare(
+                "SELECT code, ellipsoid_code
+                 FROM geodetic_datum
+                 WHERE auth_name='EPSG'
+                 ORDER BY CAST(code AS INTEGER)",
+            )
             .unwrap();
         for (code, ellipsoid_code) in stmt
             .query_map([], |row| Ok((row.get::<_, u32>(0)?, row.get::<_, u32>(1)?)))
@@ -472,7 +792,8 @@ fn main() {
             .prepare(
                 "SELECT code, conv_factor
                  FROM unit_of_measure
-                 WHERE auth_name='EPSG' AND type='length'",
+                 WHERE auth_name='EPSG' AND type='length'
+                 ORDER BY CAST(code AS INTEGER)",
             )
             .unwrap();
         stmt.query_map([], |row| {
@@ -488,7 +809,8 @@ fn main() {
             .prepare(
                 "SELECT code, conv_factor
                  FROM unit_of_measure
-                 WHERE auth_name='EPSG' AND type='angle'",
+                 WHERE auth_name='EPSG' AND type='angle'
+                 ORDER BY CAST(code AS INTEGER)",
             )
             .unwrap();
         stmt.query_map([], |row| {
@@ -504,7 +826,8 @@ fn main() {
             .prepare(
                 "SELECT code, conv_factor
                  FROM unit_of_measure
-                 WHERE auth_name='EPSG' AND type='scale'",
+                 WHERE auth_name='EPSG' AND type='scale'
+                 ORDER BY CAST(code AS INTEGER)",
             )
             .unwrap();
         stmt.query_map([], |row| {
@@ -534,7 +857,8 @@ fn main() {
                    AND deprecated=0
                  ORDER BY CAST(source_crs_code AS INTEGER),
                           (CASE WHEN rx IS NOT NULL AND rx != 0 THEN 0 ELSE 1 END),
-                          COALESCE(accuracy, 999.0)",
+                          COALESCE(accuracy, 999.0),
+                          CAST(code AS INTEGER)",
             )
             .unwrap();
         let mut datum_accuracy: BTreeMap<u32, f64> = BTreeMap::new();
@@ -657,7 +981,7 @@ fn main() {
                    ON u.auth_name = a.uom_auth_name
                   AND u.code = a.uom_code
                  WHERE pc.auth_name='EPSG' AND pc.deprecated=0
-                 ORDER BY pc.code",
+                 ORDER BY CAST(pc.code AS INTEGER)",
             )
             .unwrap();
         let rows: Vec<ProjectedCrsRow> = stmt
@@ -1131,7 +1455,10 @@ fn main() {
                    ON extent.auth_name = usage.extent_auth_name
                   AND extent.code = usage.extent_code
                  WHERE object_auth_name='EPSG'
-                   AND object_table_name IN ('grid_transformation','helmert_transformation','concatenated_operation')",
+                   AND object_table_name IN ('grid_transformation','helmert_transformation','concatenated_operation')
+                 ORDER BY object_table_name,
+                          CAST(object_code AS INTEGER),
+                          CAST(extent.code AS INTEGER)",
             )
             .unwrap();
         for row in stmt
@@ -1171,6 +1498,10 @@ fn main() {
             });
         }
     }
+    for operation in &mut operations {
+        operation.area_codes.sort_unstable();
+        operation.area_codes.dedup();
+    }
 
     let mut grid_area_by_id: BTreeMap<u32, u32> = BTreeMap::new();
     for operation in &operations {
@@ -1194,7 +1525,16 @@ fn main() {
     eprintln!("Grid resources: {}", grid_resources.len());
     eprintln!("Operations: {}", operations.len());
 
-    let out_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../proj-core/data/epsg.bin");
+    let counts = RegistryCounts {
+        ellipsoids: used_ellipsoids.len(),
+        datums: used_datums.len(),
+        geographic_crs: geo_crs.len(),
+        projected_crs: proj_crs.len(),
+        extents: extent_list.len(),
+        grid_resources: grid_resources.len(),
+        operations: operations.len(),
+    };
+
     let mut buf = Vec::<u8>::new();
     buf.extend_from_slice(&MAGIC.to_le_bytes());
     buf.extend_from_slice(&VERSION.to_le_bytes());
@@ -1210,8 +1550,8 @@ fn main() {
     for (code, a, inv_f) in &used_ellipsoids {
         let mut rec = [0u8; ELLIPSOID_RECORD_SIZE];
         rec[0..4].copy_from_slice(&code.to_le_bytes());
-        rec[4..12].copy_from_slice(&a.to_le_bytes());
-        rec[12..20].copy_from_slice(&inv_f.to_le_bytes());
+        rec[4..12].copy_from_slice(&canonical_f64(*a).to_le_bytes());
+        rec[12..20].copy_from_slice(&canonical_f64(*inv_f).to_le_bytes());
         buf.extend_from_slice(&rec);
     }
 
@@ -1226,7 +1566,7 @@ fn main() {
         };
         for (index, value) in datum.helmert.iter().enumerate() {
             let offset = 16 + index * 8;
-            rec[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+            rec[offset..offset + 8].copy_from_slice(&canonical_f64(*value).to_le_bytes());
         }
         buf.extend_from_slice(&rec);
     }
@@ -1245,10 +1585,10 @@ fn main() {
         rec[4..8].copy_from_slice(&crs.base_geographic_crs_code.to_le_bytes());
         rec[8..12].copy_from_slice(&crs.datum_code.to_le_bytes());
         rec[12] = crs.method_id;
-        rec[16..24].copy_from_slice(&crs.linear_unit_to_meter.to_le_bytes());
+        rec[16..24].copy_from_slice(&canonical_f64(crs.linear_unit_to_meter).to_le_bytes());
         for (index, value) in crs.params.iter().enumerate() {
             let offset = 24 + index * 8;
-            rec[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+            rec[offset..offset + 8].copy_from_slice(&canonical_f64(*value).to_le_bytes());
         }
         buf.extend_from_slice(&rec);
         write_string_u16(&mut buf, &crs.name);
@@ -1256,10 +1596,10 @@ fn main() {
 
     for extent in &extent_list {
         buf.extend_from_slice(&extent.code.to_le_bytes());
-        buf.extend_from_slice(&extent.west.to_le_bytes());
-        buf.extend_from_slice(&extent.south.to_le_bytes());
-        buf.extend_from_slice(&extent.east.to_le_bytes());
-        buf.extend_from_slice(&extent.north.to_le_bytes());
+        write_f64(&mut buf, extent.west);
+        write_f64(&mut buf, extent.south);
+        write_f64(&mut buf, extent.east);
+        write_f64(&mut buf, extent.north);
         write_string_u16(&mut buf, &extent.name);
     }
 
@@ -1298,7 +1638,7 @@ fn main() {
         buf.extend_from_slice(&operation.target_crs_code.to_le_bytes());
         buf.extend_from_slice(&operation.source_datum_code.to_le_bytes());
         buf.extend_from_slice(&operation.target_datum_code.to_le_bytes());
-        buf.extend_from_slice(&operation.accuracy.unwrap_or(f64::NAN).to_le_bytes());
+        write_optional_f64(&mut buf, operation.accuracy);
         write_string_u16(&mut buf, &operation.name);
         for area_code in &operation.area_codes {
             buf.extend_from_slice(&area_code.to_le_bytes());
@@ -1306,7 +1646,7 @@ fn main() {
         match &operation.payload {
             OperationPayload::Helmert(params) => {
                 for value in params {
-                    buf.extend_from_slice(&value.to_le_bytes());
+                    write_f64(&mut buf, *value);
                 }
             }
             OperationPayload::GridShift {
@@ -1330,13 +1670,71 @@ fn main() {
         }
     }
 
-    std::fs::write(&out_path, &buf).unwrap();
-    eprintln!(
-        "Wrote {} bytes ({:.1} KB) to {}",
-        buf.len(),
-        buf.len() as f64 / 1024.0,
-        out_path.display()
-    );
+    let bin_sha256 = sha256_hex(&buf);
+    let provenance = RegistryProvenance {
+        schema_version: PROVENANCE_SCHEMA_VERSION,
+        generator: "gen-reference gen-registry",
+        registry_format: RegistryFormatProvenance {
+            magic: format!("0x{MAGIC:08x}"),
+            version: VERSION,
+        },
+        source_database: SourceDatabaseProvenance {
+            kind: "PROJ proj.db",
+            file_name: "proj.db",
+            normalized_content_sha256: db_sha256,
+            metadata: proj_db_metadata,
+        },
+        output: RegistryOutputProvenance {
+            file_name: EPSG_BIN_FILE,
+            byte_len: buf.len(),
+            sha256: bin_sha256,
+        },
+        counts,
+        supported_projection_methods: supported_projection_methods(),
+        supported_grid_formats: supported_grid_formats(),
+        supported_operation_payloads: supported_operation_payloads(),
+    };
+    let mut provenance_bytes = serde_json::to_vec_pretty(&provenance)
+        .unwrap_or_else(|err| fatal(format!("failed to serialize provenance: {err}")));
+    provenance_bytes.push(b'\n');
+
+    let out_path = args.out_dir.join(EPSG_BIN_FILE);
+    let provenance_path = args.out_dir.join(PROVENANCE_FILE);
+    match args.mode {
+        RegistryMode::Write => {
+            fs::create_dir_all(&args.out_dir).unwrap_or_else(|err| {
+                fatal(format!(
+                    "failed to create output directory {}: {err}",
+                    args.out_dir.display()
+                ))
+            });
+            fs::write(&out_path, &buf).unwrap_or_else(|err| {
+                fatal(format!("failed to write {}: {err}", out_path.display()))
+            });
+            fs::write(&provenance_path, &provenance_bytes).unwrap_or_else(|err| {
+                fatal(format!(
+                    "failed to write {}: {err}",
+                    provenance_path.display()
+                ))
+            });
+            eprintln!(
+                "Wrote {} bytes ({:.1} KB) to {}",
+                buf.len(),
+                buf.len() as f64 / 1024.0,
+                out_path.display()
+            );
+            eprintln!("Wrote provenance to {}", provenance_path.display());
+        }
+        RegistryMode::Check => {
+            assert_reproducible(&out_path, &buf, EPSG_BIN_FILE);
+            assert_reproducible(&provenance_path, &provenance_bytes, PROVENANCE_FILE);
+            eprintln!(
+                "Registry artifacts are reproducible: {}, {}",
+                out_path.display(),
+                provenance_path.display()
+            );
+        }
+    }
 }
 
 fn write_string_u16(buf: &mut Vec<u8>, value: &str) {
@@ -1344,4 +1742,193 @@ fn write_string_u16(buf: &mut Vec<u8>, value: &str) {
     let len = u16::try_from(bytes.len()).expect("string too long for embedded registry");
     buf.extend_from_slice(&len.to_le_bytes());
     buf.extend_from_slice(bytes);
+}
+
+fn write_f64(buf: &mut Vec<u8>, value: f64) {
+    buf.extend_from_slice(&canonical_f64(value).to_le_bytes());
+}
+
+fn write_optional_f64(buf: &mut Vec<u8>, value: Option<f64>) {
+    match value {
+        Some(value) => write_f64(buf, value),
+        None => buf.extend_from_slice(&CANONICAL_NAN_BITS.to_le_bytes()),
+    }
+}
+
+fn canonical_f64(value: f64) -> f64 {
+    assert!(value.is_finite(), "registry value must be finite");
+    if value == 0.0 {
+        return 0.0;
+    }
+    format!("{value:.CANONICAL_FLOAT_DECIMAL_PLACES$e}")
+        .parse()
+        .expect("formatted finite f64 should parse")
+}
+
+fn assert_reproducible(path: &Path, expected: &[u8], label: &str) {
+    let existing = fs::read(path).unwrap_or_else(|err| {
+        fatal(format!(
+            "{label} is missing or unreadable at {}: {err}",
+            path.display()
+        ))
+    });
+    if existing != expected {
+        fatal(format!(
+            "{label} is not reproducible from the pinned proj.db\n\
+             expected: {} ({} bytes)\n\
+             actual:   {} ({} bytes)\n\
+             regenerate with: cargo run --manifest-path gen-reference/Cargo.toml --bin gen-registry",
+            sha256_hex(expected),
+            expected.len(),
+            sha256_hex(&existing),
+            existing.len()
+        ));
+    }
+}
+
+fn fatal(message: impl AsRef<str>) -> ! {
+    eprintln!("error: {}", message.as_ref());
+    std::process::exit(1);
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    const H0: [u32; 8] = [
+        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
+        0x5be0cd19,
+    ];
+    const K: [u32; 64] = [
+        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
+        0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe,
+        0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f,
+        0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
+        0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc,
+        0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
+        0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116,
+        0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7,
+        0xc67178f2,
+    ];
+
+    let bit_len = (bytes.len() as u64).wrapping_mul(8);
+    let mut padded = Vec::with_capacity((bytes.len() + 72).div_ceil(64) * 64);
+    padded.extend_from_slice(bytes);
+    padded.push(0x80);
+    while (padded.len() % 64) != 56 {
+        padded.push(0);
+    }
+    padded.extend_from_slice(&bit_len.to_be_bytes());
+
+    let mut h = H0;
+    let mut w = [0u32; 64];
+    for chunk in padded.chunks_exact(64) {
+        for (i, word) in w.iter_mut().take(16).enumerate() {
+            *word = u32::from_be_bytes(
+                chunk[i * 4..i * 4 + 4]
+                    .try_into()
+                    .expect("slice length checked"),
+            );
+        }
+        for i in 16..64 {
+            let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
+            let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
+            w[i] = w[i - 16]
+                .wrapping_add(s0)
+                .wrapping_add(w[i - 7])
+                .wrapping_add(s1);
+        }
+
+        let mut a = h[0];
+        let mut b = h[1];
+        let mut c = h[2];
+        let mut d = h[3];
+        let mut e = h[4];
+        let mut f = h[5];
+        let mut g = h[6];
+        let mut hh = h[7];
+
+        for i in 0..64 {
+            let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
+            let ch = (e & f) ^ ((!e) & g);
+            let temp1 = hh
+                .wrapping_add(s1)
+                .wrapping_add(ch)
+                .wrapping_add(K[i])
+                .wrapping_add(w[i]);
+            let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
+            let maj = (a & b) ^ (a & c) ^ (b & c);
+            let temp2 = s0.wrapping_add(maj);
+
+            hh = g;
+            g = f;
+            f = e;
+            e = d.wrapping_add(temp1);
+            d = c;
+            c = b;
+            b = a;
+            a = temp1.wrapping_add(temp2);
+        }
+
+        h[0] = h[0].wrapping_add(a);
+        h[1] = h[1].wrapping_add(b);
+        h[2] = h[2].wrapping_add(c);
+        h[3] = h[3].wrapping_add(d);
+        h[4] = h[4].wrapping_add(e);
+        h[5] = h[5].wrapping_add(f);
+        h[6] = h[6].wrapping_add(g);
+        h[7] = h[7].wrapping_add(hh);
+    }
+
+    let mut out = String::with_capacity(71);
+    out.push_str("sha256:");
+    for word in h {
+        use std::fmt::Write as _;
+        write!(&mut out, "{word:08x}").expect("writing to string cannot fail");
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sha256_hex_matches_known_vector() {
+        assert_eq!(
+            sha256_hex(b"abc"),
+            "sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
+
+    #[test]
+    fn canonical_nan_encoding_is_fixed() {
+        assert_eq!(
+            CANONICAL_NAN_BITS.to_le_bytes(),
+            [0, 0, 0, 0, 0, 0, 248, 127]
+        );
+    }
+
+    #[test]
+    fn canonical_f64_rounds_to_stable_decimal_precision() {
+        assert_eq!(canonical_f64(-0.0).to_bits(), 0.0f64.to_bits());
+        assert_eq!(canonical_f64(6378137.0000000001), 6378137.0);
+        assert_eq!(
+            canonical_f64(1.2345678901234567).to_bits(),
+            1.2345678901235f64.to_bits()
+        );
+    }
+
+    #[test]
+    fn parses_check_mode_with_explicit_paths() {
+        let args = RegistryArgs::parse_from([
+            "--check",
+            "--proj-db",
+            "/tmp/proj.db",
+            "--out-dir",
+            "/tmp/out",
+        ])
+        .unwrap();
+        assert_eq!(args.mode, RegistryMode::Check);
+        assert_eq!(args.proj_db.as_deref(), Some(Path::new("/tmp/proj.db")));
+        assert_eq!(args.out_dir, PathBuf::from("/tmp/out"));
+    }
 }

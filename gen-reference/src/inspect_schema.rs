@@ -16,8 +16,11 @@ fn walkdir(dir: &std::path::Path, name: &str) -> Vec<PathBuf> {
     if let Ok(es) = std::fs::read_dir(dir) {
         for e in es.flatten() {
             let p = e.path();
-            if p.is_dir() { r.extend(walkdir(&p, name)); }
-            else if p.file_name().and_then(|n| n.to_str()) == Some(name) { r.push(p); }
+            if p.is_dir() {
+                r.extend(walkdir(&p, name));
+            } else if p.file_name().and_then(|n| n.to_str()) == Some(name) {
+                r.push(p);
+            }
         }
     }
     r
@@ -28,15 +31,27 @@ fn main() {
     let conn = Connection::open(&db).unwrap();
 
     // List all tables
-    let mut stmt = conn.prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name").unwrap();
-    let tables: Vec<String> = stmt.query_map([], |r| r.get(0)).unwrap().filter_map(|r| r.ok()).collect();
+    let mut stmt = conn
+        .prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
+        .unwrap();
+    let tables: Vec<String> = stmt
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .filter_map(|r| r.ok())
+        .collect();
     println!("Tables ({}):", tables.len());
-    for t in &tables { println!("  {t}"); }
+    for t in &tables {
+        println!("  {t}");
+    }
 
     // For conversion-related tables, show columns
     for table in &["conversion", "conversion_table", "projected_crs"] {
         if let Ok(mut s) = conn.prepare(&format!("PRAGMA table_info({table})")) {
-            let cols: Vec<String> = s.query_map([], |r| r.get::<_, String>(1)).unwrap().filter_map(|r| r.ok()).collect();
+            let cols: Vec<String> = s
+                .query_map([], |r| r.get::<_, String>(1))
+                .unwrap()
+                .filter_map(|r| r.ok())
+                .collect();
             if !cols.is_empty() {
                 println!("\n{table} columns: {}", cols.join(", "));
             }
@@ -44,18 +59,26 @@ fn main() {
     }
 
     // Sample a conversion to see parameter storage
-    let s = conn.prepare(
-        "SELECT * FROM conversion_table WHERE auth_name='EPSG' LIMIT 1"
-    ).unwrap_or_else(|_| conn.prepare("SELECT 'no conversion_table'").unwrap());
-    let cols = s.column_names().iter().map(|c| c.to_string()).collect::<Vec<_>>();
+    let s = conn
+        .prepare("SELECT * FROM conversion_table WHERE auth_name='EPSG' LIMIT 1")
+        .unwrap_or_else(|_| conn.prepare("SELECT 'no conversion_table'").unwrap());
+    let cols = s
+        .column_names()
+        .iter()
+        .map(|c| c.to_string())
+        .collect::<Vec<_>>();
     println!("\nconversion_table columns: {}", cols.join(", "));
 
     // Check a specific UTM zone
     println!("\n--- EPSG:32618 (UTM 18N) ---");
-    let s = conn.prepare(
-        "SELECT * FROM conversion_table WHERE auth_name='EPSG' AND code=16018"
-    ).unwrap();
-    let cols = s.column_names().iter().map(|c| c.to_string()).collect::<Vec<_>>();
+    let s = conn
+        .prepare("SELECT * FROM conversion_table WHERE auth_name='EPSG' AND code=16018")
+        .unwrap();
+    let cols = s
+        .column_names()
+        .iter()
+        .map(|c| c.to_string())
+        .collect::<Vec<_>>();
     println!("Columns: {}", cols.join(", "));
 
     // Try to find the conversion code for UTM 18N
@@ -66,11 +89,15 @@ fn main() {
     println!("UTM 18N conversion: {} {}", row.0, row.1);
 
     // Get the conversion details
-    let mut s = conn.prepare(
-        "SELECT * FROM conversion_table WHERE auth_name=?1 AND code=?2"
-    ).unwrap();
+    let mut s = conn
+        .prepare("SELECT * FROM conversion_table WHERE auth_name=?1 AND code=?2")
+        .unwrap();
     let n = s.column_count();
-    let cols = s.column_names().iter().map(|c| c.to_string()).collect::<Vec<_>>();
+    let cols = s
+        .column_names()
+        .iter()
+        .map(|c| c.to_string())
+        .collect::<Vec<_>>();
     println!("Columns: {}", cols.join(", "));
     s.query_row(rusqlite::params![row.0, row.1], |r| {
         for (i, col) in cols.iter().enumerate().take(n) {
@@ -81,5 +108,6 @@ fn main() {
             println!("  {col}: {val}");
         }
         Ok(())
-    }).unwrap();
+    })
+    .unwrap();
 }

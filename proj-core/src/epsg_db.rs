@@ -13,6 +13,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::OnceLock;
 
 static EPSG_DATA: &[u8] = include_bytes!("../data/epsg.bin");
+pub(crate) const PROVENANCE_JSON: &str = include_str!("../data/epsg.provenance.json");
 
 const MAGIC: u32 = 0x4550_5347;
 const VERSION: u16 = 6;
