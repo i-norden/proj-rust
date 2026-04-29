@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.5.0
+
 - add explicit `VerticalCrsDef`, `VerticalCrsKind`, `HorizontalCrsDef`, and `CompoundCrsDef` CRS model types for ellipsoidal-height and gravity-related vertical components
 - add EPSG:4979 and WKT/PROJJSON 3D geographic and compound CRS parsing paths while preserving `z` only when vertical CRS components are identical
 - reject explicit vertical CRS mismatches, standalone vertical CRS transform requests, and vertical/geoid transformation semantics instead of silently preserving ambiguous heights

@@ -11,13 +11,13 @@ This workspace currently contains:
 
 `proj-rust` is intended for production use within its supported CRS and projection set. It is not a full implementation of all PROJ capabilities.
 
-Current non-goals for the `0.4` release line include:
+Current non-goals for the `0.5` release line include:
 
 - packaged vertical grid assets, broad vertical operation selection, cross-datum vertical, or time-dependent CRS transformation operations
 - arbitrary user-defined PROJ pipeline parsing/execution beyond the supported CRS and operation model
 - full EPSG/PROJ registry coverage outside the implemented projection families and embedded operation set
 - full custom CRS coverage for arbitrary axis-order, prime-meridian, and geographic angular-unit semantics
-- grid ecosystems beyond the supported embedded and application-supplied NTv2 resources
+- grid ecosystems beyond the supported embedded NTv2 resources and caller-supplied NTv2/GTX resources
 
 ## Usage
 
