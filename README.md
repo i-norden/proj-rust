@@ -1,5 +1,10 @@
 # proj-rust
 
+[![proj-core crates.io](https://img.shields.io/crates/v/proj-core.svg)](https://crates.io/crates/proj-core)
+[![proj-core docs.rs](https://docs.rs/proj-core/badge.svg)](https://docs.rs/proj-core)
+[![proj-wkt crates.io](https://img.shields.io/crates/v/proj-wkt.svg)](https://crates.io/crates/proj-wkt)
+[![proj-wkt docs.rs](https://docs.rs/proj-wkt/badge.svg)](https://docs.rs/proj-wkt)
+
 Pure-Rust coordinate transformation library. No C libraries, no build scripts, no unsafe code.
 
 This workspace currently contains:
