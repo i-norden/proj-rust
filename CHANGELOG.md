@@ -10,6 +10,7 @@
 - add caller-supplied `VerticalGridOperation` support for ellipsoidal-to-gravity height transforms backed by NOAA/VDatum binary GTX grids
 - harden vertical grid selection with declared sampling CRS handling, area-of-use ordering, runtime fallback across coverage misses, resolved SHA-256 grid checksums, and safe filesystem resource paths
 - add supported vertical CRS lookup for EPSG:3855, 5702, 5703, 5773, and 6360 and canonicalize WKT/PROJJSON vertical components from vertical CRS EPSG identifiers when datum identifiers are absent
+- harden embedded EPSG registry generation with deterministic PROJ database provenance exposed through `registry::embedded_registry_provenance_json()`, `epsg.bin` reproducibility checks, and CI coverage for the generator crate
 
 ## 0.4.0
 

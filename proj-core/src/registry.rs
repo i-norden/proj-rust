@@ -32,6 +32,15 @@ pub fn lookup_vertical_epsg(code: u32) -> Option<VerticalCrsDef> {
     epsg_db::lookup_vertical(code)
 }
 
+/// Return deterministic provenance for the embedded EPSG registry artifact.
+///
+/// The JSON documents the generator, binary registry format, source PROJ
+/// database checksum and metadata, registry counts, and generated
+/// `epsg.bin` checksum.
+pub fn embedded_registry_provenance_json() -> &'static str {
+    epsg_db::PROVENANCE_JSON
+}
+
 /// Look up a coordinate operation by its identifier.
 pub fn lookup_operation(id: CoordinateOperationId) -> Option<CoordinateOperation> {
     epsg_db::lookup_operation(id.0)
@@ -179,6 +188,26 @@ mod tests {
             navd88_ft.linear_unit_to_meter(),
             crate::crs::LinearUnit::us_survey_foot().meters_per_unit()
         );
+    }
+
+    #[test]
+    fn embedded_registry_provenance_reports_source_database() {
+        let value: serde_json::Value =
+            serde_json::from_str(embedded_registry_provenance_json()).unwrap();
+        assert_eq!(value["schema_version"], 1);
+        assert_eq!(
+            value["source_database"]["metadata"]["PROJ.VERSION"],
+            "9.6.2"
+        );
+        assert_eq!(
+            value["source_database"]["metadata"]["EPSG.VERSION"],
+            "v12.013"
+        );
+        assert_eq!(value["output"]["byte_len"], 883655);
+        assert!(value["output"]["sha256"]
+            .as_str()
+            .unwrap()
+            .starts_with("sha256:"));
     }
 
     #[test]
