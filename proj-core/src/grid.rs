@@ -2,13 +2,16 @@ use crate::operation::{AreaOfUse, GridId, GridInterpolation, GridShiftDirection}
 use smallvec::SmallVec;
 use std::collections::HashMap;
 use std::f64::consts::PI;
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use thiserror::Error;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum GridFormat {
+    /// NTv2 horizontal datum-shift grid (`.gsb`).
     Ntv2,
+    /// NOAA/VDatum binary GTX vertical offset grid (`.gtx`).
+    Gtx,
     Unsupported,
 }
 
@@ -26,6 +29,12 @@ pub struct GridDefinition {
 pub struct GridSample {
     pub lon_shift_radians: f64,
     pub lat_shift_radians: f64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct VerticalGridSample {
+    /// Vertical offset in meters at the sampled horizontal position.
+    pub offset_meters: f64,
 }
 
 #[derive(Debug, Error, Clone)]
@@ -53,12 +62,34 @@ pub trait GridProvider: Send + Sync {
 #[derive(Clone)]
 pub struct GridHandle {
     definition: GridDefinition,
-    data: Arc<GridData>,
+    data: Arc<CachedGridData>,
 }
 
 impl GridHandle {
+    /// Parse a grid resource into a handle.
+    ///
+    /// Custom [`GridProvider`] implementations can use this constructor after
+    /// loading bytes from their own package, object store, or manifest.
+    pub fn from_bytes(
+        definition: GridDefinition,
+        bytes: &[u8],
+    ) -> std::result::Result<Self, GridError> {
+        Ok(Self {
+            data: Arc::new(parse_cached_grid_data(
+                definition.format,
+                &definition.name,
+                bytes,
+            )?),
+            definition,
+        })
+    }
+
     pub fn definition(&self) -> &GridDefinition {
         &self.definition
+    }
+
+    pub fn checksum(&self) -> &str {
+        &self.data.checksum
     }
 
     pub fn sample(
@@ -66,8 +97,26 @@ impl GridHandle {
         lon_radians: f64,
         lat_radians: f64,
     ) -> std::result::Result<GridSample, GridError> {
-        match self.data.as_ref() {
+        match &self.data.data {
             GridData::Ntv2(set) => set.sample(lon_radians, lat_radians),
+            GridData::Gtx(_) => Err(GridError::UnsupportedFormat(format!(
+                "{} is a vertical grid",
+                self.definition.name
+            ))),
+        }
+    }
+
+    pub fn sample_vertical_offset_meters(
+        &self,
+        lon_radians: f64,
+        lat_radians: f64,
+    ) -> std::result::Result<VerticalGridSample, GridError> {
+        match &self.data.data {
+            GridData::Gtx(grid) => grid.sample(lon_radians, lat_radians),
+            GridData::Ntv2(_) => Err(GridError::UnsupportedFormat(format!(
+                "{} is a horizontal grid",
+                self.definition.name
+            ))),
         }
     }
 
@@ -77,8 +126,12 @@ impl GridHandle {
         lat_radians: f64,
         direction: GridShiftDirection,
     ) -> std::result::Result<(f64, f64), GridError> {
-        match self.data.as_ref() {
+        match &self.data.data {
             GridData::Ntv2(set) => set.apply(lon_radians, lat_radians, direction),
+            GridData::Gtx(_) => Err(GridError::UnsupportedFormat(format!(
+                "{} is a vertical grid",
+                self.definition.name
+            ))),
         }
     }
 }
@@ -191,7 +244,7 @@ impl GridProvider for EmbeddedGridProvider {
 
         let key = GridDataCacheKey::new(grid.format, resource_name);
         let data = cached_grid_data(embedded_grid_data_cache(), key, || {
-            parse_grid_data(grid.format, &grid.name, bytes)
+            parse_cached_grid_data(grid.format, &grid.name, bytes)
         })?;
 
         Ok(Some(GridHandle {
@@ -203,7 +256,7 @@ impl GridProvider for EmbeddedGridProvider {
 
 pub struct FilesystemGridProvider {
     roots: Vec<PathBuf>,
-    data_cache: Mutex<HashMap<GridDataCacheKey, Arc<GridData>>>,
+    data_cache: Mutex<HashMap<GridDataCacheKey, Arc<CachedGridData>>>,
 }
 
 impl FilesystemGridProvider {
@@ -219,10 +272,19 @@ impl FilesystemGridProvider {
 
     fn locate(&self, grid: &GridDefinition) -> Option<PathBuf> {
         for root in &self.roots {
+            let Ok(root) = root.canonicalize() else {
+                continue;
+            };
             for name in &grid.resource_names {
+                if !is_safe_grid_resource_name(name) {
+                    continue;
+                }
                 let candidate = root.join(name);
-                if candidate.exists() {
-                    return Some(candidate);
+                let Ok(canonical_candidate) = candidate.canonicalize() else {
+                    continue;
+                };
+                if canonical_candidate.starts_with(&root) && canonical_candidate.is_file() {
+                    return Some(canonical_candidate);
                 }
             }
         }
@@ -251,7 +313,7 @@ impl GridProvider for FilesystemGridProvider {
         let data = cached_grid_data(&self.data_cache, key, || {
             let bytes = std::fs::read(&path)
                 .map_err(|err| GridError::Unavailable(format!("{}: {err}", path.display())))?;
-            parse_grid_data(grid.format, &grid.name, &bytes)
+            parse_cached_grid_data(grid.format, &grid.name, &bytes)
         })?;
 
         Ok(Some(GridHandle {
@@ -261,8 +323,23 @@ impl GridProvider for FilesystemGridProvider {
     }
 }
 
+fn is_safe_grid_resource_name(name: &str) -> bool {
+    let path = Path::new(name);
+    if path.as_os_str().is_empty() {
+        return false;
+    }
+    path.components()
+        .all(|component| matches!(component, Component::Normal(_)))
+}
+
 enum GridData {
     Ntv2(Ntv2GridSet),
+    Gtx(GtxGrid),
+}
+
+struct CachedGridData {
+    data: GridData,
+    checksum: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -280,16 +357,16 @@ impl GridDataCacheKey {
     }
 }
 
-fn embedded_grid_data_cache() -> &'static Mutex<HashMap<GridDataCacheKey, Arc<GridData>>> {
-    static CACHE: OnceLock<Mutex<HashMap<GridDataCacheKey, Arc<GridData>>>> = OnceLock::new();
+fn embedded_grid_data_cache() -> &'static Mutex<HashMap<GridDataCacheKey, Arc<CachedGridData>>> {
+    static CACHE: OnceLock<Mutex<HashMap<GridDataCacheKey, Arc<CachedGridData>>>> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 fn cached_grid_data(
-    cache: &Mutex<HashMap<GridDataCacheKey, Arc<GridData>>>,
+    cache: &Mutex<HashMap<GridDataCacheKey, Arc<CachedGridData>>>,
     key: GridDataCacheKey,
-    parse: impl FnOnce() -> std::result::Result<GridData, GridError>,
-) -> std::result::Result<Arc<GridData>, GridError> {
+    parse: impl FnOnce() -> std::result::Result<CachedGridData, GridError>,
+) -> std::result::Result<Arc<CachedGridData>, GridError> {
     if let Some(cached) = cache
         .lock()
         .expect("grid data cache poisoned")
@@ -312,8 +389,116 @@ fn parse_grid_data(
 ) -> std::result::Result<GridData, GridError> {
     match format {
         GridFormat::Ntv2 => Ok(GridData::Ntv2(Ntv2GridSet::parse(bytes)?)),
+        GridFormat::Gtx => Ok(GridData::Gtx(GtxGrid::parse(bytes)?)),
         GridFormat::Unsupported => Err(GridError::UnsupportedFormat(name.into())),
     }
+}
+
+fn parse_cached_grid_data(
+    format: GridFormat,
+    name: &str,
+    bytes: &[u8],
+) -> std::result::Result<CachedGridData, GridError> {
+    Ok(CachedGridData {
+        data: parse_grid_data(format, name, bytes)?,
+        checksum: sha256_hex(bytes),
+    })
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    const H0: [u32; 8] = [
+        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
+        0x5be0cd19,
+    ];
+    const K: [u32; 64] = [
+        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
+        0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe,
+        0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f,
+        0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
+        0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc,
+        0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
+        0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116,
+        0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7,
+        0xc67178f2,
+    ];
+
+    let bit_len = (bytes.len() as u64).wrapping_mul(8);
+    let mut padded = Vec::with_capacity((bytes.len() + 72).div_ceil(64) * 64);
+    padded.extend_from_slice(bytes);
+    padded.push(0x80);
+    while (padded.len() % 64) != 56 {
+        padded.push(0);
+    }
+    padded.extend_from_slice(&bit_len.to_be_bytes());
+
+    let mut h = H0;
+    let mut w = [0u32; 64];
+    for chunk in padded.chunks_exact(64) {
+        for (i, word) in w.iter_mut().take(16).enumerate() {
+            *word = u32::from_be_bytes(
+                chunk[i * 4..i * 4 + 4]
+                    .try_into()
+                    .expect("slice length checked"),
+            );
+        }
+        for i in 16..64 {
+            let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
+            let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
+            w[i] = w[i - 16]
+                .wrapping_add(s0)
+                .wrapping_add(w[i - 7])
+                .wrapping_add(s1);
+        }
+
+        let mut a = h[0];
+        let mut b = h[1];
+        let mut c = h[2];
+        let mut d = h[3];
+        let mut e = h[4];
+        let mut f = h[5];
+        let mut g = h[6];
+        let mut hh = h[7];
+
+        for i in 0..64 {
+            let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
+            let ch = (e & f) ^ ((!e) & g);
+            let temp1 = hh
+                .wrapping_add(s1)
+                .wrapping_add(ch)
+                .wrapping_add(K[i])
+                .wrapping_add(w[i]);
+            let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
+            let maj = (a & b) ^ (a & c) ^ (b & c);
+            let temp2 = s0.wrapping_add(maj);
+
+            hh = g;
+            g = f;
+            f = e;
+            e = d.wrapping_add(temp1);
+            d = c;
+            c = b;
+            b = a;
+            a = temp1.wrapping_add(temp2);
+        }
+
+        h[0] = h[0].wrapping_add(a);
+        h[1] = h[1].wrapping_add(b);
+        h[2] = h[2].wrapping_add(c);
+        h[3] = h[3].wrapping_add(d);
+        h[4] = h[4].wrapping_add(e);
+        h[5] = h[5].wrapping_add(f);
+        h[6] = h[6].wrapping_add(g);
+        h[7] = h[7].wrapping_add(hh);
+    }
+
+    let mut out = String::with_capacity(71);
+    out.push_str("sha256:");
+    for word in h {
+        use std::fmt::Write as _;
+        write!(&mut out, "{word:08x}").expect("writing to string cannot fail");
+    }
+    out
 }
 
 fn embedded_grid_resource(names: &[String]) -> Option<(&'static str, &'static [u8])> {
@@ -653,6 +838,177 @@ fn interpolate(
     Ok((lon, lat))
 }
 
+#[derive(Clone)]
+struct GtxGrid {
+    west_degrees: f64,
+    south_degrees: f64,
+    east_degrees: f64,
+    north_degrees: f64,
+    delta_lon_degrees: f64,
+    delta_lat_degrees: f64,
+    width: usize,
+    height: usize,
+    offsets_meters: Vec<f64>,
+}
+
+impl GtxGrid {
+    fn parse(bytes: &[u8]) -> std::result::Result<Self, GridError> {
+        const HEADER_LEN: usize = 40;
+
+        if bytes.len() < HEADER_LEN {
+            return Err(GridError::Parse("GTX file too small".into()));
+        }
+
+        let south_degrees = read_f64(bytes, 0, Endian::Big)?;
+        let west_degrees = read_f64(bytes, 8, Endian::Big)?;
+        let delta_lat_degrees = read_f64(bytes, 16, Endian::Big)?;
+        let delta_lon_degrees = read_f64(bytes, 24, Endian::Big)?;
+        let height_i32 = read_i32(bytes, 32, Endian::Big)?;
+        let width_i32 = read_i32(bytes, 36, Endian::Big)?;
+
+        if !(west_degrees.is_finite()
+            && south_degrees.is_finite()
+            && delta_lon_degrees.is_finite()
+            && delta_lat_degrees.is_finite()
+            && delta_lon_degrees > 0.0
+            && delta_lat_degrees > 0.0
+            && width_i32 >= 2
+            && height_i32 >= 2)
+        {
+            return Err(GridError::Parse("invalid GTX georeferencing".into()));
+        }
+        let height = height_i32 as usize;
+        let width = width_i32 as usize;
+
+        let count = width
+            .checked_mul(height)
+            .ok_or_else(|| GridError::Parse("GTX data size overflow".into()))?;
+        let expected_len = HEADER_LEN
+            + count
+                .checked_mul(4)
+                .ok_or_else(|| GridError::Parse("GTX data size overflow".into()))?;
+        if bytes.len() < expected_len {
+            return Err(GridError::Parse("truncated GTX data".into()));
+        }
+
+        let mut offsets_meters = Vec::with_capacity(count);
+        for index in 0..count {
+            let value = read_f32(bytes, HEADER_LEN + index * 4, Endian::Big)? as f64;
+            if (value + 88.8888).abs() <= 1e-4 {
+                offsets_meters.push(f64::NAN);
+            } else {
+                offsets_meters.push(value);
+            }
+        }
+
+        let east_degrees = west_degrees + delta_lon_degrees * (width - 1) as f64;
+        let north_degrees = south_degrees + delta_lat_degrees * (height - 1) as f64;
+
+        Ok(Self {
+            west_degrees,
+            south_degrees,
+            east_degrees,
+            north_degrees,
+            delta_lon_degrees,
+            delta_lat_degrees,
+            width,
+            height,
+            offsets_meters,
+        })
+    }
+
+    fn sample(
+        &self,
+        lon_radians: f64,
+        lat_radians: f64,
+    ) -> std::result::Result<VerticalGridSample, GridError> {
+        let lon_degrees = self.normalize_lon_degrees(lon_radians.to_degrees());
+        let lat_degrees = lat_radians.to_degrees();
+
+        if !self.contains(lon_degrees, lat_degrees) {
+            return Err(GridError::OutsideCoverage(format!(
+                "longitude {:.8} latitude {:.8}",
+                lon_radians.to_degrees(),
+                lat_degrees
+            )));
+        }
+
+        let lam = (lon_degrees - self.west_degrees) / self.delta_lon_degrees;
+        let phi = (lat_degrees - self.south_degrees) / self.delta_lat_degrees;
+        let mut x = lam.floor() as isize;
+        let mut y = phi.floor() as isize;
+        let mut fx = lam - x as f64;
+        let mut fy = phi - y as f64;
+
+        if x as usize + 1 >= self.width {
+            if x as usize + 1 == self.width && fx < 1e-9 {
+                x -= 1;
+                fx = 1.0;
+            } else {
+                return Err(GridError::OutsideCoverage("GTX longitude edge".into()));
+            }
+        }
+        if y as usize + 1 >= self.height {
+            if y as usize + 1 == self.height && fy < 1e-9 {
+                y -= 1;
+                fy = 1.0;
+            } else {
+                return Err(GridError::OutsideCoverage("GTX latitude edge".into()));
+            }
+        }
+        if x < 0 || y < 0 {
+            return Err(GridError::OutsideCoverage("GTX negative grid index".into()));
+        }
+
+        let x0 = x as usize;
+        let y0 = y as usize;
+        let x1 = x0 + 1;
+        let y1 = y0 + 1;
+        let idx = |xx: usize, yy: usize| yy * self.width + xx;
+        let z00 = self.offsets_meters[idx(x0, y0)];
+        let z10 = self.offsets_meters[idx(x1, y0)];
+        let z01 = self.offsets_meters[idx(x0, y1)];
+        let z11 = self.offsets_meters[idx(x1, y1)];
+
+        if !(z00.is_finite() && z10.is_finite() && z01.is_finite() && z11.is_finite()) {
+            return Err(GridError::OutsideCoverage(
+                "GTX interpolation touches a null cell".into(),
+            ));
+        }
+
+        let m00 = (1.0 - fx) * (1.0 - fy);
+        let m10 = fx * (1.0 - fy);
+        let m01 = (1.0 - fx) * fy;
+        let m11 = fx * fy;
+        Ok(VerticalGridSample {
+            offset_meters: m00 * z00 + m10 * z10 + m01 * z01 + m11 * z11,
+        })
+    }
+
+    fn contains(&self, lon_degrees: f64, lat_degrees: f64) -> bool {
+        let epsilon = (self.delta_lon_degrees + self.delta_lat_degrees) * 1e-10;
+        lon_degrees >= self.west_degrees - epsilon
+            && lon_degrees <= self.east_degrees + epsilon
+            && lat_degrees >= self.south_degrees - epsilon
+            && lat_degrees <= self.north_degrees + epsilon
+    }
+
+    fn normalize_lon_degrees(&self, lon_degrees: f64) -> f64 {
+        if self.contains(lon_degrees, self.south_degrees) {
+            return lon_degrees;
+        }
+
+        let mut lon = lon_degrees;
+        while lon < self.west_degrees {
+            lon += 360.0;
+        }
+        while lon > self.east_degrees {
+            lon -= 360.0;
+        }
+        lon
+    }
+}
+
 #[derive(Clone, Copy)]
 enum Endian {
     Little,
@@ -674,6 +1030,16 @@ fn read_u32(bytes: &[u8], offset: usize, endian: Endian) -> std::result::Result<
     Ok(match endian {
         Endian::Little => u32::from_le_bytes(slice.try_into().expect("slice length checked")),
         Endian::Big => u32::from_be_bytes(slice.try_into().expect("slice length checked")),
+    })
+}
+
+fn read_i32(bytes: &[u8], offset: usize, endian: Endian) -> std::result::Result<i32, GridError> {
+    let slice = bytes
+        .get(offset..offset + 4)
+        .ok_or_else(|| GridError::Parse("truncated integer".into()))?;
+    Ok(match endian {
+        Endian::Little => i32::from_le_bytes(slice.try_into().expect("slice length checked")),
+        Endian::Big => i32::from_be_bytes(slice.try_into().expect("slice length checked")),
     })
 }
 
@@ -742,6 +1108,22 @@ mod tests {
         assert_eq!(second.definition().name, "renamed ntv2 grid");
     }
 
+    #[test]
+    fn grid_handle_reports_sha256_checksum() {
+        let provider = EmbeddedGridProvider;
+        let handle = provider
+            .load(&test_grid_definition())
+            .unwrap()
+            .expect("embedded grid");
+
+        assert!(handle.checksum().starts_with("sha256:"));
+        assert_eq!(handle.checksum().len(), 71);
+        assert_eq!(
+            sha256_hex(b"abc"),
+            "sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
+
     struct TrackingGridProvider {
         override_definition: bool,
         definition_calls: Arc<AtomicUsize>,
@@ -781,6 +1163,73 @@ mod tests {
             area_of_use: None,
             resource_names: SmallVec::from_vec(vec!["ntv2_0.gsb".into()]),
         }
+    }
+
+    #[test]
+    fn filesystem_provider_rejects_unsafe_resource_names() {
+        let root = std::env::temp_dir().join(format!("proj-core-grid-root-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("safe.gtx"), []).unwrap();
+
+        let provider = FilesystemGridProvider::new(vec![root.clone()]);
+        let mut definition = test_grid_definition();
+        definition.format = GridFormat::Gtx;
+        definition.resource_names = SmallVec::from_vec(vec!["../safe.gtx".into()]);
+        assert!(provider.definition(&definition).unwrap().is_none());
+
+        definition.resource_names =
+            SmallVec::from_vec(vec![root.join("safe.gtx").to_string_lossy().into_owned()]);
+        assert!(provider.definition(&definition).unwrap().is_none());
+
+        definition.resource_names = SmallVec::from_vec(vec!["safe.gtx".into()]);
+        assert!(provider.definition(&definition).unwrap().is_some());
+    }
+
+    fn test_gtx_bytes(values: &[f32]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&10.0f64.to_be_bytes());
+        bytes.extend_from_slice(&20.0f64.to_be_bytes());
+        bytes.extend_from_slice(&1.0f64.to_be_bytes());
+        bytes.extend_from_slice(&1.0f64.to_be_bytes());
+        bytes.extend_from_slice(&3i32.to_be_bytes());
+        bytes.extend_from_slice(&3i32.to_be_bytes());
+        for value in values {
+            bytes.extend_from_slice(&value.to_be_bytes());
+        }
+        bytes
+    }
+
+    #[test]
+    fn gtx_grid_samples_bilinear_offsets() {
+        let bytes = test_gtx_bytes(&[0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]);
+        let data = parse_grid_data(GridFormat::Gtx, "test.gtx", &bytes).unwrap();
+        let GridData::Gtx(grid) = data else {
+            panic!("expected GTX grid");
+        };
+
+        let sample = grid
+            .sample(20.5f64.to_radians(), 10.5f64.to_radians())
+            .unwrap();
+        assert!((sample.offset_meters - 2.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn gtx_grid_rejects_outside_or_null_cells() {
+        let bytes = test_gtx_bytes(&[0.0, 1.0, 2.0, 3.0, -88.8888, 5.0, 6.0, 7.0, 8.0]);
+        let data = parse_grid_data(GridFormat::Gtx, "test.gtx", &bytes).unwrap();
+        let GridData::Gtx(grid) = data else {
+            panic!("expected GTX grid");
+        };
+
+        let null_err = grid
+            .sample(20.5f64.to_radians(), 10.5f64.to_radians())
+            .unwrap_err();
+        assert!(matches!(null_err, GridError::OutsideCoverage(_)));
+
+        let outside_err = grid
+            .sample(30.0f64.to_radians(), 10.5f64.to_radians())
+            .unwrap_err();
+        assert!(matches!(outside_err, GridError::OutsideCoverage(_)));
     }
 
     #[test]

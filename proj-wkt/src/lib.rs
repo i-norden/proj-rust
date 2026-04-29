@@ -11,12 +11,17 @@
 //! - **PROJ strings**: `"+proj=utm +zone=18 +datum=WGS84"` — parsed into CrsDef
 //! - **WKT1**: `GEOGCS[...]` / `PROJCS[...]` — extracts AUTHORITY tag when present,
 //!   otherwise parses projection parameters
+//! - **WKT2/PROJJSON compound CRS**: parses explicit vertical CRS components for
+//!   equality-checked z preservation and same-reference vertical unit conversion
 //!
 //! Custom CRS definitions are only accepted when their semantics fit the
-//! `proj_core::CrsDef` model: 2D longitude/latitude geographic coordinates in
-//! degrees with a Greenwich prime meridian, and projected coordinates with
-//! easting/northing axis order. Unsupported axis-order, prime-meridian, and
-//! geographic angular-unit semantics are rejected.
+//! `proj_core::CrsDef` model: longitude/latitude geographic coordinates in
+//! degrees with a Greenwich prime meridian, projected coordinates with
+//! easting/northing axis order, and compound vertical components that can be
+//! preserved or unit-converted only when source and target vertical CRS
+//! definitions use the same vertical reference frame.
+//! Unsupported axis-order, prime-meridian, geographic angular-unit, and vertical
+//! transformation semantics are rejected.
 //!
 //! # Example
 //!
@@ -62,7 +67,7 @@ pub type Result<T> = std::result::Result<T, ParseError>;
 /// - **PROJ strings**: `"+proj=utm +zone=18 +datum=WGS84"`
 /// - **PROJJSON**: `{"type": "ProjectedCRS", ...}`
 /// - **WKT1**: `GEOGCS[...]` / `PROJCS[...]`
-/// - **WKT2**: `GEODCRS[...]` / `PROJCRS[...]`
+/// - **WKT2**: `GEODCRS[...]` / `PROJCRS[...]` / `COMPOUNDCRS[...]`
 pub fn parse_crs(s: &str) -> Result<CrsDef> {
     let s = s.trim();
 
@@ -119,6 +124,11 @@ pub fn parse_crs(s: &str) -> Result<CrsDef> {
         || upper.starts_with("GEODCRS")
         || upper.starts_with("GEOGCRS")
         || upper.starts_with("PROJCRS")
+        || upper.starts_with("COMPD_CS")
+        || upper.starts_with("COMPOUNDCRS")
+        || upper.starts_with("VERT_CS")
+        || upper.starts_with("VERTCRS")
+        || upper.starts_with("VERTICALCRS")
     {
         return wkt::parse_wkt(s);
     }
@@ -158,6 +168,38 @@ pub fn transform_from_crs_strings_with_selection_options(
     )?)
 }
 
+/// Create a horizontal-only [`Transform`] from two CRS strings in any format.
+///
+/// Compound CRS definitions are reduced to their horizontal component before
+/// operation selection. This is intended for AOI, footprint, and preview
+/// workflows where vertical coordinates are not part of the operation.
+pub fn transform_from_crs_strings_horizontal(
+    from: &str,
+    to: &str,
+) -> std::result::Result<proj_core::Transform, ParseError> {
+    transform_from_crs_strings_horizontal_with_selection_options(
+        from,
+        to,
+        SelectionOptions::default(),
+    )
+}
+
+/// Create a horizontal-only [`Transform`] from two CRS strings using explicit
+/// selection options.
+pub fn transform_from_crs_strings_horizontal_with_selection_options(
+    from: &str,
+    to: &str,
+    options: SelectionOptions,
+) -> std::result::Result<proj_core::Transform, ParseError> {
+    let from_crs = parse_crs(from)?;
+    let to_crs = parse_crs(to)?;
+    Ok(
+        proj_core::Transform::from_horizontal_components_with_selection_options(
+            &from_crs, &to_crs, options,
+        )?,
+    )
+}
+
 /// Lightweight compatibility facade for downstream code that currently expects
 /// a `proj::Proj`-like flow:
 /// 1. parse a CRS definition with [`Proj::new`]
@@ -187,6 +229,13 @@ impl Proj {
         })
     }
 
+    /// Build a horizontal-only transform directly from two CRS strings.
+    pub fn new_known_crs_horizontal(from: &str, to: &str, _area: Option<&str>) -> Result<Self> {
+        Ok(Self {
+            inner: ProjInner::Transform(Box::new(transform_from_crs_strings_horizontal(from, to)?)),
+        })
+    }
+
     /// Build a transform from two parsed CRS definitions.
     pub fn create_crs_to_crs_from_pj(
         &self,
@@ -198,6 +247,22 @@ impl Proj {
         let target = target.definition()?;
         Ok(Self {
             inner: ProjInner::Transform(Box::new(Transform::from_crs_defs(source, target)?)),
+        })
+    }
+
+    /// Build a horizontal-only transform from two parsed CRS definitions.
+    pub fn create_horizontal_crs_to_crs_from_pj(
+        &self,
+        target: &Self,
+        _area: Option<&str>,
+        _options: Option<&str>,
+    ) -> Result<Self> {
+        let source = self.definition()?;
+        let target = target.definition()?;
+        Ok(Self {
+            inner: ProjInner::Transform(Box::new(Transform::from_horizontal_components(
+                source, target,
+            )?)),
         })
     }
 
@@ -316,6 +381,14 @@ mod tests {
     }
 
     #[test]
+    fn epsg_authority_code_3d_geographic() {
+        let crs = parse_crs("EPSG:4979").unwrap();
+        assert!(crs.is_compound());
+        assert!(crs.is_geographic());
+        assert!(crs.vertical_crs().is_some());
+    }
+
+    #[test]
     fn unsupported_format_error() {
         assert!(parse_crs("not a crs").is_err());
     }
@@ -337,6 +410,20 @@ mod tests {
         .unwrap();
         let (x, _y) = t.convert((-74.006, 40.7128)).unwrap();
         assert!((x - (-8238310.0)).abs() < 100.0);
+    }
+
+    #[test]
+    fn horizontal_transform_from_compound_strings() {
+        let err = match transform_from_crs_strings("EPSG:4979", "EPSG:3857") {
+            Ok(_) => panic!("expected compound-to-horizontal transform to fail"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("explicit vertical CRS"));
+
+        let t = transform_from_crs_strings_horizontal("EPSG:4979", "EPSG:3857").unwrap();
+        let (x, _y, z) = t.convert_3d((-74.006, 40.7128, 25.0)).unwrap();
+        assert!((x - (-8238310.0)).abs() < 100.0);
+        assert!((z - 25.0).abs() < 1e-12);
     }
 
     #[test]
@@ -362,10 +449,29 @@ mod tests {
     }
 
     #[test]
+    fn proj_facade_from_known_crs_horizontal() {
+        let proj = Proj::new_known_crs_horizontal("EPSG:4979", "EPSG:3857", None).unwrap();
+        let (x, _y, z) = proj.convert_3d((-74.006, 40.7128, 25.0)).unwrap();
+        assert!((x - (-8238310.0)).abs() < 100.0);
+        assert!((z - 25.0).abs() < 1e-12);
+    }
+
+    #[test]
     fn proj_facade_create_from_definitions() {
         let from = Proj::new("+proj=longlat +datum=WGS84").unwrap();
         let to = Proj::new("EPSG:3857").unwrap();
         let proj = from.create_crs_to_crs_from_pj(&to, None, None).unwrap();
+        let (x, _y) = proj.convert((-74.006, 40.7128)).unwrap();
+        assert!((x - (-8238310.0)).abs() < 100.0);
+    }
+
+    #[test]
+    fn proj_facade_create_horizontal_from_compound_definition() {
+        let from = Proj::new("EPSG:4979").unwrap();
+        let to = Proj::new("EPSG:3857").unwrap();
+        let proj = from
+            .create_horizontal_crs_to_crs_from_pj(&to, None, None)
+            .unwrap();
         let (x, _y) = proj.convert((-74.006, 40.7128)).unwrap();
         assert!((x - (-8238310.0)).abs() < 100.0);
     }

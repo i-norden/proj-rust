@@ -2,11 +2,15 @@ use serde_json::Value;
 use std::collections::HashMap;
 
 use crate::semantics::{
-    approx_eq, normalize_key, validate_supported_geographic_semantics,
-    validate_supported_projected_semantics, AxisDirection, CoordinateSystemSpec,
+    approx_eq, normalize_key, validate_supported_geographic_or_ellipsoidal_height_semantics,
+    validate_supported_geographic_semantics, validate_supported_projected_semantics, AxisDirection,
+    CoordinateSystemSpec, GeographicCoordinateSystemKind,
 };
 use crate::{ParseError, Result};
-use proj_core::{CrsDef, Datum, GeographicCrsDef, LinearUnit, ProjectedCrsDef, ProjectionMethod};
+use proj_core::{
+    CompoundCrsDef, CrsDef, Datum, GeographicCrsDef, HorizontalCrsDef, LinearUnit, ProjectedCrsDef,
+    ProjectionMethod, VerticalCrsDef,
+};
 
 pub(crate) fn parse_projjson(s: &str) -> Result<CrsDef> {
     let value: Value =
@@ -33,17 +37,14 @@ pub(crate) fn parse_projjson(s: &str) -> Result<CrsDef> {
         .ok_or_else(|| ParseError::Parse("PROJJSON object is missing a CRS type".into()))?;
 
     let parsed = match crs_type {
-        "GeographicCRS" | "GeodeticCRS" => {
-            validate_supported_geographic_semantics(
-                "PROJJSON geographic CRS",
-                coordinate_system_angle_unit_to_degree(&value)?,
-                prime_meridian_degrees_from_json(&value),
-                &coordinate_system_from_json(&value),
-            )?;
-            let datum = infer_datum_from_json_crs(&value)?;
-            CrsDef::Geographic(GeographicCrsDef::new(0, datum, ""))
-        }
+        "GeographicCRS" | "GeodeticCRS" => parse_geographic_projjson(&value)?,
         "ProjectedCRS" => parse_projected_projjson(&value)?,
+        "CompoundCRS" => parse_compound_projjson(&value)?,
+        "VerticalCRS" => {
+            return Err(ParseError::UnsupportedSemantics(
+                "standalone vertical CRS definitions are not supported by the horizontal transform API; use a compound CRS with an identical vertical component on both sides".into(),
+            ));
+        }
         other => {
             return Err(ParseError::Parse(format!(
                 "unsupported PROJJSON CRS without an EPSG id: {other}"
@@ -56,6 +57,36 @@ pub(crate) fn parse_projjson(s: &str) -> Result<CrsDef> {
     }
 
     Ok(parsed)
+}
+
+fn parse_geographic_projjson(value: &Value) -> Result<CrsDef> {
+    let coordinate_system = coordinate_system_from_json(value);
+    let coordinate_system_kind = validate_supported_geographic_or_ellipsoidal_height_semantics(
+        "PROJJSON geographic CRS",
+        coordinate_system_angle_unit_to_degree(value)?,
+        prime_meridian_degrees_from_json(value),
+        &coordinate_system,
+    )?;
+    let datum = infer_datum_from_json_crs(value)?;
+    let horizontal = GeographicCrsDef::new(0, datum.clone(), "");
+
+    match coordinate_system_kind {
+        GeographicCoordinateSystemKind::TwoDimensional => Ok(CrsDef::Geographic(horizontal)),
+        GeographicCoordinateSystemKind::ThreeDimensionalEllipsoidalHeight => {
+            let vertical = VerticalCrsDef::ellipsoidal_height(
+                0,
+                datum,
+                vertical_axis_linear_unit_from_json(value).unwrap_or_else(LinearUnit::metre),
+                "",
+            );
+            Ok(CrsDef::Compound(Box::new(CompoundCrsDef::new(
+                0,
+                HorizontalCrsDef::Geographic(horizontal),
+                vertical,
+                "",
+            ))))
+        }
+    }
 }
 
 fn parse_projected_projjson(value: &Value) -> Result<CrsDef> {
@@ -315,6 +346,92 @@ fn parse_projected_projjson(value: &Value) -> Result<CrsDef> {
         method,
         linear_unit,
         "",
+    )))
+}
+
+fn parse_compound_projjson(value: &Value) -> Result<CrsDef> {
+    let components = value
+        .get("components")
+        .and_then(Value::as_array)
+        .ok_or_else(|| ParseError::Parse("PROJJSON compound CRS is missing components".into()))?;
+    let mut horizontal = None;
+    let mut vertical = None;
+
+    for component in components {
+        match component.get("type").and_then(Value::as_str) {
+            Some("GeographicCRS" | "GeodeticCRS") if horizontal.is_none() => {
+                horizontal = Some(parse_geographic_projjson(component));
+            }
+            Some("ProjectedCRS") if horizontal.is_none() => {
+                horizontal = Some(parse_projected_projjson(component));
+            }
+            Some("VerticalCRS") if vertical.is_none() => {
+                vertical = Some(parse_vertical_projjson(component));
+            }
+            _ => {}
+        }
+    }
+
+    let horizontal = horizontal.ok_or_else(|| {
+        ParseError::Parse("PROJJSON compound CRS is missing a horizontal CRS".into())
+    })??;
+    if horizontal.vertical_crs().is_some() {
+        return Err(ParseError::UnsupportedSemantics(
+            "PROJJSON compound CRS cannot use a 3D horizontal CRS as its horizontal component"
+                .into(),
+        ));
+    }
+
+    let vertical = vertical.ok_or_else(|| {
+        ParseError::Parse("PROJJSON compound CRS is missing a vertical CRS".into())
+    })??;
+    let compound = CompoundCrsDef::from_crs_def(0, horizontal, vertical, "")?;
+    Ok(CrsDef::Compound(Box::new(compound)))
+}
+
+fn parse_vertical_projjson(value: &Value) -> Result<VerticalCrsDef> {
+    validate_supported_vertical_coordinate_system(
+        "PROJJSON vertical CRS",
+        &coordinate_system_from_json(value),
+    )?;
+    let epsg = top_level_epsg_id(value).unwrap_or(0);
+    let linear_unit = vertical_axis_linear_unit_from_json(value).unwrap_or_else(LinearUnit::metre);
+    if let Some(canonical) = proj_core::lookup_vertical_epsg(epsg) {
+        validate_vertical_unit_matches_authority("PROJJSON vertical CRS", linear_unit, &canonical)?;
+        return Ok(canonical);
+    }
+
+    let datum = value
+        .get("datum")
+        .ok_or_else(|| ParseError::Parse("PROJJSON vertical CRS is missing a datum".into()))?;
+    let vertical_datum_epsg = epsg_id_from_object(datum.get("id")).ok_or_else(|| {
+        ParseError::UnsupportedSemantics(
+            "PROJJSON gravity-related vertical CRS requires a vertical datum EPSG identifier"
+                .into(),
+        )
+    })?;
+    Ok(VerticalCrsDef::gravity_related_height(
+        epsg,
+        vertical_datum_epsg,
+        linear_unit,
+        "",
+    )?)
+}
+
+fn validate_vertical_unit_matches_authority(
+    context: &str,
+    declared_unit: LinearUnit,
+    canonical: &VerticalCrsDef,
+) -> Result<()> {
+    let declared = declared_unit.meters_per_unit();
+    let expected = canonical.linear_unit_to_meter();
+    if (declared - expected).abs() <= 1e-12 * declared.abs().max(expected.abs()).max(1.0) {
+        return Ok(());
+    }
+
+    Err(ParseError::UnsupportedSemantics(format!(
+        "{context} declares a vertical unit that conflicts with EPSG:{}",
+        canonical.epsg()
     )))
 }
 
@@ -750,11 +867,50 @@ fn coordinate_system_from_json(value: &Value) -> CoordinateSystemSpec {
     }
 }
 
+fn validate_supported_vertical_coordinate_system(
+    context: &str,
+    coordinate_system: &CoordinateSystemSpec,
+) -> Result<()> {
+    if let Some(subtype) = &coordinate_system.subtype {
+        if normalize_key(subtype) != "vertical" {
+            return Err(ParseError::UnsupportedSemantics(format!(
+                "{context} uses unsupported coordinate system subtype `{subtype}`"
+            )));
+        }
+    }
+
+    if let Some(dimension) = coordinate_system.dimension {
+        if dimension != 1 {
+            return Err(ParseError::UnsupportedSemantics(format!(
+                "{context} uses {dimension} axes, but only 1D vertical coordinate systems are supported"
+            )));
+        }
+    }
+
+    if !coordinate_system.axes.is_empty() && coordinate_system.axes != [AxisDirection::Up] {
+        return Err(ParseError::UnsupportedSemantics(format!(
+            "{context} uses unsupported vertical axis direction; expected up"
+        )));
+    }
+
+    Ok(())
+}
+
 fn axis_direction_from_json(axis: &Value) -> AxisDirection {
     axis.get("direction")
         .and_then(Value::as_str)
         .map(AxisDirection::from_str)
         .unwrap_or(AxisDirection::Other)
+}
+
+fn vertical_axis_linear_unit_from_json(value: &Value) -> Option<LinearUnit> {
+    value
+        .get("coordinate_system")
+        .and_then(|cs| cs.get("axis"))
+        .and_then(Value::as_array)?
+        .iter()
+        .find(|axis| axis_direction_from_json(axis) == AxisDirection::Up)
+        .and_then(axis_linear_unit)
 }
 
 fn prime_meridian_degrees_from_json(value: &Value) -> Option<f64> {
@@ -899,6 +1055,169 @@ mod tests {
 
         assert!(crs.is_projected());
         assert_eq!(crs.epsg(), 3857);
+    }
+
+    #[test]
+    fn parses_projjson_geographic_3d_as_compound_ellipsoidal_height() {
+        let crs = parse_projjson(
+            r#"{
+                "type": "GeographicCRS",
+                "name": "WGS 84 3D",
+                "datum": {
+                    "type": "GeodeticReferenceFrame",
+                    "name": "World Geodetic System 1984",
+                    "ellipsoid": {
+                        "name": "WGS 84",
+                        "semi_major_axis": 6378137,
+                        "inverse_flattening": 298.257223563
+                    }
+                },
+                "coordinate_system": {
+                    "subtype": "ellipsoidal",
+                    "axis": [
+                        { "name": "Longitude", "abbreviation": "Lon", "direction": "east", "unit": "degree" },
+                        { "name": "Latitude", "abbreviation": "Lat", "direction": "north", "unit": "degree" },
+                        { "name": "Ellipsoidal height", "abbreviation": "h", "direction": "up", "unit": "metre" }
+                    ]
+                }
+            }"#,
+        )
+        .unwrap();
+
+        assert!(crs.is_compound());
+        assert!(crs.is_geographic());
+        assert!(crs.vertical_crs().is_some());
+    }
+
+    #[test]
+    fn parses_projjson_compound_with_vertical_crs() {
+        let crs = parse_projjson(
+            r#"{
+                "type": "CompoundCRS",
+                "name": "WGS 84 + NAVD88 height",
+                "components": [
+                    {
+                        "type": "GeographicCRS",
+                        "name": "WGS 84",
+                        "datum": {
+                            "type": "GeodeticReferenceFrame",
+                            "name": "World Geodetic System 1984",
+                            "ellipsoid": {
+                                "name": "WGS 84",
+                                "semi_major_axis": 6378137,
+                                "inverse_flattening": 298.257223563
+                            }
+                        },
+                        "coordinate_system": {
+                            "subtype": "ellipsoidal",
+                            "axis": [
+                                { "name": "Longitude", "abbreviation": "Lon", "direction": "east", "unit": "degree" },
+                                { "name": "Latitude", "abbreviation": "Lat", "direction": "north", "unit": "degree" }
+                            ]
+                        }
+                    },
+                    {
+                        "type": "VerticalCRS",
+                        "name": "NAVD88 height",
+                        "datum": {
+                            "type": "VerticalReferenceFrame",
+                            "name": "North American Vertical Datum 1988",
+                            "id": { "authority": "EPSG", "code": 5103 }
+                        },
+                        "coordinate_system": {
+                            "subtype": "vertical",
+                            "axis": [
+                                { "name": "Gravity-related height", "abbreviation": "H", "direction": "up", "unit": "metre" }
+                            ]
+                        }
+                    }
+                ]
+            }"#,
+        )
+        .unwrap();
+
+        assert!(crs.is_compound());
+        assert!(crs.is_geographic());
+        assert_eq!(
+            crs.vertical_crs().unwrap().linear_unit_to_meter(),
+            LinearUnit::metre().meters_per_unit()
+        );
+    }
+
+    #[test]
+    fn parses_projjson_vertical_crs_canonicalized_from_crs_epsg() {
+        let crs = parse_projjson(
+            r#"{
+                "type": "CompoundCRS",
+                "name": "WGS 84 + NAVD88 height",
+                "components": [
+                    {
+                        "type": "GeographicCRS",
+                        "name": "WGS 84",
+                        "datum": {
+                            "type": "GeodeticReferenceFrame",
+                            "name": "World Geodetic System 1984",
+                            "ellipsoid": {
+                                "name": "WGS 84",
+                                "semi_major_axis": 6378137,
+                                "inverse_flattening": 298.257223563
+                            }
+                        },
+                        "coordinate_system": {
+                            "subtype": "ellipsoidal",
+                            "axis": [
+                                { "name": "Longitude", "abbreviation": "Lon", "direction": "east", "unit": "degree" },
+                                { "name": "Latitude", "abbreviation": "Lat", "direction": "north", "unit": "degree" }
+                            ]
+                        }
+                    },
+                    {
+                        "type": "VerticalCRS",
+                        "name": "NAVD88 height",
+                        "datum": {
+                            "type": "VerticalReferenceFrame",
+                            "name": "North American Vertical Datum 1988"
+                        },
+                        "coordinate_system": {
+                            "subtype": "vertical",
+                            "axis": [
+                                { "name": "Gravity-related height", "abbreviation": "H", "direction": "up", "unit": "metre" }
+                            ]
+                        },
+                        "id": { "authority": "EPSG", "code": 5703 }
+                    }
+                ]
+            }"#,
+        )
+        .unwrap();
+
+        let vertical = crs.vertical_crs().unwrap();
+        assert_eq!(vertical.epsg(), 5703);
+        assert_eq!(vertical.vertical_datum_epsg(), Some(5103));
+    }
+
+    #[test]
+    fn rejects_standalone_vertical_projjson() {
+        let err = parse_projjson(
+            r#"{
+                "type": "VerticalCRS",
+                "name": "NAVD88 height",
+                "datum": {
+                    "type": "VerticalReferenceFrame",
+                    "name": "North American Vertical Datum 1988",
+                    "id": { "authority": "EPSG", "code": 5103 }
+                },
+                "coordinate_system": {
+                    "subtype": "vertical",
+                    "axis": [
+                        { "name": "Gravity-related height", "abbreviation": "H", "direction": "up", "unit": "metre" }
+                    ]
+                }
+            }"#,
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("standalone vertical CRS"));
     }
 
     #[test]

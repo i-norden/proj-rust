@@ -446,7 +446,7 @@ fn resolve_area_bounds(
         crate::operation::AreaOfInterestCrs::TargetCrs => target,
     };
 
-    if matches!(crs, CrsDef::Geographic(_)) {
+    if crs.is_geographic() {
         validate_geographic_area_bounds(bounds)?;
         return Ok(bounds);
     }
@@ -476,11 +476,14 @@ fn resolve_area_bounds(
 
 fn geographic_from_crs_point(crs: &CrsDef, point: Coord) -> Result<Coord> {
     match crs {
-        CrsDef::Geographic(_) => {
+        _ if crs.is_geographic() => {
             validate_geographic_area_point(point)?;
             Ok(point)
         }
-        CrsDef::Projected(projected) => {
+        _ if crs.is_projected() => {
+            let projected = crs.as_projected().ok_or_else(|| {
+                Error::InvalidDefinition("projected CRS component is missing".into())
+            })?;
             validate_projected(point.x, point.y)?;
             let projection = make_projection(&projected.method(), projected.datum())?;
             let (lon, lat) = projection.inverse(
@@ -491,6 +494,9 @@ fn geographic_from_crs_point(crs: &CrsDef, point: Coord) -> Result<Coord> {
             validate_geographic_area_point(geographic)?;
             Ok(geographic)
         }
+        _ => Err(Error::InvalidDefinition(
+            "area-of-interest CRS must have a horizontal component".into(),
+        )),
     }
 }
 

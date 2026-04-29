@@ -13,7 +13,7 @@ This workspace currently contains:
 
 Current non-goals for the `0.4` release line include:
 
-- vertical, geoid, or time-dependent CRS operations
+- packaged vertical grid assets, broad vertical operation selection, cross-datum vertical, or time-dependent CRS transformation operations
 - arbitrary user-defined PROJ pipeline parsing/execution beyond the supported CRS and operation model
 - full EPSG/PROJ registry coverage outside the implemented projection families and embedded operation set
 - full custom CRS coverage for arbitrary axis-order, prime-meridian, and geographic angular-unit semantics
@@ -40,7 +40,7 @@ let projected: geo_types::Coord<f64> = t.convert(coord).unwrap();
 let coords: Vec<(f64, f64)> = vec![(-74.006, 40.7128); 1000];
 let results = t.convert_batch(&coords).unwrap();
 
-// 3D transforms preserve the third ordinate unchanged
+// 3D transforms preserve or unit-convert the third ordinate when vertical semantics are compatible
 let (x, y, h) = t.convert_3d((-74.006, 40.7128, 15.0)).unwrap();
 assert_eq!(h, 15.0);
 
@@ -51,7 +51,7 @@ assert!(projected_bounds.max_x > projected_bounds.min_x);
 ```
 
 Coordinates use the CRS's native units: degrees for geographic CRS, and the CRS's declared linear unit for projected CRS (for example meters or US survey feet).
-For `convert_3d()`, the `z` component is preserved unchanged because the current CRS model is horizontal-only.
+For `convert_3d()`, the `z` component is preserved unchanged when neither CRS declares an explicit vertical component or both CRS definitions declare the same vertical component in the same unit. When both CRS definitions declare the same vertical reference frame with different linear units, `z` is converted between those units. Grid/geoid-backed ellipsoidal-to-gravity height transforms require an explicit `VerticalGridOperation` and caller-supplied grid resources; otherwise they are rejected.
 
 ## Supported Input Formats
 
@@ -62,8 +62,8 @@ With `proj-wkt`, the following CRS definition formats are supported:
 - EPSG authority codes and bare EPSG numbers
 - OGC `CRS:84` aliases and EPSG URNs
 - common PROJ strings for the implemented projection families, including legacy `+init=epsg:XXXX`
-- WKT1 and the supported WKT2 projected/geographic CRS forms, including top-level EPSG `ID[...]`
-- basic PROJJSON geographic and projected CRS definitions for the implemented methods
+- WKT1 and the supported WKT2 projected/geographic CRS forms, including top-level EPSG `ID[...]` and compound CRS definitions with explicit vertical components
+- basic PROJJSON geographic, projected, and compound CRS definitions for the implemented methods
 
 Custom WKT, PROJJSON, and PROJ string definitions are only accepted when they map cleanly onto this workspace's native CRS model:
 2D longitude/latitude geographic coordinates in degrees with a Greenwich prime meridian, and projected coordinates in native linear units with easting/northing axis order.
@@ -74,6 +74,8 @@ Definitions that require unsupported axis-order, prime-meridian, or geographic a
 | Projection | Status | EPSG |
 |---|---|---|
 | Geographic (WGS84, NAD83, NAD27, ETRS89, etc.) | Implemented | 4326, 4269, 4267, 4258, ... |
+| 3D geographic / compound CRS with compatible vertical component | Modelled for z preservation and same-reference unit conversion | 4979, custom WKT/PROJJSON |
+| Vertical CRS metadata | Implemented for common height CRS lookup and compound parsing | 3855, 5702, 5703, 5773, 6360 |
 | Web Mercator | Implemented | 3857 |
 | Transverse Mercator / UTM | Implemented | 32601-32660, 32701-32760 |
 | Polar Stereographic | Implemented | 3413, 3031, 3995, 32661, 32761 |
@@ -86,13 +88,13 @@ Definitions that require unsupported axis-order, prime-meridian, or geographic a
 | Mercator | Implemented | 3395 |
 | Equidistant Cylindrical | Implemented | 32662 |
 
-Custom CRS definitions can be constructed and passed to `Transform::from_crs_defs()`. Use `Transform::from_crs_defs_with_selection_options()` when custom definitions reference external grid resources through a `GridProvider`. The companion `proj-wkt` crate parses EPSG codes, a subset of WKT/PROJ strings, and basic PROJJSON inputs into `CrsDef` values, including PROJ `+nadgrids` lists for supported NTv2 horizontal grid shifts.
+Custom CRS definitions can be constructed and passed to `Transform::from_crs_defs()`. Use `Transform::from_crs_defs_with_selection_options()` when custom definitions reference external grid resources through a `GridProvider`. Use `Transform::from_horizontal_components()` for XY-only workflows that need to accept compound CRS inputs while deliberately ignoring vertical semantics. The companion `proj-wkt` crate parses EPSG codes, a subset of WKT/PROJ strings, and basic PROJJSON inputs into `CrsDef` values, including PROJ `+nadgrids` lists for supported NTv2 horizontal grid shifts and compound CRS definitions whose compatible vertical component can be preserved or unit-converted.
 
 ## Operation Selection And Grids
 
 `proj-core` includes embedded coordinate-operation metadata, default operation selection, and explicit operation execution. `Transform::new()` and `Transform::from_crs_defs()` choose the best supported operation for the CRS pair, while `Transform::with_selection_options()` lets callers supply an area of interest or require grid-backed or exact-area matches.
 
-Use `Transform::selected_operation()`, `Transform::selection_diagnostics()`, `registry::operation_candidates_between()`, and `lookup_operation()` when you need deterministic operation inspection including operation direction. NTv2 grid-backed transforms are supported through the embedded registry, parsed PROJ `+nadgrids` custom CRS definitions, `EmbeddedGridProvider`, `FilesystemGridProvider`, and custom `GridProvider` implementations.
+Use `Transform::selected_operation()`, `Transform::selection_diagnostics()`, `Transform::vertical_diagnostics()`, `registry::operation_candidates_between()`, and `lookup_operation()` when you need deterministic operation inspection including operation direction. NTv2 horizontal grid-backed transforms are supported through the embedded registry, parsed PROJ `+nadgrids` custom CRS definitions, `EmbeddedGridProvider`, `FilesystemGridProvider`, and custom `GridProvider` implementations. Vertical same-reference unit conversion is supported. NOAA/VDatum binary GTX vertical grids are supported through `FilesystemGridProvider` or a custom `GridProvider` when the caller supplies an explicit `VerticalGridOperation`; vertical grid selection honors the operation area of use, falls back across candidate grids after coverage misses, and reports resolved grid SHA-256 checksums in diagnostics. Packaged geoid grid assets and broad vertical operation selection remain outside the default registry.
 
 ## Compatibility Surface
 

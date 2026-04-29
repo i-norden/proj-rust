@@ -20,7 +20,7 @@ impl Coord {
 /// At the public API boundary:
 /// - **Geographic CRS**: x/y are longitude/latitude in degrees
 /// - **Projected CRS**: x/y are easting/northing in the CRS's native linear unit
-/// - `z` is preserved unchanged by the current horizontal-only transform pipeline
+/// - `z` is preserved only when source and target vertical semantics are unchanged
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Coord3D {
     pub x: f64,
@@ -131,7 +131,7 @@ pub trait Transformable: Sized {
 }
 
 /// Trait for types that can be transformed through a [`Transform`](crate::Transform)
-/// while preserving an ellipsoidal height component.
+/// while preserving a height component when vertical CRS semantics are unchanged.
 ///
 /// The transform returns the same type as the input, so `(f64, f64, f64)` in gives
 /// `(f64, f64, f64)` out and [`Coord3D`] in gives [`Coord3D`] out.

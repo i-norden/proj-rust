@@ -537,6 +537,22 @@ pub(crate) fn lookup_datum(code: u32) -> Option<Datum> {
 }
 
 pub(crate) fn lookup_geographic(code: u32) -> Option<CrsDef> {
+    if code == 4979 {
+        let horizontal = GeographicCrsDef::new(4326, crate::datum::WGS84, "WGS 84");
+        let vertical = VerticalCrsDef::ellipsoidal_height(
+            0,
+            crate::datum::WGS84,
+            LinearUnit::metre(),
+            "WGS 84 ellipsoidal height",
+        );
+        return Some(CrsDef::Compound(Box::new(CompoundCrsDef::new(
+            4979,
+            HorizontalCrsDef::Geographic(horizontal),
+            vertical,
+            "WGS 84",
+        ))));
+    }
+
     let record = db().geographic_crs.get(&code)?;
     let datum = db().datums.get(&record.datum_code)?;
     Some(CrsDef::Geographic(GeographicCrsDef::new(
@@ -559,6 +575,52 @@ pub(crate) fn lookup_projected(code: u32) -> Option<CrsDef> {
             record.name,
         ),
     ))
+}
+
+pub(crate) fn lookup_vertical(code: u32) -> Option<VerticalCrsDef> {
+    match code {
+        3855 => Some(
+            VerticalCrsDef::gravity_related_height(
+                3855,
+                1027,
+                LinearUnit::metre(),
+                "EGM2008 height",
+            )
+            .expect("hard-coded vertical CRS definition is valid"),
+        ),
+        5702 => Some(
+            VerticalCrsDef::gravity_related_height(
+                5702,
+                5102,
+                LinearUnit::us_survey_foot(),
+                "NGVD29 height (ftUS)",
+            )
+            .expect("hard-coded vertical CRS definition is valid"),
+        ),
+        5703 => Some(
+            VerticalCrsDef::gravity_related_height(
+                5703,
+                5103,
+                LinearUnit::metre(),
+                "NAVD88 height",
+            )
+            .expect("hard-coded vertical CRS definition is valid"),
+        ),
+        5773 => Some(
+            VerticalCrsDef::gravity_related_height(5773, 5171, LinearUnit::metre(), "EGM96 height")
+                .expect("hard-coded vertical CRS definition is valid"),
+        ),
+        6360 => Some(
+            VerticalCrsDef::gravity_related_height(
+                6360,
+                5103,
+                LinearUnit::us_survey_foot(),
+                "NAVD88 height (ftUS)",
+            )
+            .expect("hard-coded vertical CRS definition is valid"),
+        ),
+        _ => None,
+    }
 }
 
 pub(crate) fn lookup(code: u32) -> Option<CrsDef> {

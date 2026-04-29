@@ -46,6 +46,12 @@ pub(crate) struct CoordinateSystemSpec {
     pub axes: Vec<AxisDirection>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GeographicCoordinateSystemKind {
+    TwoDimensional,
+    ThreeDimensionalEllipsoidalHeight,
+}
+
 pub(crate) fn validate_supported_geographic_semantics(
     context: &str,
     angle_unit_to_degree: Option<f64>,
@@ -75,6 +81,58 @@ pub(crate) fn validate_supported_geographic_semantics(
         &[AxisDirection::East, AxisDirection::North],
         "longitude/east, latitude/north",
     )
+}
+
+pub(crate) fn validate_supported_geographic_or_ellipsoidal_height_semantics(
+    context: &str,
+    angle_unit_to_degree: Option<f64>,
+    prime_meridian_degrees: Option<f64>,
+    coordinate_system: &CoordinateSystemSpec,
+) -> Result<GeographicCoordinateSystemKind> {
+    if let Some(angle_unit_to_degree) = angle_unit_to_degree {
+        if !approx_eq(angle_unit_to_degree, 1.0) {
+            return Err(ParseError::UnsupportedSemantics(format!(
+                "{context} uses angular units other than degrees"
+            )));
+        }
+    }
+
+    if let Some(prime_meridian_degrees) = prime_meridian_degrees {
+        if !approx_eq(prime_meridian_degrees, 0.0) {
+            return Err(ParseError::UnsupportedSemantics(format!(
+                "{context} uses a non-Greenwich prime meridian"
+            )));
+        }
+    }
+
+    let inferred_dimension = coordinate_system
+        .dimension
+        .or_else(|| (!coordinate_system.axes.is_empty()).then_some(coordinate_system.axes.len()));
+
+    if inferred_dimension == Some(3) {
+        if coordinate_system.axes.is_empty() {
+            return Err(ParseError::UnsupportedSemantics(format!(
+                "{context} declares a 3D coordinate system without explicit axis directions"
+            )));
+        }
+        validate_coordinate_system(
+            context,
+            coordinate_system,
+            Some("ellipsoidal"),
+            &[AxisDirection::East, AxisDirection::North, AxisDirection::Up],
+            "longitude/east, latitude/north, ellipsoidal height/up",
+        )?;
+        return Ok(GeographicCoordinateSystemKind::ThreeDimensionalEllipsoidalHeight);
+    }
+
+    validate_coordinate_system(
+        context,
+        coordinate_system,
+        Some("ellipsoidal"),
+        &[AxisDirection::East, AxisDirection::North],
+        "longitude/east, latitude/north",
+    )?;
+    Ok(GeographicCoordinateSystemKind::TwoDimensional)
 }
 
 pub(crate) fn validate_supported_projected_semantics(
