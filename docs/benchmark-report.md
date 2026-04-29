@@ -1,10 +1,10 @@
 # Benchmark Report
 
-Date: 2026-04-28
+Date: 2026-04-29
 
 This report summarizes the current parity and benchmark suite for `proj-rust`
 against bundled C PROJ. It captures both the current Rust-versus-C performance
-shape and the current transform-construction cost for the `0.4.0` release
+shape and the current transform-construction cost for the `0.5.0` release
 state.
 
 ## System Under Test
@@ -51,8 +51,14 @@ Notes:
 - The 3D parity run passed the live C PROJ 3D cases.
 - The parity corpus currently contains 161 reference values.
 - Criterion is used for all timing.
+- Rust-versus-C rows are evaluated by same-run relative ratio only. Historical
+  Criterion baseline deltas and absolute wall-clock changes are too noisy for
+  release decisions on this host.
+- Absolute estimates are retained only to make the ratio calculation auditable.
 - The batch benchmark reports element throughput for 10,000 coordinate pairs.
-- The current 3D API preserves the third ordinate unchanged because the CRS model remains horizontal-only.
+- The benchmarked 3D cases preserve height. Vertical unit conversion and
+  grid-backed operations are exercised by targeted transform tests rather than
+  this microbenchmark suite.
 
 ## Current Results
 
@@ -64,57 +70,63 @@ Notes:
 - `proj-core` matched live bundled C PROJ for all supported corpus cases
 - `proj-core` matched live bundled C PROJ for all covered 3D cases
 
-### Construction Summary
+### Construction Diagnostics
+
+These rows do not have a same-run C PROJ control, so they are recorded as
+diagnostics rather than release performance gates.
 
 | workload | proj-rust |
 | --- | ---: |
-| `construct 4326 -> 3857` | 842.26 ns |
-| `construct 4267 -> 4326` | 34.21 us |
+| `construct 4326 -> 3857` | 1.08 us |
+| `construct 4267 -> 4326` | 34.12 us |
 
 ### Single-Point Summary
 
-| workload | proj-rust | C PROJ | result |
+| workload | proj-rust | C PROJ | same-run result |
 | --- | ---: | ---: | --- |
-| `4326 -> 3857` | 64.91 ns | 75.89 ns | `proj-rust` 1.17x faster |
-| `4326 -> 32618` | 71.48 ns | 142.25 ns | `proj-rust` 1.99x faster |
-| `4326 -> 3413` | 217.21 ns | 111.59 ns | C PROJ 1.95x faster |
-| `4267 -> 4326` | 277.17 ns | 281.69 ns | `proj-rust` 1.02x faster |
+| `4326 -> 3857` | 27.38 ns | 74.39 ns | `proj-rust` 2.72x faster |
+| `4326 -> 32618` | 51.46 ns | 136.39 ns | `proj-rust` 2.65x faster |
+| `4326 -> 3413` | 58.92 ns | 93.37 ns | `proj-rust` 1.58x faster |
+| `4267 -> 4326` | 160.07 ns | 288.85 ns | `proj-rust` 1.80x faster |
 
 ### Single-Point 3D Summary
 
-| workload | proj-rust | C PROJ | result |
+| workload | proj-rust | C PROJ | same-run result |
 | --- | ---: | ---: | --- |
-| `3D 4326 -> 3857` | 63.07 ns | 80.06 ns | `proj-rust` 1.27x faster |
-| `3D 4267 -> 4326` | 247.88 ns | 295.44 ns | `proj-rust` 1.19x faster |
+| `3D 4326 -> 3857` | 31.82 ns | 76.80 ns | `proj-rust` 2.41x faster |
+| `3D 4267 -> 4326` | 170.86 ns | 278.00 ns | `proj-rust` 1.63x faster |
 
 ### Batch Summary
 
-| workload | proj-rust | C PROJ | result |
+| workload | proj-rust | C PROJ | same-run result |
 | --- | ---: | ---: | --- |
-| `10K 4326 -> 3857` sequential | 711.61 us | 877.78 us | `proj-rust` 1.23x faster |
-| `10K 4326 -> 3857` throughput | 14.1 Melem/s | 11.4 Melem/s | `proj-rust` 1.23x higher throughput |
-| `10K 4326 -> 3857` parallel | 722.06 us | 877.78 us | `proj-rust` 1.22x faster |
-| `10K 4326 -> 3857` parallel throughput | 13.8 Melem/s | 11.4 Melem/s | `proj-rust` 1.22x higher throughput |
+| `10K 4326 -> 3857` sequential | 305.92 us | 787.07 us | `proj-rust` 2.57x faster |
+| `10K 4326 -> 3857` throughput | 32.7 Melem/s | 12.7 Melem/s | `proj-rust` 2.57x higher throughput |
+| `10K 4326 -> 3857` parallel | 307.87 us | 787.07 us | `proj-rust` 2.56x faster |
+| `10K 4326 -> 3857` parallel throughput | 32.5 Melem/s | 12.7 Melem/s | `proj-rust` 2.56x higher throughput |
 
-### Batch 3D Summary
+### Batch 3D Diagnostics
+
+These rows are Rust-only diagnostics for the height-preserving 3D path.
 
 | workload | proj-rust | result |
 | --- | ---: | --- |
-| `10K 3D 4326 -> 3857` sequential | 607.03 us | 16.5 Melem/s |
-| `10K 3D 4326 -> 3857` parallel | 645.65 us | 15.5 Melem/s |
+| `10K 3D 4326 -> 3857` sequential | 354.84 us | 28.2 Melem/s |
+| `10K 3D 4326 -> 3857` parallel | 331.43 us | 30.2 Melem/s |
 
 ## Interpretation
 
-- `proj-rust` remains faster than bundled C PROJ in most measured Rust-versus-C cases in this suite.
-- Construction is now sub-microsecond for simple registry-backed projected transforms and roughly 34 microseconds for the covered datum-shifted pair.
-- UTM single-point transforms show the largest relative win, while the covered Polar Stereographic case is currently faster in C PROJ on this host.
-- On this host and at 10K elements, the adaptive parallel path is essentially flat with the sequential path for the covered workloads, which is the intended crossover behavior.
-- The current 3D path stays close to the 2D fast path because the third ordinate is preserved unchanged.
+- `proj-rust` is faster than bundled C PROJ in every same-run Rust-versus-C case in this suite.
+- The strongest same-run wins are Web Mercator, UTM, and 10K Web Mercator batch throughput.
+- Construction timing is useful for spotting large local changes, but it is not treated as a release gate without a same-run control.
+- On this host and at 10K elements, the adaptive parallel path remains effectively flat with the sequential path for the covered 2D workload, which is the intended crossover behavior.
+- The height-preserving 3D benchmark path stays close to the 2D fast path after avoiding diagnostics work on non-diagnostic conversions.
 - The live parity suite remains the strongest correctness signal because it checks both corpus drift and current Rust-versus-C behavior.
 
 ## Limits
 
-- This report reflects one machine.
+- This report reflects one machine and should be interpreted by same-run relative
+  comparisons, not absolute timing movement.
 - The benchmark suite is representative, not exhaustive across the full CRS registry.
 - The batch comparison uses one 10K Web Mercator workload; different sizes or
   thread topologies may shift the parallel-versus-sequential crossover point.

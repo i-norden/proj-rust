@@ -202,6 +202,32 @@ struct VerticalApplyOutcome {
 }
 
 impl VerticalTransform {
+    fn apply_z(&self, coord: Coord3D) -> Result<f64> {
+        match self {
+            Self::None { .. } | Self::Preserve { .. } => Ok(coord.z),
+            Self::UnitConvert {
+                source_unit,
+                target_unit,
+                ..
+            } => Ok(target_unit.from_meters(source_unit.to_meters(coord.z))),
+            Self::GridShiftList { shifts, .. } => {
+                let mut last_coverage_error = None;
+                for shift in shifts {
+                    match apply_vertical_grid_shift(shift, coord) {
+                        Ok(z) => return Ok(z),
+                        Err(Error::Grid(crate::grid::GridError::OutsideCoverage(detail))) => {
+                            last_coverage_error = Some(detail);
+                        }
+                        Err(error) => return Err(error),
+                    }
+                }
+                Err(Error::Grid(crate::grid::GridError::OutsideCoverage(
+                    last_coverage_error.unwrap_or_else(|| "vertical grid coverage miss".into()),
+                )))
+            }
+        }
+    }
+
     fn apply(&self, coord: Coord3D) -> Result<VerticalApplyOutcome> {
         match self {
             Self::None { diagnostics } | Self::Preserve { diagnostics } => {
@@ -651,12 +677,55 @@ impl Transform {
     }
 
     fn convert_coord(&self, c: Coord) -> Result<Coord> {
-        let result = self.convert_coord3d(Coord3D::new(c.x, c.y, 0.0))?;
-        Ok(Coord::new(result.x, result.y))
+        match self.execute_pipeline_xy(&self.pipeline, Coord3D::new(c.x, c.y, 0.0)) {
+            Ok(coord) => return Ok(coord),
+            Err(error) => {
+                if !is_grid_coverage_miss(&error) {
+                    return Err(error);
+                }
+            }
+        }
+
+        for fallback in &self.fallback_pipelines {
+            match self.execute_pipeline_xy(&fallback.pipeline, Coord3D::new(c.x, c.y, 0.0)) {
+                Ok(coord) => return Ok(coord),
+                Err(error) => {
+                    if !is_grid_coverage_miss(&error) {
+                        return Err(error);
+                    }
+                }
+            }
+        }
+
+        Err(Error::Grid(GridError::OutsideCoverage(
+            "grid coverage miss".into(),
+        )))
     }
 
     fn convert_coord3d(&self, c: Coord3D) -> Result<Coord3D> {
-        Ok(self.convert_coord3d_with_diagnostics(c)?.coord)
+        match self.execute_pipeline_coord3d(&self.pipeline, c) {
+            Ok(coord) => return Ok(coord),
+            Err(error) => {
+                if !is_grid_coverage_miss(&error) {
+                    return Err(error);
+                }
+            }
+        }
+
+        for fallback in &self.fallback_pipelines {
+            match self.execute_pipeline_coord3d(&fallback.pipeline, c) {
+                Ok(coord) => return Ok(coord),
+                Err(error) => {
+                    if !is_grid_coverage_miss(&error) {
+                        return Err(error);
+                    }
+                }
+            }
+        }
+
+        Err(Error::Grid(GridError::OutsideCoverage(
+            "grid coverage miss".into(),
+        )))
     }
 
     fn convert_coord_with_diagnostics(&self, c: Coord) -> Result<TransformOutcome<Coord>> {
@@ -728,12 +797,31 @@ impl Transform {
         pipeline: &CompiledOperationPipeline,
         c: Coord3D,
     ) -> Result<PipelineExecutionOutcome> {
+        let xy = self.execute_pipeline_xy(pipeline, c)?;
+        let vertical = self.vertical_transform.apply(c)?;
+        Ok(PipelineExecutionOutcome {
+            coord: Coord3D::new(xy.x, xy.y, vertical.z),
+            vertical: vertical.diagnostics,
+        })
+    }
+
+    fn execute_pipeline_coord3d(
+        &self,
+        pipeline: &CompiledOperationPipeline,
+        c: Coord3D,
+    ) -> Result<Coord3D> {
+        let xy = self.execute_pipeline_xy(pipeline, c)?;
+        let z = self.vertical_transform.apply_z(c)?;
+        Ok(Coord3D::new(xy.x, xy.y, z))
+    }
+
+    fn execute_pipeline_xy(
+        &self,
+        pipeline: &CompiledOperationPipeline,
+        c: Coord3D,
+    ) -> Result<Coord> {
         if pipeline.steps.is_empty() {
-            let vertical = self.vertical_transform.apply(c)?;
-            return Ok(PipelineExecutionOutcome {
-                coord: Coord3D::new(c.x, c.y, vertical.z),
-                vertical: vertical.diagnostics,
-            });
+            return Ok(Coord::new(c.x, c.y));
         }
         let mut state = if self.source.is_projected() {
             let (x_m, y_m) = self.source_projected_native_to_meters(c.x, c.y);
@@ -752,11 +840,7 @@ impl Transform {
             (state.x.to_degrees(), state.y.to_degrees())
         };
 
-        let vertical = self.vertical_transform.apply(c)?;
-        Ok(PipelineExecutionOutcome {
-            coord: Coord3D::new(x, y, vertical.z),
-            vertical: vertical.diagnostics,
-        })
+        Ok(Coord::new(x, y))
     }
 
     fn source_projected_native_to_meters(&self, x: f64, y: f64) -> (f64, f64) {
@@ -887,6 +971,10 @@ fn selected_metadata(
     let mut metadata = operation.metadata_for_direction(direction);
     metadata.area_of_use = matched_area_of_use.or_else(|| operation.areas_of_use.first().cloned());
     metadata
+}
+
+fn is_grid_coverage_miss(error: &Error) -> bool {
+    matches!(error, Error::Grid(GridError::OutsideCoverage(_)))
 }
 
 fn grid_coverage_miss_detail(error: &Error) -> Option<String> {
@@ -2323,6 +2411,9 @@ mod tests {
         )));
 
         let t = Transform::from_crs_defs(&source, &target).unwrap();
+        let plain = t.convert_3d((-74.006, 40.7128, 1.0)).unwrap();
+        assert!((plain.2 - 3.280839895013123).abs() < 1e-12);
+
         let outcome = t
             .convert_3d_with_diagnostics((-74.006, 40.7128, 1.0))
             .unwrap();
@@ -2366,6 +2457,9 @@ mod tests {
             },
         )
         .unwrap();
+
+        let plain = t.convert_3d((-74.5, 40.5, 100.0)).unwrap();
+        assert!((plain.2 - 130.0).abs() < 1e-9);
 
         let outcome = t.convert_3d_with_diagnostics((-74.5, 40.5, 100.0)).unwrap();
         assert!((outcome.coord.2 - 130.0).abs() < 1e-9);
@@ -2527,6 +2621,43 @@ mod tests {
             },
         )
         .unwrap();
+
+        let err = t.convert_3d((-80.0, 40.5, 100.0)).unwrap_err();
+        assert!(matches!(err, Error::Grid(GridError::OutsideCoverage(_))));
+    }
+
+    #[test]
+    fn two_dimensional_convert_does_not_sample_vertical_grids() {
+        let grid_root = write_test_gtx(&[-30.0, -30.0, -30.0, -30.0]);
+        let source = registry::lookup_epsg(4979).unwrap();
+        let target_horizontal = ProjectedCrsDef::new_with_base_geographic_crs(
+            3857,
+            4326,
+            datum::WGS84,
+            ProjectionMethod::WebMercator,
+            LinearUnit::metre(),
+            "WGS 84 / Pseudo-Mercator",
+        );
+        let target = CrsDef::Compound(Box::new(CompoundCrsDef::new(
+            0,
+            HorizontalCrsDef::Projected(target_horizontal),
+            registry::lookup_vertical_epsg(5703).unwrap(),
+            "WGS 84 / Pseudo-Mercator + NAVD88 height",
+        )));
+        let t = Transform::from_crs_defs_with_selection_options(
+            &source,
+            &target,
+            SelectionOptions {
+                grid_provider: Some(Arc::new(FilesystemGridProvider::new(vec![grid_root]))),
+                vertical_grid_operations: vec![test_vertical_grid_operation()],
+                ..SelectionOptions::default()
+            },
+        )
+        .unwrap();
+
+        let (x, y) = t.convert((-80.0, 40.5)).unwrap();
+        assert!(x < -8_900_000.0 && x > -8_910_000.0, "x = {x}");
+        assert!(y > 4_930_000.0 && y < 4_940_000.0, "y = {y}");
 
         let err = t.convert_3d((-80.0, 40.5, 100.0)).unwrap_err();
         assert!(matches!(err, Error::Grid(GridError::OutsideCoverage(_))));
