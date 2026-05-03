@@ -533,6 +533,9 @@ impl Transform {
 
     /// Transform a single coordinate and report the operation actually used.
     ///
+    /// This 2D API is XY-only: it does not apply or sample configured vertical
+    /// transforms.
+    ///
     /// When the selected grid-backed operation misses grid coverage, this
     /// reports the coverage misses and the lower-ranked fallback operation that
     /// produced the result.
@@ -729,13 +732,64 @@ impl Transform {
     }
 
     fn convert_coord_with_diagnostics(&self, c: Coord) -> Result<TransformOutcome<Coord>> {
-        let outcome = self.convert_coord3d_with_diagnostics(Coord3D::new(c.x, c.y, 0.0))?;
-        Ok(TransformOutcome {
-            coord: Coord::new(outcome.coord.x, outcome.coord.y),
-            operation: outcome.operation,
-            vertical: outcome.vertical,
-            grid_coverage_misses: outcome.grid_coverage_misses,
-        })
+        let mut grid_coverage_misses = Vec::new();
+        let c = Coord3D::new(c.x, c.y, 0.0);
+
+        match self.execute_pipeline_xy(&self.pipeline, c) {
+            Ok(coord) => {
+                return Ok(TransformOutcome {
+                    coord,
+                    operation: self.selected_operation.clone(),
+                    vertical: vertical_diagnostics(VerticalTransformAction::None, None, None, None),
+                    grid_coverage_misses,
+                });
+            }
+            Err(error) => {
+                if let Some(detail) = grid_coverage_miss_detail(&error) {
+                    grid_coverage_misses.push(GridCoverageMiss {
+                        operation: self.selected_operation.clone(),
+                        detail,
+                    });
+                } else {
+                    return Err(error);
+                }
+            }
+        }
+
+        for fallback in &self.fallback_pipelines {
+            match self.execute_pipeline_xy(&fallback.pipeline, c) {
+                Ok(coord) => {
+                    return Ok(TransformOutcome {
+                        coord,
+                        operation: fallback.metadata.clone(),
+                        vertical: vertical_diagnostics(
+                            VerticalTransformAction::None,
+                            None,
+                            None,
+                            None,
+                        ),
+                        grid_coverage_misses,
+                    });
+                }
+                Err(error) => {
+                    if let Some(detail) = grid_coverage_miss_detail(&error) {
+                        grid_coverage_misses.push(GridCoverageMiss {
+                            operation: fallback.metadata.clone(),
+                            detail,
+                        });
+                    } else {
+                        return Err(error);
+                    }
+                }
+            }
+        }
+
+        Err(Error::Grid(GridError::OutsideCoverage(
+            grid_coverage_misses
+                .last()
+                .map(|miss| miss.detail.clone())
+                .unwrap_or_else(|| "grid coverage miss".into()),
+        )))
     }
 
     fn convert_coord3d_with_diagnostics(&self, c: Coord3D) -> Result<TransformOutcome<Coord3D>> {
@@ -2658,6 +2712,12 @@ mod tests {
         let (x, y) = t.convert((-80.0, 40.5)).unwrap();
         assert!(x < -8_900_000.0 && x > -8_910_000.0, "x = {x}");
         assert!(y > 4_930_000.0 && y < 4_940_000.0, "y = {y}");
+
+        let outcome = t.convert_with_diagnostics((-80.0, 40.5)).unwrap();
+        assert!((outcome.coord.0 - x).abs() < 1e-9);
+        assert!((outcome.coord.1 - y).abs() < 1e-9);
+        assert_eq!(outcome.vertical.action, VerticalTransformAction::None);
+        assert!(outcome.grid_coverage_misses.is_empty());
 
         let err = t.convert_3d((-80.0, 40.5, 100.0)).unwrap_err();
         assert!(matches!(err, Error::Grid(GridError::OutsideCoverage(_))));
