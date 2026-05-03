@@ -140,6 +140,7 @@ pub fn lookup_authority_code(code: &str) -> Result<CrsDef> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
 
     #[test]
     fn lookup_wgs84() {
@@ -207,7 +208,7 @@ mod tests {
             .as_str()
             .unwrap()
             .starts_with("sha256:"));
-        assert_eq!(value["output"]["byte_len"], 883655);
+        assert_eq!(value["output"]["byte_len"], 883878);
         assert!(value["output"]["sha256"]
             .as_str()
             .unwrap()
@@ -294,9 +295,89 @@ mod tests {
 
     #[test]
     fn lookup_new_projection_families() {
-        for epsg in [3035, 3408, 9311, 28992, 3078, 2056, 30200] {
+        for epsg in [3035, 3408, 9311, 28992, 3078, 2056, 30200, 32662] {
             let crs = lookup_epsg(epsg).unwrap_or_else(|| panic!("should find EPSG:{epsg}"));
             assert!(crs.is_projected(), "EPSG:{epsg} should be projected");
+        }
+    }
+
+    #[test]
+    fn readme_advertised_epsg_codes_resolve() {
+        let readme_path = concat!(env!("CARGO_MANIFEST_DIR"), "/../README.md");
+        let readme = std::fs::read_to_string(readme_path)
+            .unwrap_or_else(|err| panic!("failed to read {readme_path}: {err}"));
+        let epsg_codes = readme_advertised_epsg_codes(&readme);
+
+        assert!(
+            !epsg_codes.is_empty(),
+            "README advertised EPSG code parser found no codes"
+        );
+
+        let missing = epsg_codes
+            .iter()
+            .copied()
+            .filter(|code| lookup_epsg(*code).is_none() && lookup_vertical_epsg(*code).is_none())
+            .map(|code| format!("EPSG:{code}"))
+            .collect::<Vec<_>>();
+
+        assert!(
+            missing.is_empty(),
+            "README advertises unsupported EPSG codes: {}",
+            missing.join(", ")
+        );
+    }
+
+    fn readme_advertised_epsg_codes(readme: &str) -> BTreeSet<u32> {
+        let mut in_supported_crs = false;
+        let mut codes = BTreeSet::new();
+
+        for line in readme.lines() {
+            let trimmed = line.trim();
+            if trimmed == "## Supported CRS" {
+                in_supported_crs = true;
+                continue;
+            }
+            if in_supported_crs && trimmed.starts_with("## ") {
+                break;
+            }
+            if !in_supported_crs || !trimmed.starts_with('|') {
+                continue;
+            }
+
+            let cells = trimmed.split('|').map(str::trim).collect::<Vec<_>>();
+            if cells.len() < 4 || cells[1] == "Projection" || cells[1] == "---" {
+                continue;
+            }
+
+            for token in cells[3].split(',') {
+                add_readme_epsg_token(token, &mut codes);
+            }
+        }
+
+        codes
+    }
+
+    fn add_readme_epsg_token(token: &str, codes: &mut BTreeSet<u32>) {
+        let token = token.trim();
+        if token.is_empty() || token.contains("...") {
+            return;
+        }
+
+        if let Some((start, end)) = token.split_once('-') {
+            let start = start.trim();
+            let end = end.trim();
+            if start.chars().all(|value| value.is_ascii_digit())
+                && end.chars().all(|value| value.is_ascii_digit())
+            {
+                let start = start.parse::<u32>().expect("validated numeric range start");
+                let end = end.parse::<u32>().expect("validated numeric range end");
+                codes.extend(start..=end);
+            }
+            return;
+        }
+
+        if token.chars().all(|value| value.is_ascii_digit()) {
+            codes.insert(token.parse().expect("validated numeric EPSG token"));
         }
     }
 
