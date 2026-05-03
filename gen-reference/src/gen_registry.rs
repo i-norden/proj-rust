@@ -173,6 +173,10 @@ const GRID_FORMAT_UNSUPPORTED: u8 = 255;
 
 const GRID_INTERPOLATION_BILINEAR: u8 = 1;
 
+// EPSG:32662 is deprecated upstream but remains part of this crate's documented
+// public support set.
+const EXPLICITLY_SUPPORTED_DEPRECATED_PROJECTED_CRS: &[u32] = &[32662];
+
 #[derive(Serialize)]
 struct RegistryProvenance {
     schema_version: u16,
@@ -325,7 +329,7 @@ fn method_code_to_id(code: i64) -> Option<u8> {
         9801 | 9802 => Some(METHOD_LCC),
         9822 => Some(METHOD_ALBERS),
         9810 | 9829 => Some(METHOD_POLAR_STEREO),
-        9842 | 9843 => Some(METHOD_EQUIDISTANT_CYL),
+        1028 | 1029 | 9823 | 9842 => Some(METHOD_EQUIDISTANT_CYL),
         9820 => Some(METHOD_LAEA),
         1027 => Some(METHOD_LAEA_SPHERICAL),
         9809 => Some(METHOD_OBLIQUE_STEREO),
@@ -457,11 +461,11 @@ fn encode_params(method_id: u8, cp: &ConvParams, linear_uoms: &BTreeMap<i64, f64
             0.0,
         ],
         METHOD_EQUIDISTANT_CYL => [
-            get_degrees(cp, &[LON_ORIGIN]),
-            get_degrees(cp, &[LAT_1ST_PARALLEL]),
+            get_degrees(cp, &[LON_ORIGIN, LON_FALSE_ORIGIN, LON_OF_ORIGIN]),
+            get_degrees(cp, &[LAT_1ST_PARALLEL, LAT_STD_PARALLEL, LAT_ORIGIN]),
             0.0,
-            get_meters(cp, &[FALSE_EASTING], linear_uoms),
-            get_meters(cp, &[FALSE_NORTHING], linear_uoms),
+            get_meters(cp, &[FALSE_EASTING, EASTING_FALSE_ORIGIN], linear_uoms),
+            get_meters(cp, &[FALSE_NORTHING, NORTHING_FALSE_ORIGIN], linear_uoms),
             0.0,
             0.0,
         ],
@@ -692,6 +696,14 @@ fn supported_operation_payloads() -> BTreeMap<String, u8> {
         ("GridShift", OP_GRID_SHIFT),
         ("Helmert", OP_HELMERT),
     ])
+}
+
+fn explicitly_supported_deprecated_projected_crs_sql_list() -> String {
+    EXPLICITLY_SUPPORTED_DEPRECATED_PROJECTED_CRS
+        .iter()
+        .map(u32::to_string)
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn main() {
@@ -959,9 +971,8 @@ fn main() {
 
     let mut proj_crs: Vec<ProjCrs> = Vec::new();
     {
-        let mut stmt = conn
-            .prepare(
-                "SELECT pc.code,
+        let sql = format!(
+            "SELECT pc.code,
                         pc.geodetic_crs_code,
                         gc.datum_code,
                         pc.name,
@@ -980,10 +991,12 @@ fn main() {
                  LEFT JOIN unit_of_measure u
                    ON u.auth_name = a.uom_auth_name
                   AND u.code = a.uom_code
-                 WHERE pc.auth_name='EPSG' AND pc.deprecated=0
+                 WHERE pc.auth_name='EPSG'
+                   AND (pc.deprecated=0 OR pc.code IN ({}))
                  ORDER BY CAST(pc.code AS INTEGER)",
-            )
-            .unwrap();
+            explicitly_supported_deprecated_projected_crs_sql_list()
+        );
+        let mut stmt = conn.prepare(&sql).unwrap();
         let rows: Vec<ProjectedCrsRow> = stmt
             .query_map([], |row| {
                 Ok((

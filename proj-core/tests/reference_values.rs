@@ -15,7 +15,6 @@
 
 use proj_core::Transform;
 use serde::Deserialize;
-use std::collections::BTreeSet;
 
 #[derive(Deserialize)]
 struct ReferencePoint {
@@ -28,13 +27,6 @@ struct ReferencePoint {
     tolerance: f64,
     description: String,
 }
-
-const EXPECTED_UNSUPPORTED_TRANSFORMS: &[(u32, u32)] = &[
-    // Plate Carree is present in the C PROJ-generated corpus but not embedded
-    // in proj-core's compact EPSG registry yet.
-    (4326, 32662),
-    (32662, 4326),
-];
 
 fn load_corpus() -> Vec<ReferencePoint> {
     let path = concat!(
@@ -52,20 +44,12 @@ fn corpus_matches_c_proj() {
     assert!(!corpus.is_empty(), "corpus is empty");
 
     let mut pass = 0;
-    let mut skip = 0;
     let mut failures = Vec::new();
-    let mut observed_expected_skips = BTreeSet::new();
 
     for r in &corpus {
-        let pair = (r.from_epsg, r.to_epsg);
         let t = match Transform::from_epsg(r.from_epsg, r.to_epsg) {
             Ok(t) => t,
             Err(e) => {
-                if EXPECTED_UNSUPPORTED_TRANSFORMS.contains(&pair) {
-                    skip += 1;
-                    observed_expected_skips.insert(pair);
-                    continue;
-                }
                 failures.push(format!(
                     "{}: unexpected transform construction failure for EPSG:{}→EPSG:{}: {e}",
                     r.description, r.from_epsg, r.to_epsg
@@ -96,23 +80,9 @@ fn corpus_matches_c_proj() {
         }
     }
 
-    let stale_expected_skips = EXPECTED_UNSUPPORTED_TRANSFORMS
-        .iter()
-        .copied()
-        .filter(|pair| !observed_expected_skips.contains(pair))
-        .map(|(from, to)| format!("EPSG:{from}→EPSG:{to}"))
-        .collect::<Vec<_>>();
-    if !stale_expected_skips.is_empty() {
-        failures.push(format!(
-            "reference skip allowlist contains transforms that no longer fail construction: {}",
-            stale_expected_skips.join(", ")
-        ));
-    }
-
     eprintln!(
-        "Corpus results: {} passed, {} skipped, {} failed out of {} total",
+        "Corpus results: {} passed, {} failed out of {} total",
         pass,
-        skip,
         failures.len(),
         corpus.len()
     );
