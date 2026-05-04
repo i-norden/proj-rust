@@ -23,10 +23,6 @@ use std::sync::Arc;
 const PARALLEL_MIN_TOTAL_ITEMS: usize = 16_384;
 #[cfg(feature = "rayon")]
 const PARALLEL_MIN_ITEMS_PER_THREAD: usize = 4_096;
-#[cfg(feature = "rayon")]
-const PARALLEL_CHUNKS_PER_THREAD: usize = 4;
-#[cfg(feature = "rayon")]
-const PARALLEL_MIN_CHUNK_SIZE: usize = 1_024;
 
 /// A reusable coordinate transformation between two CRS.
 pub struct Transform {
@@ -44,11 +40,69 @@ pub struct Transform {
 
 struct CompiledOperationPipeline {
     steps: SmallVec<[CompiledStep; 8]>,
+    source_xy_units: PipelineSourceXyUnits,
+    target_xy_units: PipelineTargetXyUnits,
 }
 
 struct CompiledOperationFallback {
     metadata: CoordinateOperationMetadata,
     pipeline: CompiledOperationPipeline,
+}
+
+#[derive(Clone, Copy)]
+enum PipelineSourceXyUnits {
+    GeographicDegrees,
+    ProjectedMeters,
+    ProjectedNativeToMeters(LinearUnit),
+}
+
+#[derive(Clone, Copy)]
+enum PipelineTargetXyUnits {
+    GeographicDegrees,
+    ProjectedMeters,
+    ProjectedMetersToNative(LinearUnit),
+}
+
+impl PipelineSourceXyUnits {
+    fn compile(source: &CrsDef) -> Self {
+        match source.as_projected() {
+            Some(projected) if projected.linear_unit_to_meter() == 1.0 => Self::ProjectedMeters,
+            Some(projected) => Self::ProjectedNativeToMeters(projected.linear_unit()),
+            None => Self::GeographicDegrees,
+        }
+    }
+
+    fn normalize(self, coord: Coord3D) -> Coord3D {
+        match self {
+            Self::GeographicDegrees => {
+                Coord3D::new(coord.x.to_radians(), coord.y.to_radians(), 0.0)
+            }
+            Self::ProjectedMeters => Coord3D::new(coord.x, coord.y, 0.0),
+            Self::ProjectedNativeToMeters(unit) => {
+                Coord3D::new(unit.to_meters(coord.x), unit.to_meters(coord.y), 0.0)
+            }
+        }
+    }
+}
+
+impl PipelineTargetXyUnits {
+    fn compile(target: &CrsDef) -> Self {
+        match target.as_projected() {
+            Some(projected) if projected.linear_unit_to_meter() == 1.0 => Self::ProjectedMeters,
+            Some(projected) => Self::ProjectedMetersToNative(projected.linear_unit()),
+            None => Self::GeographicDegrees,
+        }
+    }
+
+    fn denormalize(self, coord: Coord3D) -> Coord {
+        match self {
+            Self::GeographicDegrees => Coord::new(coord.x.to_degrees(), coord.y.to_degrees()),
+            Self::ProjectedMeters => Coord::new(coord.x, coord.y),
+            Self::ProjectedMetersToNative(unit) => {
+                Coord::new(unit.from_meters(coord.x), unit.from_meters(coord.y))
+            }
+        }
+    }
 }
 
 struct PipelineExecutionOutcome {
@@ -680,7 +734,7 @@ impl Transform {
     }
 
     fn convert_coord(&self, c: Coord) -> Result<Coord> {
-        match self.execute_pipeline_xy(&self.pipeline, Coord3D::new(c.x, c.y, 0.0)) {
+        match execute_pipeline_xy(&self.pipeline, Coord3D::new(c.x, c.y, 0.0)) {
             Ok(coord) => return Ok(coord),
             Err(error) => {
                 if !is_grid_coverage_miss(&error) {
@@ -690,7 +744,7 @@ impl Transform {
         }
 
         for fallback in &self.fallback_pipelines {
-            match self.execute_pipeline_xy(&fallback.pipeline, Coord3D::new(c.x, c.y, 0.0)) {
+            match execute_pipeline_xy(&fallback.pipeline, Coord3D::new(c.x, c.y, 0.0)) {
                 Ok(coord) => return Ok(coord),
                 Err(error) => {
                     if !is_grid_coverage_miss(&error) {
@@ -735,7 +789,7 @@ impl Transform {
         let mut grid_coverage_misses = Vec::new();
         let c = Coord3D::new(c.x, c.y, 0.0);
 
-        match self.execute_pipeline_xy(&self.pipeline, c) {
+        match execute_pipeline_xy(&self.pipeline, c) {
             Ok(coord) => {
                 return Ok(TransformOutcome {
                     coord,
@@ -757,7 +811,7 @@ impl Transform {
         }
 
         for fallback in &self.fallback_pipelines {
-            match self.execute_pipeline_xy(&fallback.pipeline, c) {
+            match execute_pipeline_xy(&fallback.pipeline, c) {
                 Ok(coord) => {
                     return Ok(TransformOutcome {
                         coord,
@@ -851,7 +905,7 @@ impl Transform {
         pipeline: &CompiledOperationPipeline,
         c: Coord3D,
     ) -> Result<PipelineExecutionOutcome> {
-        let xy = self.execute_pipeline_xy(pipeline, c)?;
+        let xy = execute_pipeline_xy(pipeline, c)?;
         let vertical = self.vertical_transform.apply(c)?;
         Ok(PipelineExecutionOutcome {
             coord: Coord3D::new(xy.x, xy.y, vertical.z),
@@ -864,57 +918,9 @@ impl Transform {
         pipeline: &CompiledOperationPipeline,
         c: Coord3D,
     ) -> Result<Coord3D> {
-        let xy = self.execute_pipeline_xy(pipeline, c)?;
+        let xy = execute_pipeline_xy(pipeline, c)?;
         let z = self.vertical_transform.apply_z(c)?;
         Ok(Coord3D::new(xy.x, xy.y, z))
-    }
-
-    fn execute_pipeline_xy(
-        &self,
-        pipeline: &CompiledOperationPipeline,
-        c: Coord3D,
-    ) -> Result<Coord> {
-        if pipeline.steps.is_empty() {
-            return Ok(Coord::new(c.x, c.y));
-        }
-        let mut state = if self.source.is_projected() {
-            let (x_m, y_m) = self.source_projected_native_to_meters(c.x, c.y);
-            Coord3D::new(x_m, y_m, 0.0)
-        } else {
-            Coord3D::new(c.x.to_radians(), c.y.to_radians(), 0.0)
-        };
-
-        for step in &pipeline.steps {
-            state = execute_step(step, state)?;
-        }
-
-        let (x, y) = if self.target.is_projected() {
-            self.projected_meters_to_target_native(state.x, state.y)
-        } else {
-            (state.x.to_degrees(), state.y.to_degrees())
-        };
-
-        Ok(Coord::new(x, y))
-    }
-
-    fn source_projected_native_to_meters(&self, x: f64, y: f64) -> (f64, f64) {
-        match self.source.as_projected() {
-            Some(projected) => (
-                projected.linear_unit().to_meters(x),
-                projected.linear_unit().to_meters(y),
-            ),
-            None => (x, y),
-        }
-    }
-
-    fn projected_meters_to_target_native(&self, x: f64, y: f64) -> (f64, f64) {
-        match self.target.as_projected() {
-            Some(projected) => (
-                projected.linear_unit().from_meters(x),
-                projected.linear_unit().from_meters(y),
-            ),
-            None => (x, y),
-        }
     }
 
     /// Batch transform (sequential).
@@ -979,7 +985,16 @@ impl Transform {
         &self,
         coords: &[T],
     ) -> Result<Vec<T>> {
-        self.convert_batch_parallel_adaptive(coords, |this, chunk| this.convert_batch(chunk))
+        if !should_parallelize(coords.len()) {
+            return self.convert_batch(coords);
+        }
+
+        use rayon::prelude::*;
+
+        coords
+            .par_iter()
+            .map(|coord| self.convert(coord.clone()))
+            .collect()
     }
 
     /// Batch transform of 3D coordinates with adaptive Rayon parallelism.
@@ -988,32 +1003,16 @@ impl Transform {
         &self,
         coords: &[T],
     ) -> Result<Vec<T>> {
-        self.convert_batch_parallel_adaptive(coords, |this, chunk| this.convert_batch_3d(chunk))
-    }
-
-    #[cfg(feature = "rayon")]
-    fn convert_batch_parallel_adaptive<T, F>(&self, coords: &[T], convert: F) -> Result<Vec<T>>
-    where
-        T: Send + Sync + Clone,
-        F: Fn(&Self, &[T]) -> Result<Vec<T>> + Sync,
-    {
         if !should_parallelize(coords.len()) {
-            return convert(self, coords);
+            return self.convert_batch_3d(coords);
         }
 
         use rayon::prelude::*;
 
-        let chunk_size = parallel_chunk_size(coords.len());
-        let chunk_results: Vec<Result<Vec<T>>> = coords
-            .par_chunks(chunk_size)
-            .map(|chunk| convert(self, chunk))
-            .collect();
-
-        let mut results = Vec::with_capacity(coords.len());
-        for chunk in chunk_results {
-            results.extend(chunk?);
-        }
-        Ok(results)
+        coords
+            .par_iter()
+            .map(|coord| self.convert_3d(coord.clone()))
+            .collect()
     }
 }
 
@@ -1530,6 +1529,19 @@ fn execute_step(step: &CompiledStep, coord: Coord3D) -> Result<Coord3D> {
     }
 }
 
+fn execute_pipeline_xy(pipeline: &CompiledOperationPipeline, c: Coord3D) -> Result<Coord> {
+    if pipeline.steps.is_empty() {
+        return Ok(Coord::new(c.x, c.y));
+    }
+    let mut state = pipeline.source_xy_units.normalize(c);
+
+    for step in &pipeline.steps {
+        state = execute_step(step, state)?;
+    }
+
+    Ok(pipeline.target_xy_units.denormalize(state))
+}
+
 fn compile_pipeline(
     source: &CrsDef,
     target: &CrsDef,
@@ -1563,7 +1575,11 @@ fn compile_pipeline(
         });
     }
 
-    Ok(CompiledOperationPipeline { steps })
+    Ok(CompiledOperationPipeline {
+        steps,
+        source_xy_units: PipelineSourceXyUnits::compile(source),
+        target_xy_units: PipelineTargetXyUnits::compile(target),
+    })
 }
 
 fn compile_operation(
@@ -1848,14 +1864,6 @@ fn should_parallelize(len: usize) -> bool {
     len >= PARALLEL_MIN_TOTAL_ITEMS.max(threads.saturating_mul(PARALLEL_MIN_ITEMS_PER_THREAD))
 }
 
-#[cfg(feature = "rayon")]
-fn parallel_chunk_size(len: usize) -> usize {
-    let threads = rayon::current_num_threads().max(1);
-    let target_chunks = threads.saturating_mul(PARALLEL_CHUNKS_PER_THREAD).max(1);
-    let chunk_size = len.div_ceil(target_chunks);
-    chunk_size.max(PARALLEL_MIN_CHUNK_SIZE)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2015,6 +2023,30 @@ mod tests {
 
         assert!((roundtrip.0 - coord.0).abs() < 1e-8);
         assert!((roundtrip.1 - coord.1).abs() < 1e-8);
+    }
+
+    #[test]
+    fn pipeline_compiles_xy_unit_modes() {
+        let web_mercator = Transform::new("EPSG:4326", "EPSG:3857").unwrap();
+        assert!(matches!(
+            web_mercator.pipeline.source_xy_units,
+            PipelineSourceXyUnits::GeographicDegrees
+        ));
+        assert!(matches!(
+            web_mercator.pipeline.target_xy_units,
+            PipelineTargetXyUnits::ProjectedMeters
+        ));
+
+        let foot_crs = Transform::new("EPSG:2264", "EPSG:4326").unwrap();
+        assert!(matches!(
+            foot_crs.pipeline.source_xy_units,
+            PipelineSourceXyUnits::ProjectedNativeToMeters(unit)
+                if (unit.meters_per_unit() - US_FOOT_TO_METER).abs() < 1e-15
+        ));
+        assert!(matches!(
+            foot_crs.pipeline.target_xy_units,
+            PipelineTargetXyUnits::GeographicDegrees
+        ));
     }
 
     #[test]
