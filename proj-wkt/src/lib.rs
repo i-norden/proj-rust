@@ -155,7 +155,7 @@ pub fn transform_from_crs_strings(
 ///
 /// This is the path for parsed PROJ strings that reference external resources
 /// such as `+nadgrids`, because callers can provide a [`proj_core::GridProvider`]
-/// through [`SelectionOptions::grid_provider`].
+/// through [`SelectionOptions::with_grid_provider`].
 pub fn transform_from_crs_strings_with_selection_options(
     from: &str,
     to: &str,
