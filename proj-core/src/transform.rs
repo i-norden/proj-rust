@@ -371,10 +371,7 @@ impl Transform {
         Self::with_selection_options(
             from_crs,
             to_crs,
-            SelectionOptions {
-                policy: SelectionPolicy::Operation(operation_id),
-                ..SelectionOptions::default()
-            },
+            SelectionOptions::new().with_operation(operation_id),
         )
     }
 

@@ -373,6 +373,69 @@ impl Default for SelectionOptions {
 }
 
 impl SelectionOptions {
+    /// Create default selection options.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Set the area of interest used for operation ranking and filtering.
+    pub fn with_area_of_interest(mut self, area_of_interest: AreaOfInterest) -> Self {
+        self.area_of_interest = Some(area_of_interest);
+        self
+    }
+
+    /// Set the operation selection policy.
+    pub fn with_policy(mut self, policy: SelectionPolicy) -> Self {
+        self.policy = policy;
+        self
+    }
+
+    /// Select the best available operation.
+    pub fn best_available(self) -> Self {
+        self.with_policy(SelectionPolicy::BestAvailable)
+    }
+
+    /// Require a grid-backed datum operation when a datum operation is needed.
+    pub fn require_grids(self) -> Self {
+        self.with_policy(SelectionPolicy::RequireGrids)
+    }
+
+    /// Require selected operations to match the configured area of interest.
+    pub fn require_exact_area_match(self) -> Self {
+        self.with_policy(SelectionPolicy::RequireExactAreaMatch)
+    }
+
+    /// Allow approximate Helmert fallback operations when no better operation is available.
+    pub fn allow_approximate_helmert_fallback(self) -> Self {
+        self.with_policy(SelectionPolicy::AllowApproximateHelmertFallback)
+    }
+
+    /// Select a specific registry operation by id.
+    pub fn with_operation(self, operation_id: CoordinateOperationId) -> Self {
+        self.with_policy(SelectionPolicy::Operation(operation_id))
+    }
+
+    /// Set the grid provider used to resolve grid-backed horizontal and vertical operations.
+    pub fn with_grid_provider(mut self, provider: Arc<dyn crate::grid::GridProvider>) -> Self {
+        self.grid_provider = Some(provider);
+        self
+    }
+
+    /// Add one explicit vertical grid operation candidate.
+    pub fn with_vertical_grid_operation(mut self, operation: VerticalGridOperation) -> Self {
+        self.vertical_grid_operations.push(operation);
+        self
+    }
+
+    /// Add explicit vertical grid operation candidates.
+    pub fn with_vertical_grid_operations(
+        mut self,
+        operations: impl IntoIterator<Item = VerticalGridOperation>,
+    ) -> Self {
+        self.vertical_grid_operations.extend(operations);
+        self
+    }
+
     pub fn inverse(&self) -> Self {
         Self {
             area_of_interest: self.area_of_interest.map(AreaOfInterest::inverse),
@@ -476,4 +539,114 @@ pub struct TransformOutcome<T> {
     pub operation: CoordinateOperationMetadata,
     pub vertical: VerticalTransformDiagnostics,
     pub grid_coverage_misses: Vec<GridCoverageMiss>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::grid::{EmbeddedGridProvider, GridDefinition, GridFormat};
+
+    fn vertical_grid_operation(
+        name: &str,
+        source_vertical_crs_epsg: Option<u32>,
+        target_vertical_crs_epsg: Option<u32>,
+    ) -> VerticalGridOperation {
+        VerticalGridOperation {
+            name: name.into(),
+            grid: GridDefinition {
+                id: GridId(1),
+                name: format!("{name}.gtx"),
+                format: GridFormat::Gtx,
+                interpolation: GridInterpolation::Bilinear,
+                area_of_use: None,
+                resource_names: smallvec::SmallVec::from_vec(vec![format!("{name}.gtx")]),
+            },
+            grid_horizontal_crs_epsg: Some(4326),
+            source_vertical_crs_epsg,
+            target_vertical_crs_epsg,
+            source_vertical_datum_epsg: Some(1),
+            target_vertical_datum_epsg: Some(2),
+            accuracy: Some(OperationAccuracy { meters: 0.1 }),
+            area_of_use: None,
+            offset_convention: VerticalGridOffsetConvention::GeoidHeightMeters,
+        }
+    }
+
+    #[test]
+    fn selection_options_builders_chain_advanced_options() {
+        let area = AreaOfInterest::geographic_point(Coord::new(-74.0, 40.0));
+        let provider: Arc<dyn crate::grid::GridProvider> = Arc::new(EmbeddedGridProvider);
+        let first = vertical_grid_operation("first", Some(4979), Some(5703));
+        let second = vertical_grid_operation("second", Some(4979), Some(5703));
+
+        let options = SelectionOptions::new()
+            .with_area_of_interest(area)
+            .require_grids()
+            .with_grid_provider(provider.clone())
+            .with_vertical_grid_operation(first.clone())
+            .with_vertical_grid_operations([second.clone()]);
+
+        assert_eq!(options.area_of_interest, Some(area));
+        assert!(matches!(options.policy, SelectionPolicy::RequireGrids));
+        assert!(Arc::ptr_eq(
+            options.grid_provider.as_ref().unwrap(),
+            &provider
+        ));
+        assert_eq!(options.vertical_grid_operations, vec![first, second]);
+    }
+
+    #[test]
+    fn selection_options_policy_builders_cover_all_modes() {
+        assert!(matches!(
+            SelectionOptions::new().best_available().policy,
+            SelectionPolicy::BestAvailable
+        ));
+        assert!(matches!(
+            SelectionOptions::new().require_exact_area_match().policy,
+            SelectionPolicy::RequireExactAreaMatch
+        ));
+        assert!(matches!(
+            SelectionOptions::new()
+                .allow_approximate_helmert_fallback()
+                .policy,
+            SelectionPolicy::AllowApproximateHelmertFallback
+        ));
+        assert!(matches!(
+            SelectionOptions::new()
+                .with_operation(CoordinateOperationId(1234))
+                .policy,
+            SelectionPolicy::Operation(CoordinateOperationId(1234))
+        ));
+    }
+
+    #[test]
+    fn selection_options_inverse_preserves_builder_values() {
+        let options = SelectionOptions::new()
+            .with_area_of_interest(AreaOfInterest::source_crs_point(Coord::new(1.0, 2.0)))
+            .with_policy(SelectionPolicy::RequireExactAreaMatch)
+            .with_vertical_grid_operation(vertical_grid_operation("grid", Some(4979), Some(5703)));
+
+        let inverse = options.inverse();
+
+        assert!(matches!(
+            inverse.area_of_interest,
+            Some(AreaOfInterest {
+                crs: AreaOfInterestCrs::TargetCrs,
+                point: Some(Coord { x: 1.0, y: 2.0 }),
+                bounds: None,
+            })
+        ));
+        assert!(matches!(
+            inverse.policy,
+            SelectionPolicy::RequireExactAreaMatch
+        ));
+        assert_eq!(
+            inverse.vertical_grid_operations[0].source_vertical_crs_epsg,
+            Some(5703)
+        );
+        assert_eq!(
+            inverse.vertical_grid_operations[0].target_vertical_crs_epsg,
+            Some(4979)
+        );
+    }
 }
