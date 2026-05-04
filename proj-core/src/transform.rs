@@ -23,10 +23,6 @@ use std::sync::Arc;
 const PARALLEL_MIN_TOTAL_ITEMS: usize = 16_384;
 #[cfg(feature = "rayon")]
 const PARALLEL_MIN_ITEMS_PER_THREAD: usize = 4_096;
-#[cfg(feature = "rayon")]
-const PARALLEL_CHUNKS_PER_THREAD: usize = 4;
-#[cfg(feature = "rayon")]
-const PARALLEL_MIN_CHUNK_SIZE: usize = 1_024;
 
 /// A reusable coordinate transformation between two CRS.
 pub struct Transform {
@@ -989,7 +985,16 @@ impl Transform {
         &self,
         coords: &[T],
     ) -> Result<Vec<T>> {
-        self.convert_batch_parallel_adaptive(coords, |this, chunk| this.convert_batch(chunk))
+        if !should_parallelize(coords.len()) {
+            return self.convert_batch(coords);
+        }
+
+        use rayon::prelude::*;
+
+        coords
+            .par_iter()
+            .map(|coord| self.convert(coord.clone()))
+            .collect()
     }
 
     /// Batch transform of 3D coordinates with adaptive Rayon parallelism.
@@ -998,32 +1003,16 @@ impl Transform {
         &self,
         coords: &[T],
     ) -> Result<Vec<T>> {
-        self.convert_batch_parallel_adaptive(coords, |this, chunk| this.convert_batch_3d(chunk))
-    }
-
-    #[cfg(feature = "rayon")]
-    fn convert_batch_parallel_adaptive<T, F>(&self, coords: &[T], convert: F) -> Result<Vec<T>>
-    where
-        T: Send + Sync + Clone,
-        F: Fn(&Self, &[T]) -> Result<Vec<T>> + Sync,
-    {
         if !should_parallelize(coords.len()) {
-            return convert(self, coords);
+            return self.convert_batch_3d(coords);
         }
 
         use rayon::prelude::*;
 
-        let chunk_size = parallel_chunk_size(coords.len());
-        let chunk_results: Vec<Result<Vec<T>>> = coords
-            .par_chunks(chunk_size)
-            .map(|chunk| convert(self, chunk))
-            .collect();
-
-        let mut results = Vec::with_capacity(coords.len());
-        for chunk in chunk_results {
-            results.extend(chunk?);
-        }
-        Ok(results)
+        coords
+            .par_iter()
+            .map(|coord| self.convert_3d(coord.clone()))
+            .collect()
     }
 }
 
@@ -1873,14 +1862,6 @@ fn should_parallelize(len: usize) -> bool {
 
     let threads = rayon::current_num_threads().max(1);
     len >= PARALLEL_MIN_TOTAL_ITEMS.max(threads.saturating_mul(PARALLEL_MIN_ITEMS_PER_THREAD))
-}
-
-#[cfg(feature = "rayon")]
-fn parallel_chunk_size(len: usize) -> usize {
-    let threads = rayon::current_num_threads().max(1);
-    let target_chunks = threads.saturating_mul(PARALLEL_CHUNKS_PER_THREAD).max(1);
-    let chunk_size = len.div_ceil(target_chunks);
-    chunk_size.max(PARALLEL_MIN_CHUNK_SIZE)
 }
 
 #[cfg(test)]
