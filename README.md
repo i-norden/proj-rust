@@ -104,7 +104,7 @@ Use `Transform::selected_operation()`, `Transform::selection_diagnostics()`, `Tr
 
 ## Compatibility Surface
 
-`proj-wkt` also exposes a lightweight `Proj` compatibility facade for downstream code that currently uses the common `new_known_crs` / `new` / `create_crs_to_crs_from_pj` / `convert` flow. It is intentionally narrow and only covers the supported CRS semantics in this workspace.
+`proj-wkt` also exposes a lightweight `Proj` compatibility facade for downstream code that currently uses the common `new_known_crs` / `new` / `create_crs_to_crs_from_pj` / `convert` flow. These constructors honor compatibility area strings such as `lon,lat` or `west,south,east,north`, accept simple option strings including `require_grids` and `operation=<id>`, and provide `*_with_selection_options` variants for the full typed selection API. The facade is intentionally narrow and only covers the supported CRS semantics in this workspace.
 
 `proj-core::Transform` and `proj-wkt::Proj` also expose inverse-transform construction and sampled bounds reprojection via `inverse()` and `transform_bounds()`.
 

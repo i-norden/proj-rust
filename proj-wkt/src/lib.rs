@@ -41,7 +41,8 @@ mod semantics;
 mod wkt;
 
 use proj_core::{
-    Bounds, Coord, Coord3D, CrsDef, SelectionOptions, Transform, Transformable, Transformable3D,
+    AreaOfInterest, Bounds, Coord, Coord3D, CoordinateOperationId, CrsDef, SelectionOptions,
+    Transform, Transformable, Transformable3D,
 };
 
 /// Parse error.
@@ -200,6 +201,123 @@ pub fn transform_from_crs_strings_horizontal_with_selection_options(
     )
 }
 
+fn compatibility_selection_options(
+    area: Option<&str>,
+    options: Option<&str>,
+) -> Result<SelectionOptions> {
+    let mut selection_options = SelectionOptions::default();
+    if let Some(area) = parse_compatibility_area(area)? {
+        selection_options = selection_options.with_area_of_interest(area);
+    }
+    if let Some(options) = options {
+        selection_options = apply_compatibility_options(selection_options, options)?;
+    }
+    Ok(selection_options)
+}
+
+fn parse_compatibility_area(area: Option<&str>) -> Result<Option<AreaOfInterest>> {
+    let Some(area) = area.map(str::trim).filter(|area| !area.is_empty()) else {
+        return Ok(None);
+    };
+    let area = strip_area_prefix(area);
+    let values = split_compatibility_values(area)
+        .map(|value| {
+            value.parse::<f64>().map_err(|_| {
+                ParseError::Parse(format!(
+                    "unsupported Proj compatibility area value: {value}"
+                ))
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    match values.as_slice() {
+        [lon, lat] => Ok(Some(AreaOfInterest::geographic_point(Coord::new(
+            *lon, *lat,
+        )))),
+        [west, south, east, north] => Ok(Some(AreaOfInterest::geographic_bounds(Bounds::new(
+            *west, *south, *east, *north,
+        )))),
+        _ => Err(ParseError::Parse(
+            "unsupported Proj compatibility area; expected lon,lat or west,south,east,north".into(),
+        )),
+    }
+}
+
+fn strip_area_prefix(area: &str) -> &str {
+    for prefix in [
+        "bbox=", "bounds=", "area=", "point=", "aoi=", "bbox:", "bounds:", "area:", "point:",
+        "aoi:",
+    ] {
+        if area
+            .get(..prefix.len())
+            .is_some_and(|candidate| candidate.eq_ignore_ascii_case(prefix))
+        {
+            return area[prefix.len()..].trim();
+        }
+    }
+    area
+}
+
+fn apply_compatibility_options(
+    mut selection_options: SelectionOptions,
+    options: &str,
+) -> Result<SelectionOptions> {
+    for option in split_compatibility_values(options) {
+        selection_options = apply_compatibility_option(selection_options, option)?;
+    }
+    Ok(selection_options)
+}
+
+fn apply_compatibility_option(
+    selection_options: SelectionOptions,
+    option: &str,
+) -> Result<SelectionOptions> {
+    let normalized = option.trim().trim_start_matches('+').replace('-', "_");
+    let normalized = normalized.as_str();
+    if normalized.is_empty() {
+        return Ok(selection_options);
+    }
+
+    match normalized.to_ascii_lowercase().as_str() {
+        "best_available" => Ok(selection_options.best_available()),
+        "require_grids" | "require_grid" | "grids" => Ok(selection_options.require_grids()),
+        "require_exact_area_match" | "exact_area" | "exact_area_match" => {
+            Ok(selection_options.require_exact_area_match())
+        }
+        "allow_approximate_helmert_fallback"
+        | "allow_approximate_helmert"
+        | "allow_approximate" => Ok(selection_options.allow_approximate_helmert_fallback()),
+        _ => match normalized
+            .split_once('=')
+            .or_else(|| normalized.split_once(':'))
+        {
+            Some((key, value))
+                if matches!(
+                    key.to_ascii_lowercase().as_str(),
+                    "operation" | "operation_id" | "op"
+                ) =>
+            {
+                let id = value.parse::<u32>().map_err(|_| {
+                    ParseError::Parse(format!(
+                        "unsupported Proj compatibility operation id: {value}"
+                    ))
+                })?;
+                Ok(selection_options.with_operation(CoordinateOperationId(id)))
+            }
+            _ => Err(ParseError::Parse(format!(
+                "unsupported Proj compatibility option: {option}"
+            ))),
+        },
+    }
+}
+
+fn split_compatibility_values(value: &str) -> impl Iterator<Item = &str> {
+    value
+        .split(|candidate: char| candidate == ',' || candidate == ';' || candidate.is_whitespace())
+        .map(str::trim)
+        .filter(|candidate| !candidate.is_empty())
+}
+
 /// Lightweight compatibility facade for downstream code that currently expects
 /// a `proj::Proj`-like flow:
 /// 1. parse a CRS definition with [`Proj::new`]
@@ -223,16 +341,46 @@ impl Proj {
     }
 
     /// Build a transform directly from two CRS strings.
-    pub fn new_known_crs(from: &str, to: &str, _area: Option<&str>) -> Result<Self> {
+    pub fn new_known_crs(from: &str, to: &str, area: Option<&str>) -> Result<Self> {
+        Self::new_known_crs_with_selection_options(
+            from,
+            to,
+            compatibility_selection_options(area, None)?,
+        )
+    }
+
+    /// Build a transform directly from two CRS strings using selection options.
+    pub fn new_known_crs_with_selection_options(
+        from: &str,
+        to: &str,
+        options: SelectionOptions,
+    ) -> Result<Self> {
         Ok(Self {
-            inner: ProjInner::Transform(Box::new(transform_from_crs_strings(from, to)?)),
+            inner: ProjInner::Transform(Box::new(
+                transform_from_crs_strings_with_selection_options(from, to, options)?,
+            )),
         })
     }
 
     /// Build a horizontal-only transform directly from two CRS strings.
-    pub fn new_known_crs_horizontal(from: &str, to: &str, _area: Option<&str>) -> Result<Self> {
+    pub fn new_known_crs_horizontal(from: &str, to: &str, area: Option<&str>) -> Result<Self> {
+        Self::new_known_crs_horizontal_with_selection_options(
+            from,
+            to,
+            compatibility_selection_options(area, None)?,
+        )
+    }
+
+    /// Build a horizontal-only transform directly from two CRS strings using selection options.
+    pub fn new_known_crs_horizontal_with_selection_options(
+        from: &str,
+        to: &str,
+        options: SelectionOptions,
+    ) -> Result<Self> {
         Ok(Self {
-            inner: ProjInner::Transform(Box::new(transform_from_crs_strings_horizontal(from, to)?)),
+            inner: ProjInner::Transform(Box::new(
+                transform_from_crs_strings_horizontal_with_selection_options(from, to, options)?,
+            )),
         })
     }
 
@@ -240,13 +388,27 @@ impl Proj {
     pub fn create_crs_to_crs_from_pj(
         &self,
         target: &Self,
-        _area: Option<&str>,
-        _options: Option<&str>,
+        area: Option<&str>,
+        options: Option<&str>,
+    ) -> Result<Self> {
+        self.create_crs_to_crs_from_pj_with_selection_options(
+            target,
+            compatibility_selection_options(area, options)?,
+        )
+    }
+
+    /// Build a transform from two parsed CRS definitions using selection options.
+    pub fn create_crs_to_crs_from_pj_with_selection_options(
+        &self,
+        target: &Self,
+        options: SelectionOptions,
     ) -> Result<Self> {
         let source = self.definition()?;
         let target = target.definition()?;
         Ok(Self {
-            inner: ProjInner::Transform(Box::new(Transform::from_crs_defs(source, target)?)),
+            inner: ProjInner::Transform(Box::new(Transform::from_crs_defs_with_selection_options(
+                source, target, options,
+            )?)),
         })
     }
 
@@ -254,15 +416,29 @@ impl Proj {
     pub fn create_horizontal_crs_to_crs_from_pj(
         &self,
         target: &Self,
-        _area: Option<&str>,
-        _options: Option<&str>,
+        area: Option<&str>,
+        options: Option<&str>,
+    ) -> Result<Self> {
+        self.create_horizontal_crs_to_crs_from_pj_with_selection_options(
+            target,
+            compatibility_selection_options(area, options)?,
+        )
+    }
+
+    /// Build a horizontal-only transform from two parsed CRS definitions using selection options.
+    pub fn create_horizontal_crs_to_crs_from_pj_with_selection_options(
+        &self,
+        target: &Self,
+        options: SelectionOptions,
     ) -> Result<Self> {
         let source = self.definition()?;
         let target = target.definition()?;
         Ok(Self {
-            inner: ProjInner::Transform(Box::new(Transform::from_horizontal_components(
-                source, target,
-            )?)),
+            inner: ProjInner::Transform(Box::new(
+                Transform::from_horizontal_components_with_selection_options(
+                    source, target, options,
+                )?,
+            )),
         })
     }
 
@@ -335,6 +511,13 @@ impl Proj {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn expect_proj_error(result: Result<Proj>) -> ParseError {
+        match result {
+            Ok(_) => panic!("expected Proj construction to fail"),
+            Err(err) => err,
+        }
+    }
 
     #[test]
     fn bare_epsg_code() {
@@ -441,6 +624,36 @@ mod tests {
     }
 
     #[test]
+    fn proj_facade_new_known_crs_accepts_area_string() {
+        let proj =
+            Proj::new_known_crs("EPSG:4326", "EPSG:3857", Some("bbox=-75,40,-74,41")).unwrap();
+        let (x, _y) = proj.convert((-74.006, 40.7128)).unwrap();
+        assert!((x - (-8238310.0)).abs() < 100.0);
+    }
+
+    #[test]
+    fn proj_facade_new_known_crs_rejects_invalid_area_string() {
+        let err = expect_proj_error(Proj::new_known_crs(
+            "EPSG:4326",
+            "EPSG:3857",
+            Some("not an area"),
+        ));
+        assert!(err
+            .to_string()
+            .contains("unsupported Proj compatibility area"));
+    }
+
+    #[test]
+    fn proj_facade_new_known_crs_with_selection_options_uses_options() {
+        let err = expect_proj_error(Proj::new_known_crs_with_selection_options(
+            "EPSG:4326",
+            "EPSG:3857",
+            SelectionOptions::new().with_operation(CoordinateOperationId(999_999)),
+        ));
+        assert!(err.to_string().contains("unknown operation id 999999"));
+    }
+
+    #[test]
     fn proj_facade_from_known_crs_3d() {
         let proj = Proj::new_known_crs("EPSG:4326", "EPSG:3857", None).unwrap();
         let (x, _y, z) = proj.convert_3d((-74.006, 40.7128, 25.0)).unwrap();
@@ -457,10 +670,43 @@ mod tests {
     }
 
     #[test]
+    fn proj_facade_from_known_crs_horizontal_with_selection_options() {
+        let proj = Proj::new_known_crs_horizontal_with_selection_options(
+            "EPSG:4979",
+            "EPSG:3857",
+            SelectionOptions::new(),
+        )
+        .unwrap();
+        let (x, _y, z) = proj.convert_3d((-74.006, 40.7128, 25.0)).unwrap();
+        assert!((x - (-8238310.0)).abs() < 100.0);
+        assert!((z - 25.0).abs() < 1e-12);
+    }
+
+    #[test]
     fn proj_facade_create_from_definitions() {
         let from = Proj::new("+proj=longlat +datum=WGS84").unwrap();
         let to = Proj::new("EPSG:3857").unwrap();
         let proj = from.create_crs_to_crs_from_pj(&to, None, None).unwrap();
+        let (x, _y) = proj.convert((-74.006, 40.7128)).unwrap();
+        assert!((x - (-8238310.0)).abs() < 100.0);
+    }
+
+    #[test]
+    fn proj_facade_create_from_definitions_applies_options_string() {
+        let from = Proj::new("+proj=longlat +datum=WGS84").unwrap();
+        let to = Proj::new("EPSG:3857").unwrap();
+        let err =
+            expect_proj_error(from.create_crs_to_crs_from_pj(&to, None, Some("operation=999999")));
+        assert!(err.to_string().contains("unknown operation id 999999"));
+    }
+
+    #[test]
+    fn proj_facade_create_from_definitions_with_selection_options() {
+        let from = Proj::new("+proj=longlat +datum=WGS84").unwrap();
+        let to = Proj::new("EPSG:3857").unwrap();
+        let proj = from
+            .create_crs_to_crs_from_pj_with_selection_options(&to, SelectionOptions::new())
+            .unwrap();
         let (x, _y) = proj.convert((-74.006, 40.7128)).unwrap();
         assert!((x - (-8238310.0)).abs() < 100.0);
     }
