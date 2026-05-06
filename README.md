@@ -16,7 +16,7 @@ This workspace currently contains:
 
 `proj-rust` is intended for production use within its supported CRS and projection set. It is not a full implementation of all PROJ capabilities.
 
-Current non-goals for the `0.5` release line include:
+Current non-goals for the `0.6` release line include:
 
 - packaged vertical grid assets, broad vertical operation selection, cross-datum vertical, or time-dependent CRS transformation operations
 - arbitrary user-defined PROJ pipeline parsing/execution beyond the supported CRS and operation model

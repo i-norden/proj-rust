@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+## 0.6.0
+
+- add EPSG:32662 Plate Carree registry lookup, operation selection, and reference-corpus coverage, with a regression test that every README-advertised EPSG code resolves
+- add fluent `SelectionOptions` builders and option-aware `proj-wkt::Proj` facade constructors for area-of-interest, grid policy, and explicit operation selection
+- fix 2D diagnostic conversion so XY-only callers do not sample vertical grids
+- optimize transform execution by compiling source/target XY unit conversion modes into the pipeline and reducing Rayon parallel batch temporary allocations
+
 ## 0.5.0
 
 - add explicit `VerticalCrsDef`, `VerticalCrsKind`, `HorizontalCrsDef`, and `CompoundCrsDef` CRS model types for ellipsoidal-height and gravity-related vertical components
