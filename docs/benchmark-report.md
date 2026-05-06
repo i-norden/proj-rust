@@ -1,10 +1,10 @@
 # Benchmark Report
 
-Date: 2026-04-29
+Date: 2026-05-05
 
 This report summarizes the current parity and benchmark suite for `proj-rust`
 against bundled C PROJ. It captures both the current Rust-versus-C performance
-shape and the current transform-construction cost for the `0.5.0` release
+shape and the current transform-construction cost for the `0.6.0` release
 state.
 
 ## System Under Test
@@ -77,33 +77,33 @@ diagnostics rather than release performance gates.
 
 | workload | proj-rust |
 | --- | ---: |
-| `construct 4326 -> 3857` | 1.08 us |
-| `construct 4267 -> 4326` | 34.12 us |
+| `construct 4326 -> 3857` | 0.83 us |
+| `construct 4267 -> 4326` | 33.95 us |
 
 ### Single-Point Summary
 
 | workload | proj-rust | C PROJ | same-run result |
 | --- | ---: | ---: | --- |
-| `4326 -> 3857` | 27.38 ns | 74.39 ns | `proj-rust` 2.72x faster |
-| `4326 -> 32618` | 51.46 ns | 136.39 ns | `proj-rust` 2.65x faster |
-| `4326 -> 3413` | 58.92 ns | 93.37 ns | `proj-rust` 1.58x faster |
-| `4267 -> 4326` | 160.07 ns | 288.85 ns | `proj-rust` 1.80x faster |
+| `4326 -> 3857` | 25.46 ns | 72.99 ns | `proj-rust` 2.87x faster |
+| `4326 -> 32618` | 40.14 ns | 130.26 ns | `proj-rust` 3.25x faster |
+| `4326 -> 3413` | 55.71 ns | 94.24 ns | `proj-rust` 1.69x faster |
+| `4267 -> 4326` | 159.79 ns | 282.16 ns | `proj-rust` 1.77x faster |
 
 ### Single-Point 3D Summary
 
 | workload | proj-rust | C PROJ | same-run result |
 | --- | ---: | ---: | --- |
-| `3D 4326 -> 3857` | 31.82 ns | 76.80 ns | `proj-rust` 2.41x faster |
-| `3D 4267 -> 4326` | 170.86 ns | 278.00 ns | `proj-rust` 1.63x faster |
+| `3D 4326 -> 3857` | 28.88 ns | 71.72 ns | `proj-rust` 2.48x faster |
+| `3D 4267 -> 4326` | 162.56 ns | 266.63 ns | `proj-rust` 1.64x faster |
 
 ### Batch Summary
 
 | workload | proj-rust | C PROJ | same-run result |
 | --- | ---: | ---: | --- |
-| `10K 4326 -> 3857` sequential | 305.92 us | 787.07 us | `proj-rust` 2.57x faster |
-| `10K 4326 -> 3857` throughput | 32.7 Melem/s | 12.7 Melem/s | `proj-rust` 2.57x higher throughput |
-| `10K 4326 -> 3857` parallel | 307.87 us | 787.07 us | `proj-rust` 2.56x faster |
-| `10K 4326 -> 3857` parallel throughput | 32.5 Melem/s | 12.7 Melem/s | `proj-rust` 2.56x higher throughput |
+| `10K 4326 -> 3857` sequential | 391.65 us | 771.63 us | `proj-rust` 1.97x faster |
+| `10K 4326 -> 3857` throughput | 25.5 Melem/s | 13.0 Melem/s | `proj-rust` 1.97x higher throughput |
+| `10K 4326 -> 3857` parallel | 409.49 us | 771.63 us | `proj-rust` 1.88x faster |
+| `10K 4326 -> 3857` parallel throughput | 24.4 Melem/s | 13.0 Melem/s | `proj-rust` 1.88x higher throughput |
 
 ### Batch 3D Diagnostics
 
@@ -111,8 +111,8 @@ These rows are Rust-only diagnostics for the height-preserving 3D path.
 
 | workload | proj-rust | result |
 | --- | ---: | --- |
-| `10K 3D 4326 -> 3857` sequential | 354.84 us | 28.2 Melem/s |
-| `10K 3D 4326 -> 3857` parallel | 331.43 us | 30.2 Melem/s |
+| `10K 3D 4326 -> 3857` sequential | 309.51 us | 32.3 Melem/s |
+| `10K 3D 4326 -> 3857` parallel | 302.91 us | 33.0 Melem/s |
 
 ## Interpretation
 
